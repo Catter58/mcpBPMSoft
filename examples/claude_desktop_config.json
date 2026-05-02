@@ -1,0 +1,25 @@
+{
+  "_comment": "Примеры подключения mcp-bpmsoft-odata к Claude Desktop. Замените путь /path/to/mcpBPMSoft/build/index.js на абсолютный путь к собранному файлу на вашей машине (после `npm run build`). В реальном claude_desktop_config.json блок _comment не нужен — оставьте только один из вариантов внутри mcpServers.",
+
+  "mcpServers": {
+    "_variant_A_with_env": {
+      "_comment": "Вариант A: учётные данные в env-блоке. Сервер аутентифицируется автоматически при первом вызове инструмента.",
+      "command": "node",
+      "args": ["/path/to/mcpBPMSoft/build/index.js"],
+      "env": {
+        "BPMSOFT_URL": "https://crm.example.com",
+        "BPMSOFT_USERNAME": "your_username",
+        "BPMSOFT_PASSWORD": "your_password",
+        "BPMSOFT_ODATA_VERSION": "4",
+        "BPMSOFT_PLATFORM": "net8"
+      }
+    },
+
+    "_variant_B_interactive": {
+      "_comment": "Вариант B: пустой env-блок. Сервер стартует без подключения и ожидает вызова инструмента bpm_init с параметрами подключения.",
+      "command": "node",
+      "args": ["/path/to/mcpBPMSoft/build/index.js"],
+      "env": {}
+    }
+  }
+}
