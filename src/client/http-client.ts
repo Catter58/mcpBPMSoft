@@ -27,6 +27,9 @@ const MAX_RETRIES = 3;
 const RETRY_BASE_DELAY_MS = 1000;
 const MAX_RETRY_AFTER_SECONDS = 60; // hard cap to avoid pathological waits
 
+/** Auth resolved for a single request: a BPMCSRF token and the cookies to send. */
+type ResolvedAuth = { csrfToken: string | null; cookies: Map<string, string> };
+
 export class HttpClient {
   private authState: AuthState = {
     sessionId: null,
@@ -65,7 +68,7 @@ export class HttpClient {
    * Priority: per-request ALS auth > env-creds singleton (opt-in) > error.
    * Returns null only for skipAuth requests (login/CSRF fetch).
    */
-  private resolveAuth(skipAuth?: boolean): { csrfToken: string | null; cookies: Map<string, string> } | null {
+  private resolveAuth(skipAuth?: boolean): ResolvedAuth | null {
     if (skipAuth) {
       // Login / CSRF-fetch flow: use whatever the singleton accumulated (creds path).
       return { csrfToken: null, cookies: this.authState.cookies };
@@ -222,7 +225,7 @@ export class HttpClient {
    */
   private buildHeaders(
     options: HttpRequestOptions,
-    resolved: { csrfToken: string | null; cookies: Map<string, string> } | null
+    resolved: ResolvedAuth | null
   ): Record<string, string> {
     const v3 = this.config.odata_version === 3;
     const kind = options.contentKind ?? 'crud';
@@ -404,7 +407,7 @@ export class HttpClient {
   }
 
   private buildCookieString(
-    resolved: { csrfToken: string | null; cookies: Map<string, string> } | null
+    resolved: ResolvedAuth | null
   ): string {
     const cookies = resolved?.cookies ?? this.authState.cookies;
     const parts: string[] = [];
