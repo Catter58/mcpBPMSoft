@@ -3,21 +3,24 @@
 /**
  * MCP Server for BPMSoft OData
  *
- * Entry point. Supports two initialization modes:
+ * Entry point. Per-request auth model:
  *
- * 1. Environment variables (headless):
- *    Set BPMSOFT_URL, BPMSOFT_USERNAME, BPMSOFT_PASSWORD before starting.
- *    Server auto-authenticates on first tool call.
+ * - Only BPMSOFT_URL is required (fatal exit if missing); it pins the target
+ *   instance. Credentials are NOT stored server-side.
+ * - Each request carries the caller's auth (BPMCSRF + cookies) over the
+ *   Streamable HTTP transport; tools forward it to BPMSoft per-request.
+ * - Env-stored credentials are an opt-in fallback: set BPMSOFT_ALLOW_ENV_CREDS
+ *   to expose the hidden bpm_init tool and allow login from
+ *   BPMSOFT_USERNAME / BPMSOFT_PASSWORD. Off by default.
  *
- * 2. Interactive (bpm_init):
- *    Start without env vars. Use bpm_init tool to provide credentials.
- *    All other tools will prompt to run bpm_init first.
+ * Transport: chosen via MCP_TRANSPORT (default `http`; set `stdio` for stdio).
  */
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 
-import { tryLoadConfigFromEnv } from './config.js';
+import { startHttpServer } from './server/http-transport.js';
+import { tryLoadConfigFromEnv, isEnvCredsAllowed } from './config.js';
 import {
   registerInitTool,
   initializeServices,
@@ -44,46 +47,73 @@ let services: ServiceContainer = createEmptyContainer();
 async function main(): Promise<void> {
   const envConfig = tryLoadConfigFromEnv();
 
-  if (envConfig) {
-    services = initializeServices(envConfig);
-    console.error('[Server] Configuration loaded from environment variables');
-    console.error(`  Target: ${envConfig.bpmsoft_url}`);
-    console.error(`  OData: v${envConfig.odata_version}, Platform: ${envConfig.platform}`);
-  } else {
-    console.error('[Server] No environment configuration found.');
-    console.error('[Server] Use the bpm_init tool to provide connection parameters.');
+  if (!envConfig) {
+    console.error('[Server] FATAL: BPMSOFT_URL is required but not set.');
+    console.error('[Server] Set BPMSOFT_URL to the target BPMSoft instance and restart.');
+    process.exit(1);
   }
 
-  const server = new McpServer({
-    name: 'mcp-bpmsoft-odata',
-    version: '0.2.0',
-  });
+  const allowEnvCreds = isEnvCredsAllowed();
+  services = initializeServices(envConfig, allowEnvCreds);
+  console.error('[Server] Configuration loaded from environment.');
+  console.error(`  Target: ${envConfig.bpmsoft_url}`);
+  console.error(`  OData: v${envConfig.odata_version}, Platform: ${envConfig.platform}`);
+  console.error(
+    `  Auth mode: ${allowEnvCreds ? 'env-creds opt-in (bpm_init available)' : 'per-request (caller forwards credentials)'}`
+  );
 
-  registerInitTool(server, services, (newContainer) => {
-    services = newContainer;
-  });
+  // Build a fully-registered McpServer. The HTTP path calls this once per
+  // request (see http-transport.ts) so concurrent callers each get their own
+  // server/transport; the stdio path calls it once. `services` is shared across
+  // all instances — it holds the HttpClient/AuthManager which read per-request
+  // auth from AsyncLocalStorage and are stateless w.r.t. user identity.
+  const buildServer = (): McpServer => {
+    const server = new McpServer({
+      name: 'mcp-bpmsoft-odata',
+      version: '0.3.0',
+    });
 
-  registerReadTools(server, services);
-  registerWriteTools(server, services);
-  registerSchemaTools(server, services);
-  registerDescribeInstanceTool(server, services);
-  registerEnumTool(server, services);
-  registerWorkflowCatalogTool(server, services);
-  registerBatchTools(server, services);
-  registerStreamTools(server, services);
-  registerWorkflowTools(server, services);
-  registerProcessTools(server, services);
-  registerPrompts(server, services);
-  registerResources(server, services);
+    // bpm_init is only exposed when env-stored credentials are explicitly enabled.
+    if (allowEnvCreds) {
+      registerInitTool(server, services, (newContainer) => {
+        services = newContainer;
+      });
+    }
 
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
+    registerReadTools(server, services);
+    registerWriteTools(server, services);
+    registerSchemaTools(server, services);
+    registerDescribeInstanceTool(server, services);
+    registerEnumTool(server, services);
+    registerWorkflowCatalogTool(server, services);
+    registerBatchTools(server, services);
+    registerStreamTools(server, services);
+    registerWorkflowTools(server, services);
+    registerProcessTools(server, services);
+    registerPrompts(server, services);
+    registerResources(server, services);
 
-  const total = TOOLS.length;
+    return server;
+  };
+
   const operational = TOOLS.filter((t) => t.category !== 'init').length;
-  console.error(`MCP BPMSoft OData Server running on stdio`);
-  console.error(`Registered ${total} tools (bpm_init + ${operational} operational)`);
+  const registeredTools = allowEnvCreds ? operational + 1 : operational;
+  console.error(
+    `Registered ${registeredTools} tools (${operational} operational${allowEnvCreds ? ' + bpm_init' : ''})`
+  );
   console.error(`Registered ${PROMPTS.length} prompts, 4 resource templates`);
+
+  const transportKind = (process.env.MCP_TRANSPORT || 'http').toLowerCase();
+  if (transportKind === 'stdio') {
+    const server = buildServer();
+    const transport = new StdioServerTransport();
+    await server.connect(transport);
+    console.error('MCP BPMSoft OData Server running on stdio');
+  } else {
+    const port = parseInt(process.env.MCP_HTTP_PORT || '8007', 10);
+    await startHttpServer(buildServer, { port });
+    console.error('MCP BPMSoft OData Server running on Streamable HTTP');
+  }
 }
 
 main().catch((error) => {

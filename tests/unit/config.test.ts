@@ -1,5 +1,5 @@
-import { describe, it, expect } from 'vitest';
-import { buildConfig, getODataBaseUrl, getAuthUrl } from '../../src/config.js';
+import { describe, it, expect, afterEach } from 'vitest';
+import { buildConfig, getODataBaseUrl, getAuthUrl, tryLoadConfigFromEnv, isEnvCredsAllowed } from '../../src/config.js';
 import type { BpmConfig } from '../../src/types/index.js';
 
 describe('buildConfig', () => {
@@ -89,5 +89,66 @@ describe('getAuthUrl', () => {
     expect(
       getAuthUrl(makeCfg({ odata_version: 3, platform: 'netframework' }))
     ).toBe('https://bpm.test/ServiceModel/AuthService.svc/Login');
+  });
+});
+
+describe('buildConfig without credentials', () => {
+  it('builds a config when username/password are omitted', () => {
+    const cfg = buildConfig('https://bpm.test');
+    expect(cfg.bpmsoft_url).toBe('https://bpm.test');
+    expect(cfg.username).toBeUndefined();
+    expect(cfg.password).toBeUndefined();
+    expect(cfg.odata_version).toBe(4);
+  });
+});
+
+describe('tryLoadConfigFromEnv', () => {
+  const saved = { ...process.env };
+  afterEach(() => {
+    process.env = { ...saved };
+  });
+
+  it('requires only BPMSOFT_URL', () => {
+    process.env = { ...saved, BPMSOFT_URL: 'https://bpm.test' };
+    delete process.env.BPMSOFT_USERNAME;
+    delete process.env.BPMSOFT_PASSWORD;
+    delete process.env.BPMSOFT_ALLOW_ENV_CREDS;
+    const cfg = tryLoadConfigFromEnv();
+    expect(cfg).not.toBeNull();
+    expect(cfg!.bpmsoft_url).toBe('https://bpm.test');
+    expect(cfg!.username).toBeUndefined();
+  });
+
+  it('returns null when BPMSOFT_URL missing', () => {
+    process.env = { ...saved };
+    delete process.env.BPMSOFT_URL;
+    expect(tryLoadConfigFromEnv()).toBeNull();
+  });
+
+  it('ignores credentials when env-creds opt-in is off', () => {
+    process.env = {
+      ...saved,
+      BPMSOFT_URL: 'https://bpm.test',
+      BPMSOFT_USERNAME: 'u',
+      BPMSOFT_PASSWORD: 'p',
+      BPMSOFT_ALLOW_ENV_CREDS: 'false',
+    };
+    const cfg = tryLoadConfigFromEnv();
+    expect(cfg!.username).toBeUndefined();
+    expect(cfg!.password).toBeUndefined();
+  });
+
+  it('loads credentials when opt-in is on', () => {
+    process.env = {
+      ...saved,
+      BPMSOFT_URL: 'https://bpm.test',
+      BPMSOFT_USERNAME: 'u',
+      BPMSOFT_PASSWORD: 'p',
+      BPMSOFT_ALLOW_ENV_CREDS: 'true',
+    };
+    expect(isEnvCredsAllowed()).toBe(true);
+    const cfg = tryLoadConfigFromEnv();
+    expect(cfg!.username).toBe('u');
+    expect(cfg!.password).toBe('p');
   });
 });

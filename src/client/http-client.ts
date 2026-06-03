@@ -20,11 +20,15 @@ import type {
   HttpResponse,
   AuthState,
 } from '../types/index.js';
-import { BpmApiError, parseODataError } from '../utils/errors.js';
+import { BpmApiError, parseODataError, AuthRequiredError } from '../utils/errors.js';
+import { getRequestAuth, hasRequestAuth } from '../auth/request-context.js';
 
 const MAX_RETRIES = 3;
 const RETRY_BASE_DELAY_MS = 1000;
 const MAX_RETRY_AFTER_SECONDS = 60; // hard cap to avoid pathological waits
+
+/** Auth resolved for a single request: a BPMCSRF token and the cookies to send. */
+type ResolvedAuth = { csrfToken: string | null; cookies: Map<string, string> };
 
 export class HttpClient {
   private authState: AuthState = {
@@ -37,6 +41,7 @@ export class HttpClient {
   private reauthHandler: (() => Promise<void>) | null = null;
   private isReauthenticating = false;
   private allowedOrigin: string | null = null;
+  private allowEnvCreds = false;
 
   private readonly debugMode: 'off' | 'on' | 'trace';
 
@@ -51,6 +56,31 @@ export class HttpClient {
    */
   setAllowedOrigin(origin: string): void {
     this.allowedOrigin = origin;
+  }
+
+  /** Enable the hidden env-stored credentials path (off by default). */
+  setAllowEnvCreds(allow: boolean): void {
+    this.allowEnvCreds = allow;
+  }
+
+  /**
+   * Resolve auth for an authenticated request.
+   * Priority: per-request ALS auth > env-creds singleton (opt-in) > error.
+   * Returns null only for skipAuth requests (login/CSRF fetch).
+   */
+  private resolveAuth(skipAuth?: boolean): ResolvedAuth | null {
+    if (skipAuth) {
+      // Login / CSRF-fetch flow: use whatever the singleton accumulated (creds path).
+      return { csrfToken: null, cookies: this.authState.cookies };
+    }
+    const reqAuth = getRequestAuth();
+    if (hasRequestAuth(reqAuth)) {
+      return { csrfToken: reqAuth.csrfToken ?? null, cookies: reqAuth.cookies };
+    }
+    if (this.allowEnvCreds) {
+      return { csrfToken: this.authState.csrfToken, cookies: this.authState.cookies };
+    }
+    throw new AuthRequiredError();
   }
 
   setReauthHandler(handler: () => Promise<void>): void {
@@ -69,7 +99,7 @@ export class HttpClient {
   }
 
   getAuthState(): AuthState {
-    return { ...this.authState };
+    return { ...this.authState, cookies: new Map(this.authState.cookies) };
   }
 
   /**
@@ -84,8 +114,9 @@ export class HttpClient {
     options: HttpRequestOptions,
     attempt: number
   ): Promise<HttpResponse<T>> {
-    const headers = this.buildHeaders(options);
-    const cookieStr = this.buildCookieString();
+    const resolved = this.resolveAuth(options.skipAuth);
+    const headers = this.buildHeaders(options, resolved);
+    const cookieStr = this.buildCookieString(resolved);
     if (cookieStr) headers['Cookie'] = cookieStr;
 
     const controller = new AbortController();
@@ -128,8 +159,12 @@ export class HttpClient {
 
       this.logResponse(options, httpResponse, Date.now() - startedAt);
 
-      // 401/403: try reauth once
-      if ((response.status === 401 || response.status === 403) && !options.skipAuth) {
+      // 401/403: reauth only in env-creds mode (never with a per-request token)
+      if (
+        (response.status === 401 || response.status === 403) &&
+        !options.skipAuth &&
+        !hasRequestAuth(getRequestAuth())
+      ) {
         return this.handleAuthFailure<T>(options, httpResponse);
       }
 
@@ -188,7 +223,10 @@ export class HttpClient {
    *   batch:   application/json; odata=verbose; IEEE754Compatible=true
    *   binary:  application/octet-stream; IEEE754Compatible=true
    */
-  private buildHeaders(options: HttpRequestOptions): Record<string, string> {
+  private buildHeaders(
+    options: HttpRequestOptions,
+    resolved: ResolvedAuth | null
+  ): Record<string, string> {
     const v3 = this.config.odata_version === 3;
     const kind = options.contentKind ?? 'crud';
 
@@ -229,9 +267,9 @@ export class HttpClient {
       ...options.headers,
     };
 
-    if (!options.skipAuth) {
-      if (this.authState.csrfToken) {
-        headers['BPMCSRF'] = this.authState.csrfToken;
+    if (!options.skipAuth && resolved) {
+      if (resolved.csrfToken) {
+        headers['BPMCSRF'] = resolved.csrfToken;
       }
       headers['ForceUseSession'] = 'true';
     }
@@ -345,6 +383,9 @@ export class HttpClient {
   }
 
   private extractCookies(response: Response): void {
+    // In per-request mode, do not persist Set-Cookie into the shared singleton
+    // (anti cross-user leakage). Only the env-creds login flow accumulates cookies.
+    if (hasRequestAuth(getRequestAuth())) return;
     // Node 18+ provides getSetCookie(); fall back to single header otherwise.
     const setCookies =
       typeof (response.headers as unknown as { getSetCookie?: () => string[] }).getSetCookie === 'function'
@@ -365,9 +406,12 @@ export class HttpClient {
     }
   }
 
-  private buildCookieString(): string {
+  private buildCookieString(
+    resolved: ResolvedAuth | null
+  ): string {
+    const cookies = resolved?.cookies ?? this.authState.cookies;
     const parts: string[] = [];
-    for (const [name, value] of this.authState.cookies) {
+    for (const [name, value] of cookies) {
       parts.push(`${name}=${value}`);
     }
     return parts.join('; ');

@@ -8,10 +8,10 @@ export type PlatformType = 'net8' | 'netframework';
 export interface BpmConfig {
   /** Base URL of BPMSoft application (e.g. https://example.bpmsoft.com) */
   bpmsoft_url: string;
-  /** Login username */
-  username: string;
-  /** Login password */
-  password: string;
+  /** Login username (only used with env-creds opt-in) */
+  username?: string;
+  /** Login password (only used with env-creds opt-in) */
+  password?: string;
   /** OData protocol version (default: 4) */
   odata_version: ODataVersion;
   /** Platform type (default: net8) */
