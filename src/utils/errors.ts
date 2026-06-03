@@ -53,6 +53,27 @@ export class AuthenticationError extends BpmApiError {
   }
 }
 
+/**
+ * Бросается, когда входящий запрос не содержит per-request авторизации
+ * (нет BPMCSRF/cookies) и env-creds opt-in выключен.
+ */
+export class AuthRequiredError extends BpmApiError {
+  constructor() {
+    super(
+      'Запрос не содержит авторизации. Передайте заголовок BPMCSRF и cookies (.ASPXAUTH, BPMSESSIONID, CsrfToken) во входящем HTTP-запросе.',
+      401,
+      undefined,
+      'Per-request авторизация: токен и куки извлекаются из входящего запроса (mcp-proxy-server pattern).',
+      undefined,
+      [
+        'Убедитесь, что MCP-клиент шлёт заголовки BPMCSRF и Cookie актуальной сессии BPMSoft.',
+        'Сессия BPMSoft могла истечь — переавторизуйтесь в BPMSoft и повторите запрос.',
+      ]
+    );
+    this.name = 'AuthRequiredError';
+  }
+}
+
 export class NotFoundError extends BpmApiError {
   constructor(collection: string, id?: string) {
     const msg = id
