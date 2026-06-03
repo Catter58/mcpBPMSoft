@@ -22,18 +22,40 @@
    cookies, тайм-аутами, ретраями и проверкой origin. Здесь же — `buildHeaders(contentKind)`.
 5. **Типы** — `src/types/index.ts` (`BpmConfig`, `ODataVersion`, `PlatformType`, и пр.).
 
+## Модель авторизации и транспорт
+
+**Транспорт по умолчанию — Streamable HTTP** (порт `MCP_HTTP_PORT`, default 8007).
+Для локальной отладки: `MCP_TRANSPORT=stdio`.
+
+**Авторизация по умолчанию — per-request.**
+Каждый входящий HTTP-запрос должен нести заголовок `BPMCSRF` и cookie `.ASPXAUTH`,
+`BPMSESSIONID`, `CsrfToken`. Сервер извлекает их через AsyncLocalStorage и пробрасывает
+в OData-запросы к BPMSoft. Секреты на сервере не хранятся. Запрос без авторизации →
+`AuthRequiredError`. Эта модель аналогична mcp-proxy-server.
+
+**`BPMSOFT_URL` — единственная обязательная переменная среды.** Если не задана — сервер
+завершается с фатальной ошибкой при старте.
+
+**Env-creds — скрытый opt-in** (`BPMSOFT_ALLOW_ENV_CREDS=true`). При включении:
+- добавляется путь логина через `BPMSOFT_USERNAME` / `BPMSOFT_PASSWORD`;
+- регистрируется инструмент `bpm_init`.
+По умолчанию `bpm_init` **не регистрируется**. В документации и подсказках по умолчанию
+env-creds путь не упоминается — показывать только если opt-in явно включён.
+
 ## Поток управления
 
 При старте `src/index.ts`:
 
-1. `tryLoadConfigFromEnv()` пытается собрать `BpmConfig` из `BPMSOFT_URL` / `BPMSOFT_USERNAME` /
-   `BPMSOFT_PASSWORD` (и опционально `BPMSOFT_ODATA_VERSION`, `BPMSOFT_PLATFORM`).
-2. Если env есть — `initializeServices(config)` сразу собирает контейнер.
-   Если нет — создаётся пустой контейнер; пользователь обязан вызвать `bpm_init` первым.
-3. Регистрируются все группы инструментов (read/write/schema/batch/stream) и `bpm_init`.
-4. На каждый MCP-вызов tool сначала проверяет `services.config` (через `notInitialized()`),
-   затем вызывает `services.authManager.ensureAuthenticated()` и далее обращается к
-   `odataClient` / `lookupResolver` / `metadataManager`.
+1. `BPMSOFT_URL` проверяется; отсутствие → фатальная ошибка.
+2. `tryLoadConfigFromEnv()` собирает `BpmConfig` из `BPMSOFT_URL` (и опц.
+   `BPMSOFT_ODATA_VERSION`, `BPMSOFT_PLATFORM`).
+3. Если `BPMSOFT_ALLOW_ENV_CREDS=true` — дополнительно подтягиваются
+   `BPMSOFT_USERNAME` / `BPMSOFT_PASSWORD`; регистрируется `bpm_init`.
+4. Сервис-контейнер собирается сразу; авторизационный контекст каждого запроса
+   хранится в AsyncLocalStorage и живёт ровно время одного MCP-вызова.
+5. Регистрируются все группы инструментов (read/write/schema/batch/stream).
+6. На каждый MCP-вызов tool извлекает auth-контекст из ALS,
+   затем обращается к `odataClient` / `lookupResolver` / `metadataManager`.
 
 ## Контракт Content-Type / Accept
 
