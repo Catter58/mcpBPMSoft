@@ -6,7 +6,7 @@ import * as z from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import type { BpmConfig } from '../types/index.js';
-import { buildConfig, getODataBaseUrl } from '../config.js';
+import { buildConfig, getODataBaseUrl, isEnvCredsAllowed } from '../config.js';
 import { HttpClient } from '../client/http-client.js';
 import { AuthManager } from '../auth/auth-manager.js';
 import { ODataClient } from '../client/odata-client.js';
@@ -39,9 +39,10 @@ export function createEmptyContainer(): ServiceContainer {
   };
 }
 
-export function initializeServices(config: BpmConfig): ServiceContainer {
+export function initializeServices(config: BpmConfig, allowEnvCreds: boolean = isEnvCredsAllowed()): ServiceContainer {
   const httpClient = new HttpClient(config);
-  const authManager = new AuthManager(config, httpClient);
+  httpClient.setAllowEnvCreds(allowEnvCreds);
+  const authManager = new AuthManager(config, httpClient, allowEnvCreds);
   const odataClient = new ODataClient(config, httpClient);
   const metadataManager = new MetadataManager(config, odataClient, httpClient);
   const lookupResolver = new LookupResolver(config, odataClient, metadataManager);
