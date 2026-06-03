@@ -1,6 +1,6 @@
 {
   "name": "mcp-bpmsoft-odata",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "MCP server for BPMSoft OData API integration",
   "type": "module",
   "bin": {

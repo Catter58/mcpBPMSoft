@@ -10,6 +10,7 @@ import { ODataClient } from '../client/odata-client.js';
 import { MetadataManager } from '../metadata/metadata-manager.js';
 import { LookupResolutionError } from '../utils/errors.js';
 import { assertSafeIdentifier, escapeODataString } from '../utils/odata.js';
+import { getAuthCacheScope } from '../auth/request-context.js';
 
 interface CacheEntry {
   result: LookupResult;
@@ -41,7 +42,7 @@ export class LookupResolver {
     assertSafeIdentifier(lookupCollection, 'lookup collection');
     assertSafeIdentifier(displayColumn, 'lookup column');
 
-    const cacheKey = `${lookupCollection}:${displayColumn}:${displayValue}:${options.fuzzy ? 'fuzzy' : 'eq'}`;
+    const cacheKey = `${getAuthCacheScope()}:${lookupCollection}:${displayColumn}:${displayValue}:${options.fuzzy ? 'fuzzy' : 'eq'}`;
 
     const cached = this.cache.get(cacheKey);
     if (cached && Date.now() - cached.timestamp < this.config.lookup_cache_ttl * 1000) {

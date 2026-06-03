@@ -4,6 +4,7 @@ import {
   LookupResolutionError,
   parseODataError,
   formatToolError,
+  AuthRequiredError,
 } from '../../src/utils/errors.js';
 
 describe('BpmApiError.toString', () => {
@@ -79,5 +80,18 @@ describe('formatToolError', () => {
     const out = formatToolError('string error');
     expect(out.success).toBe(false);
     expect(out.error).toBe('string error');
+  });
+});
+
+describe('AuthRequiredError', () => {
+  it('is a 401 BpmApiError with a clear ToolError', () => {
+    const err = new AuthRequiredError();
+    expect(err.name).toBe('AuthRequiredError');
+    expect(err.httpStatus).toBe(401);
+    const tool = err.toToolError();
+    expect(tool.success).toBe(false);
+    expect(tool.error).toMatch(/BPMCSRF/);
+    expect(tool.error).toMatch(/CsrfToken/);
+    expect(tool.next_steps && tool.next_steps.length).toBeTruthy();
   });
 });

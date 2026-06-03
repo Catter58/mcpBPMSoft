@@ -9,7 +9,7 @@
 - защиту от случайного массового удаления, переполнения контекста модели и SSRF;
 - запуск бизнес-процессов через `ProcessEngineService`.
 
-В коробке **32 инструмента, 6 prompts, 4 ресурса** — от низкоуровневого CRUD до готовых сценариев «зарегистрировать контакт + контрагента» и «найти всё про Иванова».
+В коробке **31 операционный инструмент (+ `bpm_init` при включённом env-creds opt-in), 6 prompts, 4 ресурса** — от низкоуровневого CRUD до готовых сценариев «зарегистрировать контакт + контрагента» и «найти всё про Иванова».
 
 ---
 
@@ -19,7 +19,7 @@
 - [Быстрый старт за 5 минут](#быстрый-старт-за-5-минут)
 - [Подключение к Claude Desktop](#подключение-к-claude-desktop)
 - [Примеры диалогов](#примеры-диалогов)
-- [Все 32 инструмента — кратко](#все-32-инструмента--кратко)
+- [Все инструменты — кратко](#все-инструменты--кратко)
 - [Готовые сценарии (MCP prompts)](#готовые-сценарии-mcp-prompts)
 - [Ресурсы (MCP resources)](#ресурсы-mcp-resources)
 - [Конфигурация](#конфигурация)
@@ -82,34 +82,23 @@ npm install
 # 3. Собрать
 npm run build
 
-# 4. Прописать подключение в .env (или передать переменные среды)
+# 4. Прописать URL целевого стенда в .env
 cp .env.example .env
-# открыть .env, заполнить BPMSOFT_URL / USERNAME / PASSWORD
+# открыть .env, заполнить BPMSOFT_URL
 
-# 5. Запустить (с переменными среды)
+# 5. Запустить сервер
 npm start
 ```
 
-Сервер общается через stdio — это стандартный транспорт MCP. Самостоятельный запуск нужен только для отладки; в реальной жизни сервер запускает MCP-клиент (Claude Desktop, Cursor и т.п.) — см. ниже.
+По умолчанию сервер поднимает **Streamable HTTP** транспорт на порту `8007`. MCP-клиент обращается к нему по HTTP с авторизационными заголовками своего пользователя — секреты на сервере не хранятся.
 
-### Альтернатива: интерактивная инициализация
-
-Если не хочешь хранить пароль в `.env`, запусти сервер без переменных и попроси LLM вызвать инструмент `bpm_init`:
-
-```
-Агент: bpm_init
-       url:      https://mycompany.bpmsoft.com
-       username: Supervisor
-       password: ***
-```
-
-Сервер сразу проверит подключение, и все остальные инструменты станут доступны.
+Для локальной отладки через stdio установите `MCP_TRANSPORT=stdio` в `.env`.
 
 ---
 
 ## Подключение к Claude Desktop
 
-В файле `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) или `%APPDATA%\Claude\claude_desktop_config.json` (Windows):
+Сервер использует **Streamable HTTP** транспорт по умолчанию. Для Claude Desktop, который запускает процесс локально, удобен режим stdio. В файле `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) или `%APPDATA%\Claude\claude_desktop_config.json` (Windows):
 
 ```json
 {
@@ -118,9 +107,8 @@ npm start
       "command": "node",
       "args": ["/абсолютный/путь/к/mcpBPMSoft/build/index.js"],
       "env": {
-        "BPMSOFT_URL":      "https://mycompany.bpmsoft.com",
-        "BPMSOFT_USERNAME": "Supervisor",
-        "BPMSOFT_PASSWORD": "пароль",
+        "BPMSOFT_URL":       "https://mycompany.bpmsoft.com",
+        "MCP_TRANSPORT":     "stdio",
         "BPMSOFT_ODATA_VERSION": "4",
         "BPMSOFT_PLATFORM":      "net8"
       }
@@ -129,9 +117,9 @@ npm start
 }
 ```
 
-Перезапустить Claude Desktop. В чате появится бейдж `bpmsoft`, и список из 32 инструментов будет доступен модели.
+Перезапустить Claude Desktop. В чате появится бейдж `bpmsoft`, и инструменты будут доступны модели.
 
-Если предпочитаешь интерактивный логин — оставь блок `env` пустым и попроси Claude вызвать `bpm_init` в начале диалога.
+> **Авторизация в stdio-режиме.** При запуске через Claude Desktop аутентификация выполняется per-request: каждый вызов инструмента должен нести заголовок `BPMCSRF` и cookie `.ASPXAUTH`, `BPMSESSIONID`, `CsrfToken` — Claude Desktop передаёт их автоматически из сессии браузера пользователя. Секреты на сервере не хранятся.
 
 Полный пример — в [`examples/claude_desktop_config.json`](examples/claude_desktop_config.json).
 
@@ -242,13 +230,13 @@ Claude → bpm_post_feed
 
 ---
 
-## Все 32 инструмента — кратко
+## Все инструменты — кратко
 
-### Подключение
+### Подключение (env-creds opt-in)
 
 | Инструмент | Зачем |
 |---|---|
-| `bpm_init` | Подключиться к BPMSoft (URL, логин/пароль, OData v3/v4, платформа) |
+| `bpm_init` | Подключиться к BPMSoft через логин/пароль (доступен только при `BPMSOFT_ALLOW_ENV_CREDS=true`) |
 
 ### Чтение
 
@@ -350,13 +338,15 @@ bpmsoft://schema/{name}                  — только схема колле�
 
 ## Конфигурация
 
-Все параметры — через переменные окружения. Минимально необходимы первые три, остальные имеют разумные defaults:
+Все параметры — через переменные окружения. Единственная обязательная переменная — `BPMSOFT_URL`; остальные имеют разумные defaults.
+
+### Основные параметры
 
 | Переменная | По умолчанию | Описание |
 |---|---|---|
 | `BPMSOFT_URL` | — *(обязательно)* | URL приложения, например `https://mycompany.bpmsoft.com` |
-| `BPMSOFT_USERNAME` | — *(обязательно)* | Логин |
-| `BPMSOFT_PASSWORD` | — *(обязательно)* | Пароль |
+| `MCP_TRANSPORT` | `http` | Транспорт: `http` (Streamable HTTP, production) или `stdio` (локальная отладка) |
+| `MCP_HTTP_PORT` | `8007` | Порт HTTP-сервера (при `MCP_TRANSPORT=http`) |
 | `BPMSOFT_ODATA_VERSION` | `4` | `4` или `3` |
 | `BPMSOFT_PLATFORM` | `net8` | `net8` или `netframework` |
 | `BPMSOFT_PAGE_SIZE` | `5000` | Размер страницы при автопагинации |
@@ -366,7 +356,24 @@ bpmsoft://schema/{name}                  — только схема колле�
 | `BPMSOFT_MAX_FILE_SIZE` | `10485760` | Лимит размера файла (10 МБ) |
 | `BPMSOFT_DEBUG` | `off` | `1` — логировать `method url status duration`; `trace` — ещё и тела с маскированием паролей и токенов |
 
-Без переменных среды сервер всё равно стартует, но любой инструмент кроме `bpm_init` ответит «сервер не инициализирован».
+### Авторизация
+
+**По умолчанию — per-request.** Сервер не хранит учётных данных. Каждый входящий MCP HTTP-запрос должен нести:
+
+- заголовок `BPMCSRF` — CSRF-токен пользователя;
+- заголовок `Cookie` с полями `.ASPXAUTH`, `BPMSESSIONID`, `CsrfToken`.
+
+Сервер извлекает эти значения через AsyncLocalStorage и пробрасывает их в каждый OData-запрос к BPMSoft. Запрос без авторизационных данных завершается ошибкой `AuthRequiredError` (HTTP 401). Эта модель аналогична mcp-proxy-server.
+
+#### Env-creds (скрытый opt-in)
+
+> **Не рекомендуется для on-prem без явного согласия службы ИБ.**
+
+Если выставить `BPMSOFT_ALLOW_ENV_CREDS=true`, сервер дополнительно:
+- включает путь аутентификации через `BPMSOFT_USERNAME` / `BPMSOFT_PASSWORD` (login через `AuthService.svc`);
+- регистрирует инструмент `bpm_init`, позволяющий передать логин/пароль через MCP-вызов.
+
+По умолчанию (`BPMSOFT_ALLOW_ENV_CREDS` не задана или `false`) `bpm_init` **не регистрируется**, а env-creds путь не используется. В стандартной документации и подсказках этот режим не рекламируется.
 
 ---
 
@@ -406,10 +413,12 @@ BPMSOFT_DEBUG=trace npm start
 [Server] Configuration loaded from environment variables
   Target: https://mycompany.bpmsoft.com
   OData: v4, Platform: net8
-MCP BPMSoft OData Server running on stdio
-Registered 32 tools (bpm_init + 31 operational)
+MCP BPMSoft OData Server running on http (port 8007)
+Registered 31 operational tools
 Registered 6 prompts, 4 resource templates
 ```
+
+При `MCP_TRANSPORT=stdio` строка транспорта будет `running on stdio`.
 
 ---
 

@@ -3,6 +3,8 @@ import { setupServer } from 'msw/node';
 import { http, HttpResponse } from 'msw';
 import { HttpClient } from '../../src/client/http-client.js';
 import { BpmApiError } from '../../src/utils/errors.js';
+import { runWithAuth, extractAuthFromHeaders } from '../../src/auth/request-context.js';
+import { AuthRequiredError } from '../../src/utils/errors.js';
 import type { BpmConfig } from '../../src/types/index.js';
 
 const ORIGIN = 'https://bpm.test';
@@ -41,6 +43,7 @@ describe('HttpClient (integration with MSW)', () => {
 
     const client = new HttpClient(makeCfg());
     client.setAllowedOrigin(ORIGIN);
+    client.setAllowEnvCreds(true);
     client.updateAuthState({ csrfToken: 'csrf-abc', isAuthenticated: true });
 
     const res = await client.request<{ value: unknown[] }>({
@@ -73,12 +76,16 @@ describe('HttpClient (integration with MSW)', () => {
     const client = new HttpClient(makeCfg());
     client.setAllowedOrigin(ORIGIN);
 
-    const res = await client.request({
-      method: 'PUT',
-      url: `${ORIGIN}/odata/Contact(1)/Photo`,
-      body: payload,
-      contentKind: 'binary',
-    });
+    const res = await runWithAuth(
+      extractAuthFromHeaders({ BPMCSRF: 't', Cookie: 'CsrfToken=t' }),
+      () =>
+        client.request({
+          method: 'PUT',
+          url: `${ORIGIN}/odata/Contact(1)/Photo`,
+          body: payload,
+          contentKind: 'binary',
+        })
+    );
 
     expect(res.status).toBe(204);
     expect(receivedLength).toBe(payload.length);
@@ -99,12 +106,16 @@ describe('HttpClient (integration with MSW)', () => {
     const client = new HttpClient(makeCfg());
     client.setAllowedOrigin(ORIGIN);
 
-    const res = await client.request<Buffer>({
-      method: 'GET',
-      url: `${ORIGIN}/odata/Contact(1)/Photo`,
-      contentKind: 'binary',
-      responseType: 'binary',
-    });
+    const res = await runWithAuth(
+      extractAuthFromHeaders({ BPMCSRF: 't', Cookie: 'CsrfToken=t' }),
+      () =>
+        client.request<Buffer>({
+          method: 'GET',
+          url: `${ORIGIN}/odata/Contact(1)/Photo`,
+          contentKind: 'binary',
+          responseType: 'binary',
+        })
+    );
 
     expect(Buffer.isBuffer(res.data)).toBe(true);
     expect(Buffer.compare(res.data, expected)).toBe(0);
@@ -124,6 +135,7 @@ describe('HttpClient (integration with MSW)', () => {
 
     const client = new HttpClient(makeCfg());
     client.setAllowedOrigin(ORIGIN);
+    client.setAllowEnvCreds(true);
 
     const reauth = vi.fn(async () => {
       client.updateAuthState({ csrfToken: 'new-token', isAuthenticated: true });
@@ -158,10 +170,14 @@ describe('HttpClient (integration with MSW)', () => {
     const client = new HttpClient(makeCfg());
     client.setAllowedOrigin(ORIGIN);
 
-    const res = await client.request<{ value: unknown[] }>({
-      method: 'GET',
-      url: `${ORIGIN}/odata/Contact`,
-    });
+    const res = await runWithAuth(
+      extractAuthFromHeaders({ BPMCSRF: 't', Cookie: 'CsrfToken=t' }),
+      () =>
+        client.request<{ value: unknown[] }>({
+          method: 'GET',
+          url: `${ORIGIN}/odata/Contact`,
+        })
+    );
 
     expect(count).toBe(2);
     expect(res.status).toBe(200);
@@ -180,9 +196,61 @@ describe('HttpClient (integration with MSW)', () => {
     client.setAllowedOrigin(ORIGIN);
 
     await expect(
-      client.request({ method: 'GET', url: 'https://evil.example/x' })
+      runWithAuth(extractAuthFromHeaders({ BPMCSRF: 't', Cookie: 'CsrfToken=t' }), () =>
+        client.request({ method: 'GET', url: 'https://evil.example/x' })
+      )
     ).rejects.toBeInstanceOf(BpmApiError);
 
     expect(evilCalled).toBe(false);
+  });
+});
+
+describe('HttpClient auth resolution', () => {
+  it('per-request: sends caller BPMCSRF + forwarded cookies from ALS', async () => {
+    let captured: Headers | null = null;
+    server.use(
+      http.get(`${ORIGIN}/odata/Contact`, ({ request }) => {
+        captured = request.headers;
+        return HttpResponse.json({ value: [] });
+      })
+    );
+
+    const client = new HttpClient(makeCfg());
+    client.setAllowedOrigin(ORIGIN);
+
+    const auth = extractAuthFromHeaders({
+      BPMCSRF: 'req-csrf',
+      Cookie: '.ASPXAUTH=aaa; BPMSESSIONID=sss; CsrfToken=ttt',
+    });
+
+    const res = await runWithAuth(auth, () =>
+      client.request<{ value: unknown[] }>({ method: 'GET', url: `${ORIGIN}/odata/Contact` })
+    );
+
+    expect(res.status).toBe(200);
+    expect(captured!.get('bpmcsrf')).toBe('req-csrf');
+    expect(captured!.get('forceusesession')).toBe('true');
+    const cookie = captured!.get('cookie') || '';
+    expect(cookie).toContain('.ASPXAUTH=aaa');
+    expect(cookie).toContain('BPMSESSIONID=sss');
+    expect(cookie).toContain('CsrfToken=ttt');
+  });
+
+  it('no auth + env-creds off -> AuthRequiredError before network', async () => {
+    let called = false;
+    server.use(
+      http.get(`${ORIGIN}/odata/Contact`, () => {
+        called = true;
+        return HttpResponse.json({ value: [] });
+      })
+    );
+
+    const client = new HttpClient(makeCfg());
+    client.setAllowedOrigin(ORIGIN);
+
+    await expect(
+      client.request({ method: 'GET', url: `${ORIGIN}/odata/Contact` })
+    ).rejects.toBeInstanceOf(AuthRequiredError);
+    expect(called).toBe(false);
   });
 });
