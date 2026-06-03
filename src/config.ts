@@ -19,17 +19,27 @@ const DEFAULT_CONFIG: Omit<BpmConfig, 'bpmsoft_url' | 'username' | 'password'> =
 };
 
 /**
+ * Whether env-stored credentials are allowed (hidden opt-in).
+ * Default: false. Enables AuthService login + bpm_init credential path.
+ */
+export function isEnvCredsAllowed(): boolean {
+  const v = (process.env.BPMSOFT_ALLOW_ENV_CREDS || '').toLowerCase();
+  return v === '1' || v === 'true' || v === 'on';
+}
+
+/**
  * Try loading configuration from environment variables.
- * Returns null if required vars are missing (allows runtime init via bpm_init).
+ * Requires only BPMSOFT_URL (the target stand). Credentials are loaded ONLY
+ * when the env-creds opt-in is enabled; otherwise auth comes per-request.
+ * Returns null if BPMSOFT_URL is missing.
  */
 export function tryLoadConfigFromEnv(): BpmConfig | null {
   const url = process.env.BPMSOFT_URL;
-  const username = process.env.BPMSOFT_USERNAME;
-  const password = process.env.BPMSOFT_PASSWORD;
+  if (!url) return null;
 
-  if (!url || !username || !password) {
-    return null;
-  }
+  const allowCreds = isEnvCredsAllowed();
+  const username = allowCreds ? process.env.BPMSOFT_USERNAME : undefined;
+  const password = allowCreds ? process.env.BPMSOFT_PASSWORD : undefined;
 
   return buildConfig(url, username, password, {
     odata_version: process.env.BPMSOFT_ODATA_VERSION,
@@ -43,8 +53,8 @@ export function tryLoadConfigFromEnv(): BpmConfig | null {
  */
 export function buildConfig(
   url: string,
-  username: string,
-  password: string,
+  username?: string,
+  password?: string,
   options?: {
     odata_version?: string | number;
     platform?: string;
