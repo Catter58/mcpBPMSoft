@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { LookupResolver } from '../../src/lookup/lookup-resolver.js';
+import { runWithAuth, extractAuthFromHeaders } from '../../src/auth/request-context.js';
 import type { BpmConfig, ODataCollectionResponse } from '../../src/types/index.js';
 
 function makeCfg(): BpmConfig {
@@ -115,5 +116,36 @@ describe('LookupResolver LRU cache', () => {
     // "A" evicted — must hit network again
     await resolver.resolve('City', 'A');
     expect(od.calls).toHaveLength(4);
+  });
+});
+
+describe('LookupResolver per-session cache isolation', () => {
+  it('does not serve one session cached lookup to another session', async () => {
+    const od = makeStubODataClient(() => [{ Id: 'guid-1', Name: 'Moscow' }]);
+    const resolver = new LookupResolver(makeCfg(), od as never, {} as never);
+
+    const authA = extractAuthFromHeaders({ Cookie: 'BPMSESSIONID=sessA' });
+    const authB = extractAuthFromHeaders({ Cookie: 'BPMSESSIONID=sessB' });
+
+    await runWithAuth(authA, () => resolver.resolve('City', 'Moscow'));
+    expect(od.calls).toHaveLength(1);
+
+    // Same value, different session — must NOT hit cache (would be a cross-user leak).
+    await runWithAuth(authB, () => resolver.resolve('City', 'Moscow'));
+    expect(od.calls).toHaveLength(2);
+  });
+
+  it('still caches within the same session', async () => {
+    const od = makeStubODataClient(() => [{ Id: 'guid-1', Name: 'Moscow' }]);
+    const resolver = new LookupResolver(makeCfg(), od as never, {} as never);
+
+    const authA = extractAuthFromHeaders({ Cookie: 'BPMSESSIONID=sessA' });
+
+    await runWithAuth(authA, () => resolver.resolve('City', 'Moscow'));
+    expect(od.calls).toHaveLength(1);
+
+    // Same value, same session, immediate — cache hit, no new backend query.
+    await runWithAuth(authA, () => resolver.resolve('City', 'Moscow'));
+    expect(od.calls).toHaveLength(1);
   });
 });

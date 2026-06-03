@@ -1,9 +1,10 @@
 /**
  * Configuration management for BPMSoft MCP Server
  *
- * Supports two modes:
- * 1. Pre-configured via environment variables (headless/CI)
- * 2. Runtime initialization via bpm_init tool (interactive)
+ * Per-request auth is the default: each request carries its own BPMCSRF/cookies.
+ * Static config (URL + tuning) comes from environment variables. The legacy
+ * env-creds / bpm_init credential flow is a hidden opt-in, enabled only via
+ * BPMSOFT_ALLOW_ENV_CREDS=true (headless/CI single-identity scenarios).
  */
 
 import type { BpmConfig, ODataVersion, PlatformType } from './types/index.js';
