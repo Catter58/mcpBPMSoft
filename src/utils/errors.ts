@@ -207,8 +207,8 @@ export function formatToolError(error: unknown, collection?: string): ToolError 
 function defaultNextSteps(httpStatus?: number, collection?: string): string[] | undefined {
   if (httpStatus === 401 || httpStatus === 403) {
     return [
-      'Запросите у пользователя проверить срок действия учётной записи.',
-      'Если ошибка повторяется — повторно вызовите bpm_init с актуальными данными.',
+      'Сессия BPMSoft могла истечь — переавторизуйтесь в BPMSoft и повторите запрос с актуальными BPMCSRF/cookies.',
+      'Если сервер запущен в режиме env-creds (BPMSOFT_ALLOW_ENV_CREDS=true) — повторно вызовите bpm_init с актуальными учётными данными.',
     ];
   }
   if (httpStatus === 400 && collection) {

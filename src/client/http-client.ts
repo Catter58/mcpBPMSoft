@@ -99,7 +99,7 @@ export class HttpClient {
   }
 
   getAuthState(): AuthState {
-    return { ...this.authState };
+    return { ...this.authState, cookies: new Map(this.authState.cookies) };
   }
 
   /**

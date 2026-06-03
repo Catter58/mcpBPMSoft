@@ -8,6 +8,7 @@
  */
 
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { createHash } from 'node:crypto';
 
 export interface RequestAuth {
   /** BPMCSRF token from the incoming request header. */
@@ -75,4 +76,22 @@ export function getRequestAuth(): RequestAuth | undefined {
 /** True when the auth carries usable credentials (token or at least one cookie). */
 export function hasRequestAuth(auth: RequestAuth | undefined): auth is RequestAuth {
   return !!auth && (!!auth.csrfToken || auth.cookies.size > 0);
+}
+
+/**
+ * Stable cache-scope token for the current request, used to isolate per-user
+ * cached data (e.g. lookup results) so one caller's data is never served to
+ * another. Derived (hashed) from the session cookie; empty string when there
+ * is no per-request auth (env-creds / stdio mode → a single shared identity).
+ */
+export function getAuthCacheScope(): string {
+  const auth = getRequestAuth();
+  if (!auth) return '';
+  const token =
+    auth.cookies.get('BPMSESSIONID') ||
+    auth.cookies.get('.ASPXAUTH') ||
+    auth.csrfToken ||
+    '';
+  if (!token) return '';
+  return createHash('sha256').update(token).digest('hex').slice(0, 16);
 }
