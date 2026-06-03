@@ -70,7 +70,7 @@ async function main(): Promise<void> {
   const buildServer = (): McpServer => {
     const server = new McpServer({
       name: 'mcp-bpmsoft-odata',
-      version: '0.2.0',
+      version: '0.3.0',
     });
 
     // bpm_init is only exposed when env-stored credentials are explicitly enabled.
