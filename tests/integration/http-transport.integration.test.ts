@@ -43,10 +43,13 @@ describe('HTTP transport forwards per-request auth', () => {
     );
 
     const services = initializeServices(cfg(), false);
-    const mcp = new McpServer({ name: 'test', version: '0.0.0' });
-    registerReadTools(mcp, services);
+    const makeServer = () => {
+      const mcp = new McpServer({ name: 'test', version: '0.0.0' });
+      registerReadTools(mcp, services);
+      return mcp;
+    };
 
-    const httpServer = await startHttpServer(mcp, { port: 0, host: '127.0.0.1' });
+    const httpServer = await startHttpServer(makeServer, { port: 0, host: '127.0.0.1' });
     const { port } = httpServer.address() as AddressInfo;
 
     const client = new Client({ name: 'test-client', version: '0.0.0' });
