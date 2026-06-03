@@ -8,18 +8,20 @@
 
 import type { BpmConfig, LoginResponse } from '../types/index.js';
 import { HttpClient } from '../client/http-client.js';
-import { AuthenticationError } from '../utils/errors.js';
+import { AuthenticationError, AuthRequiredError } from '../utils/errors.js';
 import { getAuthUrl } from '../config.js';
+import { getRequestAuth, hasRequestAuth } from './request-context.js';
 
 export class AuthManager {
   private authUrl: string;
 
   constructor(
     private config: BpmConfig,
-    private httpClient: HttpClient
+    private httpClient: HttpClient,
+    private allowEnvCreds: boolean = false
   ) {
     this.authUrl = getAuthUrl(config);
-
+    this.httpClient.setAllowEnvCreds(allowEnvCreds);
     this.httpClient.setReauthHandler(() => this.login());
   }
 
@@ -69,14 +71,21 @@ export class AuthManager {
   }
 
   /**
-   * Ensure we're authenticated before making requests.
-   * If not authenticated yet, performs login.
+   * Ensure auth is available before making requests.
+   * - Per-request mode: auth is carried by the incoming request (ALS) — no-op.
+   * - Env-creds opt-in: log in with stored credentials if not yet authenticated.
+   * - Otherwise: reject with AuthRequiredError.
    */
   async ensureAuthenticated(): Promise<void> {
-    const state = this.httpClient.getAuthState();
-    if (!state.isAuthenticated) {
-      await this.login();
+    if (hasRequestAuth(getRequestAuth())) return;
+
+    if (this.allowEnvCreds) {
+      const state = this.httpClient.getAuthState();
+      if (!state.isAuthenticated) await this.login();
+      return;
     }
+
+    throw new AuthRequiredError();
   }
 
   /**
