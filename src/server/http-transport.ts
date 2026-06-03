@@ -7,45 +7,37 @@
  *
  * Stateless: no server-side session state is retained.
  *
- * Transport mode chosen: STATELESS, FRESH-TRANSPORT-PER-REQUEST,
- * with SERIALIZED connect/close against the shared McpServer.
+ * Transport mode chosen: STATELESS, FRESH-SERVER-AND-TRANSPORT-PER-REQUEST,
+ * fully concurrent (no serialization).
  *
- * Why per-request transport (not a single persistent one):
+ * Why per-request server + transport:
  *   SDK 1.29's StreamableHTTPServerTransport in stateless mode
- *   (`sessionIdGenerator: undefined`) explicitly refuses to be reused —
- *   the second `handleRequest` throws "Stateless transport cannot be reused
- *   across requests. Create a new transport per request." (see
- *   webStandardStreamableHttp.js). Because an MCP client performs several
- *   POSTs over one logical connection (initialize, then
- *   notifications/initialized, then tool calls), a single persistent transport
- *   would fail after the first request. We therefore create a fresh transport
- *   per HTTP request and (re)connect the shared McpServer to it.
- *
- * Why serialize:
- *   A single McpServer (Protocol) allows only one connected transport at a
- *   time — `connect()` throws "Already connected to a transport" otherwise.
- *   The client fires `notifications/initialized` immediately after the
- *   initialize response, so the next POST can arrive before the previous
- *   transport has detached. We chain requests on a promise and explicitly
- *   `close()` each transport (detaching it from the server) before connecting
- *   the next, so connect/close stays strictly sequential.
+ *   (`sessionIdGenerator: undefined`) explicitly refuses to be reused across
+ *   requests, and a single McpServer (Protocol) allows only one connected
+ *   transport at a time. Rather than serialize all requests against one shared
+ *   server (which would funnel every slow OData round-trip through a single
+ *   lane), we build a fresh McpServer + fresh stateless transport PER REQUEST.
+ *   Each request runs in its own server/transport with its own
+ *   AsyncLocalStorage auth context, so callers' BPMCSRF/cookies never cross
+ *   between requests and slow OData round-trips overlap instead of serializing.
+ *   Re-registering the ~36 tools per request is cheap in-memory work
+ *   (single-digit ms) that overlaps the network I/O it enables.
  *
  * Why `enableJsonResponse: true`:
  *   It returns a single buffered JSON response per POST instead of an
- *   open-ended SSE stream, which makes the per-request close deterministic and
- *   avoids holding the Node response open. The SDK client consumes either mode.
+ *   open-ended SSE stream. With JSON responses, `handleRequest` resolves after
+ *   the response has been sent, so closing the transport/server in `finally`
+ *   afterwards is safe. The SDK client consumes either mode.
  *
  * Why GET/DELETE -> 405:
  *   After initialize, the SDK client opens a standalone GET SSE stream for
- *   server-initiated messages. That stream is long-lived and would block our
- *   serialized POST chain forever. In stateless JSON-response mode we have no
+ *   server-initiated messages. In stateless JSON-response mode we have no
  *   server-initiated traffic, so we reject GET/DELETE with 405 (same as the
  *   SDK's stateless example); the client treats the optional GET stream's
  *   failure as non-fatal and proceeds with POSTs.
  *
  * The ALS wrap (`runWithAuth`) surrounds `transport.handleRequest`, so the
- * caller's auth is in-context when the tool callback runs inside the promise
- * chain started within that scope.
+ * caller's auth is in-context when the tool callback runs.
  */
 
 import http from 'node:http';
@@ -53,41 +45,59 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { extractAuthFromHeaders, runWithAuth } from '../auth/request-context.js';
 
+const MAX_BODY_BYTES = 4 * 1024 * 1024;
+
 export interface HttpServerOptions {
   port: number;
   host?: string;
 }
 
+/**
+ * Host the MCP server over Streamable HTTP.
+ *
+ * A fresh McpServer + stateless transport is built PER REQUEST (the SDK's
+ * Protocol allows only one connected transport at a time, and a stateless
+ * transport cannot be reused). This keeps requests fully concurrent — each
+ * runs in its own server/transport with its own AsyncLocalStorage auth
+ * context, so callers' BPMCSRF/cookies never cross between requests and
+ * slow OData round-trips overlap instead of serializing.
+ *
+ * `createServer` must return a fully-registered McpServer (tools/prompts/resources).
+ */
 export async function startHttpServer(
-  server: McpServer,
+  createServer: () => McpServer,
   opts: HttpServerOptions
 ): Promise<http.Server> {
-  // Serializes connect/handle/close cycles against the single shared McpServer
-  // so only one transport is ever connected at a time (see file header).
-  let chain: Promise<void> = Promise.resolve();
-
   const httpServer = http.createServer((req, res) => {
-    // Only POST carries JSON-RPC. Reject the optional standalone GET SSE stream
-    // (and DELETE) with 405 so they don't block the serialized POST chain.
+    // GET/DELETE (standalone SSE / session teardown) unsupported in stateless JSON mode.
     if (req.method !== 'POST') {
       res.statusCode = 405;
       res.setHeader('Allow', 'POST');
-      res.setHeader('Content-Type', 'application/json');
-      res.end(
-        JSON.stringify({
-          jsonrpc: '2.0',
-          error: { code: -32000, message: 'Method not allowed.' },
-          id: null,
-        })
-      );
+      res.end();
       return;
     }
 
     const auth = extractAuthFromHeaders(req.headers);
 
     const chunks: Buffer[] = [];
-    req.on('data', (c: Buffer) => chunks.push(c));
+    let size = 0;
+    let aborted = false;
+    req.on('data', (c: Buffer) => {
+      size += c.length;
+      if (size > MAX_BODY_BYTES) {
+        aborted = true;
+        if (!res.headersSent) {
+          res.statusCode = 413;
+          res.end();
+        }
+        req.destroy();
+        return;
+      }
+      chunks.push(c);
+    });
+
     req.on('end', () => {
+      if (aborted) return;
       let body: unknown;
       const raw = Buffer.concat(chunks).toString('utf8');
       try {
@@ -95,39 +105,7 @@ export async function startHttpServer(
       } catch {
         body = undefined;
       }
-
-      // Wait for any in-flight request to fully detach before connecting.
-      chain = chain.then(async () => {
-        // Fresh stateless transport per request (see file header for rationale).
-        const transport = new StreamableHTTPServerTransport({
-          sessionIdGenerator: undefined,
-          enableJsonResponse: true,
-        });
-
-        const finished = new Promise<void>((resolve) => {
-          res.on('close', () => resolve());
-          res.on('finish', () => resolve());
-        });
-
-        try {
-          await server.connect(transport);
-          await runWithAuth(auth, () => transport.handleRequest(req, res, body));
-          // Ensure the response is flushed before detaching the transport.
-          await finished;
-        } catch (err) {
-          console.error('[http-transport] handleRequest error:', err);
-          if (!res.headersSent) {
-            res.statusCode = 500;
-            res.end();
-          }
-        } finally {
-          // Detach this transport from the shared server (resets server._transport)
-          // so the next queued request can connect cleanly.
-          await transport.close().catch(() => {
-            /* already closing */
-          });
-        }
-      });
+      void handlePost(createServer, auth, req, res, body);
     });
 
     req.on('error', (err) => {
@@ -148,4 +126,31 @@ export async function startHttpServer(
   console.error(`[http-transport] listening on ${opts.host ?? '0.0.0.0'}:${shownPort}`);
 
   return httpServer;
+}
+
+async function handlePost(
+  createServer: () => McpServer,
+  auth: ReturnType<typeof extractAuthFromHeaders>,
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  body: unknown
+): Promise<void> {
+  const server = createServer();
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: undefined,
+    enableJsonResponse: true,
+  });
+  try {
+    await server.connect(transport);
+    await runWithAuth(auth, () => transport.handleRequest(req, res, body));
+  } catch (err) {
+    console.error('[http-transport] handleRequest error:', err);
+    if (!res.headersSent) {
+      res.statusCode = 500;
+      res.end();
+    }
+  } finally {
+    await transport.close().catch(() => {});
+    await server.close().catch(() => {});
+  }
 }

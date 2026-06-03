@@ -62,30 +62,39 @@ async function main(): Promise<void> {
     `  Auth mode: ${allowEnvCreds ? 'env-creds opt-in (bpm_init available)' : 'per-request (caller forwards credentials)'}`
   );
 
-  const server = new McpServer({
-    name: 'mcp-bpmsoft-odata',
-    version: '0.2.0',
-  });
-
-  // bpm_init is only exposed when env-stored credentials are explicitly enabled.
-  if (allowEnvCreds) {
-    registerInitTool(server, services, (newContainer) => {
-      services = newContainer;
+  // Build a fully-registered McpServer. The HTTP path calls this once per
+  // request (see http-transport.ts) so concurrent callers each get their own
+  // server/transport; the stdio path calls it once. `services` is shared across
+  // all instances — it holds the HttpClient/AuthManager which read per-request
+  // auth from AsyncLocalStorage and are stateless w.r.t. user identity.
+  const buildServer = (): McpServer => {
+    const server = new McpServer({
+      name: 'mcp-bpmsoft-odata',
+      version: '0.2.0',
     });
-  }
 
-  registerReadTools(server, services);
-  registerWriteTools(server, services);
-  registerSchemaTools(server, services);
-  registerDescribeInstanceTool(server, services);
-  registerEnumTool(server, services);
-  registerWorkflowCatalogTool(server, services);
-  registerBatchTools(server, services);
-  registerStreamTools(server, services);
-  registerWorkflowTools(server, services);
-  registerProcessTools(server, services);
-  registerPrompts(server, services);
-  registerResources(server, services);
+    // bpm_init is only exposed when env-stored credentials are explicitly enabled.
+    if (allowEnvCreds) {
+      registerInitTool(server, services, (newContainer) => {
+        services = newContainer;
+      });
+    }
+
+    registerReadTools(server, services);
+    registerWriteTools(server, services);
+    registerSchemaTools(server, services);
+    registerDescribeInstanceTool(server, services);
+    registerEnumTool(server, services);
+    registerWorkflowCatalogTool(server, services);
+    registerBatchTools(server, services);
+    registerStreamTools(server, services);
+    registerWorkflowTools(server, services);
+    registerProcessTools(server, services);
+    registerPrompts(server, services);
+    registerResources(server, services);
+
+    return server;
+  };
 
   const operational = TOOLS.filter((t) => t.category !== 'init').length;
   const registeredTools = allowEnvCreds ? operational + 1 : operational;
@@ -96,12 +105,13 @@ async function main(): Promise<void> {
 
   const transportKind = (process.env.MCP_TRANSPORT || 'http').toLowerCase();
   if (transportKind === 'stdio') {
+    const server = buildServer();
     const transport = new StdioServerTransport();
     await server.connect(transport);
     console.error('MCP BPMSoft OData Server running on stdio');
   } else {
     const port = parseInt(process.env.MCP_HTTP_PORT || '8007', 10);
-    await startHttpServer(server, { port });
+    await startHttpServer(buildServer, { port });
     console.error('MCP BPMSoft OData Server running on Streamable HTTP');
   }
 }
