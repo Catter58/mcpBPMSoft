@@ -1,0 +1,16 @@
+node_modules
+build
+coverage
+.git
+.gitignore
+.env
+.env.local
+*.log
+.DS_Store
+.idea
+.vscode
+.serena
+.claude
+docs
+tests
+*.md

@@ -1,0 +1,36 @@
+# syntax=docker/dockerfile:1
+
+# Development image: full toolchain + tsc --watch hot rebuild.
+# Mount the repo over /app to get live recompilation on host edits, e.g.:
+#   docker build -f Dockerfile.dev -t mcp-bpmsoft:dev .
+#   docker run --rm -it -p 8007:8007 \
+#     -e BPMSOFT_URL=https://bpm.example.ru \
+#     -e BPMSOFT_DEBUG=true \
+#     -v "$PWD/src":/app/src \
+#     mcp-bpmsoft:dev
+FROM node:22-alpine
+
+ENV NODE_ENV=development
+
+# In dev, bind 0.0.0.0 inside the container so the host can reach the port.
+ENV MCP_TRANSPORT=http \
+    MCP_HTTP_HOST=0.0.0.0 \
+    MCP_HTTP_PORT=8007
+
+WORKDIR /app
+
+# Install all dependencies (incl. dev: tsc, vitest, eslint).
+COPY package.json package-lock.json* ./
+RUN npm ci
+
+# Copy the rest of the sources (overridden by a bind mount at run time).
+COPY . .
+
+# Initial compile so build/ exists before the watcher starts.
+RUN npm run build
+
+EXPOSE 8007
+
+# tsc --watch rebuilds build/ on change; restart the server to pick up changes,
+# or override CMD with a watcher of your choice.
+CMD ["sh", "-c", "npm run dev & node build/index.js"]
