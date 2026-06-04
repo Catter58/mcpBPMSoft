@@ -8,6 +8,7 @@
 
 const SAFE_IDENT_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const SAFE_PATH_RE = /^[A-Za-z_][A-Za-z0-9_/]*$/;
+const GUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
 
 export function isSafeIdentifier(name: string): boolean {
   return typeof name === 'string' && SAFE_IDENT_RE.test(name);
@@ -22,6 +23,18 @@ export function assertSafeIdentifier(name: string, label = 'identifier'): void {
   if (!isSafeIdentifier(name)) {
     throw new Error(
       `Недопустимое значение для ${label}: "${name}". Разрешены только латинские буквы, цифры и подчёркивания, начало — с буквы или подчёркивания.`
+    );
+  }
+}
+
+export function isGuid(value: string): boolean {
+  return typeof value === 'string' && GUID_RE.test(value);
+}
+
+export function assertGuid(id: string, label = 'id'): void {
+  if (!isGuid(id)) {
+    throw new Error(
+      `Недопустимое значение для ${label}: "${id}". Ожидается канонический GUID (например, 11111111-2222-3333-4444-555555555555).`
     );
   }
 }
