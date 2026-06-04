@@ -375,6 +375,15 @@ bpmsoft://schema/{name}                  — только схема колле�
 
 По умолчанию (`BPMSOFT_ALLOW_ENV_CREDS` не задана или `false`) `bpm_init` **не регистрируется**, а env-creds путь не используется. В стандартной документации и подсказках этот режим не рекламируется.
 
+### Deployment hardening (on-prem)
+
+- **Default bind is loopback** (`MCP_HTTP_HOST=127.0.0.1`). Set explicitly only if the reverse proxy lives on a different interface; never bind to `0.0.0.0` in production.
+- **Plain HTTP only** — the server must sit behind an HTTPS-terminating reverse proxy (nginx, Caddy, etc.). Never expose port 8007 directly to untrusted networks.
+- **Firewall the host** so only the reverse proxy can reach port 8007, and so the only permitted outbound destination is the BPMSoft stand.
+- Keep `BPMSOFT_ALLOW_ENV_CREDS` unset (default per-request auth); keep `BPMSOFT_DEBUG` unset in production.
+- Run `npm audit` regularly to catch transitive dependency vulnerabilities.
+- Note: upstream OData error messages are surfaced verbatim to callers and may echo request data (field names, filter values). Account for this when configuring aggregated log storage and retention.
+
 ---
 
 ## Скрипты

@@ -111,8 +111,9 @@ async function main(): Promise<void> {
     console.error('MCP BPMSoft OData Server running on stdio');
   } else {
     const port = parseInt(process.env.MCP_HTTP_PORT || '8007', 10);
-    await startHttpServer(buildServer, { port });
-    console.error('MCP BPMSoft OData Server running on Streamable HTTP');
+    const host = process.env.MCP_HTTP_HOST || '127.0.0.1';
+    await startHttpServer(buildServer, { port, host });
+    console.error(`MCP BPMSoft OData Server running on Streamable HTTP (${host}:${port})`);
   }
 }
 
