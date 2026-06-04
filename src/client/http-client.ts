@@ -24,6 +24,7 @@ import { BpmApiError, parseODataError, AuthRequiredError } from '../utils/errors
 import { getRequestAuth, hasRequestAuth } from '../auth/request-context.js';
 
 const MAX_RETRIES = 3;
+const MAX_REDIRECTS = 5;
 const RETRY_BASE_DELAY_MS = 1000;
 const MAX_RETRY_AFTER_SECONDS = 60; // hard cap to avoid pathological waits
 
@@ -129,7 +130,7 @@ export class HttpClient {
         method: options.method,
         headers,
         signal: controller.signal,
-        redirect: 'follow',
+        redirect: 'manual',
       };
 
       if (options.body !== undefined && options.body !== null && options.method !== 'GET') {
@@ -138,7 +139,23 @@ export class HttpClient {
 
       this.logRequest(options, headers);
 
-      const response = await fetch(options.url, fetchOptions);
+      let currentUrl = options.url;
+      let response = await fetch(currentUrl, fetchOptions);
+      let redirects = 0;
+      while ([301, 302, 303, 307, 308].includes(response.status) && response.headers.get('location')) {
+        if (++redirects > MAX_REDIRECTS) {
+          throw new BpmApiError('Превышено число редиректов', 0);
+        }
+        const resolvedUrl = new URL(response.headers.get('location') as string, currentUrl).toString();
+        this.assertAllowedOrigin(resolvedUrl); // throws BpmApiError on cross-origin
+        currentUrl = resolvedUrl;
+        const redirectOpts: RequestInit = { ...fetchOptions };
+        if (response.status === 303) {
+          redirectOpts.method = 'GET';
+          delete (redirectOpts as { body?: unknown }).body;
+        }
+        response = await fetch(currentUrl, redirectOpts);
+      }
 
       this.extractCookies(response);
 
