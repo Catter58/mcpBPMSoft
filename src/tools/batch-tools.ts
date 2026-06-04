@@ -24,7 +24,7 @@ export function registerBatchTools(server: McpServer, services: ServiceContainer
         title: meta.title,
         description: meta.description,
         inputSchema: {
-          collection: z.string(),
+          collection: z.string().describe('Имя коллекции (EntitySet)'),
           records: z
             .array(z.record(z.string(), z.unknown()))
             .describe('Массив записей для создания (lookup-поля резолвятся)'),
@@ -115,11 +115,11 @@ export function registerBatchTools(server: McpServer, services: ServiceContainer
         title: meta.title,
         description: meta.description,
         inputSchema: {
-          collection: z.string(),
+          collection: z.string().describe('Имя коллекции (EntitySet)'),
           updates: z
             .array(
               z.object({
-                id: z.string(),
+                id: z.string().describe('UUID записи'),
                 data: z.record(z.string(), z.unknown()),
               })
             )
@@ -210,7 +210,7 @@ export function registerBatchTools(server: McpServer, services: ServiceContainer
         title: meta.title,
         description: meta.description,
         inputSchema: {
-          collection: z.string(),
+          collection: z.string().describe('Имя коллекции (EntitySet)'),
           ids: z.array(z.string()).describe('Массив UUID записей для удаления'),
           continue_on_error: z.boolean().optional().describe('Не прерывать batch на первой ошибке'),
         },

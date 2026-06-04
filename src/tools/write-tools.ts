@@ -207,7 +207,7 @@ export function registerWriteTools(server: McpServer, services: ServiceContainer
         title: meta.title,
         description: meta.description,
         inputSchema: {
-          collection: z.string(),
+          collection: z.string().describe('Имя коллекции (EntitySet)'),
           filter: z.string().describe('OData $filter — обязателен, не должен быть пустым'),
           data: z.record(z.string(), z.unknown()).describe('Поля для обновления (lookup резолвятся)'),
           expected_count: z.number().int().positive().describe('Сколько записей должен вернуть фильтр; иначе откат'),
@@ -299,7 +299,7 @@ export function registerWriteTools(server: McpServer, services: ServiceContainer
         title: meta.title,
         description: meta.description,
         inputSchema: {
-          collection: z.string(),
+          collection: z.string().describe('Имя коллекции (EntitySet)'),
           filter: z.string().describe('OData $filter — обязателен'),
           expected_count: z.number().int().positive().describe('Сколько записей должно совпадать; иначе откат'),
         },

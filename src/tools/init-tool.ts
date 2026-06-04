@@ -77,13 +77,13 @@ export function registerInitTool(
         username: z.string().describe('Имя пользователя для входа'),
         password: z.string().describe('Пароль пользователя'),
         odata_version: z
-          .number()
+          .union([z.literal(3), z.literal(4)])
           .optional()
-          .describe('Версия OData протокола: 4 (по умолчанию) или 3'),
+          .describe('Версия OData: 4 (по умолчанию) или 3'),
         platform: z
-          .string()
+          .enum(['net8', 'netframework'])
           .optional()
-          .describe('Платформа: "net8" (по умолчанию) или "netframework"'),
+          .describe('Платформа: net8 (по умолчанию) или netframework'),
       },
       annotations: meta.annotations,
     },
