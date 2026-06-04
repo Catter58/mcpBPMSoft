@@ -30,7 +30,7 @@ export const TOOLS: ToolDescriptor[] = [
     name: 'bpm_init',
     title: 'Подключиться к BPMSoft',
     description:
-      'Инициализирует подключение к BPMSoft (URL, логин, пароль, версия OData, платформа) и проверяет учётные данные. Должен быть вызван первым, если сервер запущен без переменных окружения BPMSOFT_URL/USERNAME/PASSWORD. После успешного вызова все остальные инструменты становятся работоспособными.',
+      'Устанавливает подключение к BPMSoft по логину/паролю и проверяет учётные данные. Нужен, когда сервер запущен в режиме env-creds без сохранённого подключения (нет переменных окружения BPMSOFT_URL/USERNAME/PASSWORD).',
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     blurb: 'инициализация подключения (URL, логин/пароль, OData v3/4, платформа)',
     category: 'init',
@@ -87,7 +87,7 @@ export const TOOLS: ToolDescriptor[] = [
     title: 'Обновить запись',
     description:
       'Обновляет поля записи по UUID (PATCH). Lookup-поля с текстовыми значениями разрешаются автоматически. Идемпотентно при одинаковых данных.',
-    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
     blurb: 'обновить запись по UUID',
     category: 'write',
   },
@@ -104,7 +104,7 @@ export const TOOLS: ToolDescriptor[] = [
     title: 'Обновить по фильтру',
     description:
       'Находит записи по $filter и обновляет каждую через PATCH. Требует параметр expected_count: если найдено иное число записей — операция отменяется (защита от случайного массового обновления).',
-    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
     blurb: 'массовое обновление по фильтру (с защитным expected_count)',
     category: 'write',
   },
@@ -159,7 +159,7 @@ export const TOOLS: ToolDescriptor[] = [
     name: 'bpm_workflow_catalog',
     title: 'Каталог типичных сценариев',
     description:
-      'Возвращает каталог типичных пользовательских сценариев работы с BPMSoft и какие tool-ы для них вызывать. Карта основных сущностей и их связей. Ограничения BPMSoft 1.8. Используйте в начале сессии, когда LLM-агент не знает с чего начать.',
+      'Каталог высокоуровневых сценариев и сущностей инстанса для ориентации агента в начале сессии. Возвращает карту типичных пользовательских сценариев работы с BPMSoft, какие инструменты для них используются, карту основных сущностей и их связей, а также ограничения BPMSoft 1.8.',
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     blurb: 'каталог сценариев и карта сущностей',
     category: 'schema',
@@ -198,7 +198,7 @@ export const TOOLS: ToolDescriptor[] = [
     title: 'Пакетное обновление',
     description:
       'Обновляет несколько записей в одном $batch (только OData v4). Lookup-поля резолвятся автоматически. Поддерживает continue_on_error.',
-    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
     blurb: 'пакетное обновление (OData v4)',
     category: 'batch',
   },
@@ -234,7 +234,7 @@ export const TOOLS: ToolDescriptor[] = [
     name: 'bpm_field_upload',
     title: 'Загрузить бинарь в поле',
     description:
-      'PUT бинарных данных напрямую в поле сущности по схеме {Collection}({id})/{FieldName}. Используйте для произвольных бинарных полей (не только SysImage).',
+      'PUT бинарных данных напрямую в поле сущности по схеме {Collection}({id})/{FieldName}. Для произвольных бинарных полей (не только SysImage).',
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     blurb: 'PUT бинарь в поле сущности',
     category: 'stream',
