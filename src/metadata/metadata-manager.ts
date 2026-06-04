@@ -91,6 +91,7 @@ export class MetadataManager {
       parseAttributeValue: false,
       removeNSPrefix: false,
       isArray: () => false,
+      processEntities: false,
     });
   }
 
