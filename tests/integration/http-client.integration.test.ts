@@ -254,3 +254,43 @@ describe('HttpClient auth resolution', () => {
     expect(called).toBe(false);
   });
 });
+
+describe('HttpClient redirect SSRF guard', () => {
+  it('refuses to follow a cross-origin redirect (no creds leak to other host)', async () => {
+    let evilHit = false;
+    server.use(
+      http.get(`${ORIGIN}/odata/Contact`, () =>
+        new HttpResponse(null, { status: 302, headers: { Location: 'https://evil.example/steal' } })
+      ),
+      http.get('https://evil.example/steal', () => {
+        evilHit = true;
+        return HttpResponse.json({ pwned: true });
+      })
+    );
+    const client = new HttpClient(makeCfg());
+    client.setAllowedOrigin(ORIGIN);
+    await expect(
+      runWithAuth(extractAuthFromHeaders({ BPMCSRF: 't', Cookie: 'CsrfToken=t' }), () =>
+        client.request({ method: 'GET', url: `${ORIGIN}/odata/Contact` })
+      )
+    ).rejects.toBeInstanceOf(BpmApiError);
+    expect(evilHit).toBe(false);
+  });
+
+  it('follows a same-origin redirect', async () => {
+    server.use(
+      http.get(`${ORIGIN}/odata/Old`, () =>
+        new HttpResponse(null, { status: 302, headers: { Location: `${ORIGIN}/odata/New` } })
+      ),
+      http.get(`${ORIGIN}/odata/New`, () => HttpResponse.json({ value: [{ Id: 'x' }] }))
+    );
+    const client = new HttpClient(makeCfg());
+    client.setAllowedOrigin(ORIGIN);
+    const res = await runWithAuth(
+      extractAuthFromHeaders({ BPMCSRF: 't', Cookie: 'CsrfToken=t' }),
+      () => client.request<{ value: unknown[] }>({ method: 'GET', url: `${ORIGIN}/odata/Old` })
+    );
+    expect(res.status).toBe(200);
+    expect(res.data).toEqual({ value: [{ Id: 'x' }] });
+  });
+});

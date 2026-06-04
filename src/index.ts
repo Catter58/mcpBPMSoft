@@ -70,7 +70,7 @@ async function main(): Promise<void> {
   const buildServer = (): McpServer => {
     const server = new McpServer({
       name: 'mcp-bpmsoft-odata',
-      version: '0.3.0',
+      version: '0.3.1',
     });
 
     // bpm_init is only exposed when env-stored credentials are explicitly enabled.
@@ -111,8 +111,9 @@ async function main(): Promise<void> {
     console.error('MCP BPMSoft OData Server running on stdio');
   } else {
     const port = parseInt(process.env.MCP_HTTP_PORT || '8007', 10);
-    await startHttpServer(buildServer, { port });
-    console.error('MCP BPMSoft OData Server running on Streamable HTTP');
+    const host = process.env.MCP_HTTP_HOST || '127.0.0.1';
+    await startHttpServer(buildServer, { port, host });
+    console.error(`MCP BPMSoft OData Server running on Streamable HTTP (${host}:${port})`);
   }
 }
 

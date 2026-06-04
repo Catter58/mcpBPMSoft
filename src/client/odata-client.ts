@@ -15,6 +15,7 @@ import type {
 import { HttpClient } from './http-client.js';
 import { getODataBaseUrl } from '../config.js';
 import { BpmApiError } from '../utils/errors.js';
+import { assertSafeIdentifier, assertGuid } from '../utils/odata.js';
 
 export interface QueryOptions {
   $filter?: string;
@@ -311,11 +312,13 @@ export class ODataClient {
   }
 
   buildCollectionPath(collection: string): string {
+    assertSafeIdentifier(collection, 'collection');
     const collectionName = this.odataVersion === 3 ? this.ensureCollectionSuffix(collection) : collection;
     return `${this.baseUrl}/${collectionName}`;
   }
 
   buildRecordPath(collection: string, id: string): string {
+    assertGuid(id, 'id');
     const collectionPath = this.buildCollectionPath(collection);
     return this.odataVersion === 3
       ? `${collectionPath}(guid'${id}')`

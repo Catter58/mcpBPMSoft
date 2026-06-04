@@ -73,6 +73,27 @@ describe('ODataClient.buildRecordPath', () => {
   });
 });
 
+describe('odata-client identifier validation', () => {
+  function client() {
+    const http = new MockHttpClient();
+    return new ODataClient(makeCfg(), http as unknown as never);
+  }
+  it('rejects an unsafe collection name', () => {
+    expect(() => client().buildCollectionPath('Contact?$expand=Account')).toThrow();
+    expect(() => client().buildCollectionPath('Account/$batch')).toThrow();
+  });
+  it('rejects a non-GUID id', () => {
+    expect(() => client().buildRecordPath('Contact', '1)/Account')).toThrow();
+    expect(() => client().buildRecordPath('Contact', 'not-a-guid')).toThrow();
+  });
+  it('accepts a valid collection and GUID', () => {
+    expect(() => client().buildCollectionPath('Contact')).not.toThrow();
+    expect(() =>
+      client().buildRecordPath('Contact', '77a09b42-3b7b-46d1-be1f-2cd49b8ea656')
+    ).not.toThrow();
+  });
+});
+
 describe('ODataClient.executeBatch', () => {
   it('throws BpmApiError when odata_version=3', async () => {
     const http = new MockHttpClient();
