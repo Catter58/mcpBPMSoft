@@ -252,9 +252,10 @@ export const TOOLS: ToolDescriptor[] = [
   {
     name: 'bpm_field_delete',
     title: 'Очистить бинарное поле',
-    description: 'DELETE бинарных данных в поле сущности.',
+    description:
+      'DELETE бинарных данных в поле сущности. Без confirm=true вернёт только описание того, что будет очищено, — ничего не удаляя; повторите вызов с confirm=true после согласия пользователя.',
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
-    blurb: 'DELETE бинарь в поле сущности',
+    blurb: 'DELETE бинарь в поле сущности (требует confirm=true)',
     category: 'stream',
   },
 

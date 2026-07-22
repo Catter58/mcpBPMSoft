@@ -22,6 +22,7 @@ import { formatToolError } from '../utils/errors.js';
 import { getTool } from './registry.js';
 import { notInitialized } from './_guards.js';
 import { isSafeIdentifier } from '../utils/odata.js';
+import { confirmParam, confirmationRequired, confirmationResponse } from '../utils/confirm.js';
 
 export function registerStreamTools(server: McpServer, services: ServiceContainer): void {
   // bpm_upload_file (SysImage)
@@ -349,6 +350,7 @@ export function registerStreamTools(server: McpServer, services: ServiceContaine
           collection: z.string().describe('Имя коллекции (EntitySet)'),
           id: z.string().describe('UUID записи'),
           field: z.string().describe('Имя бинарного поля сущности'),
+          confirm: confirmParam,
         },
         annotations: meta.annotations,
       },
@@ -362,6 +364,15 @@ export function registerStreamTools(server: McpServer, services: ServiceContaine
               isError: true,
             };
           }
+
+          if (confirmationRequired(params)) {
+            return confirmationResponse(
+              meta.name,
+              [`Будет очищено поле ${params.collection}(${params.id}).${params.field}.`],
+              { collection: params.collection, id: params.id, field: params.field }
+            );
+          }
+
           await services.odataClient.deleteFieldBinary(params.collection, params.id, params.field);
           return {
             content: [

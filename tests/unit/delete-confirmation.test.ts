@@ -6,6 +6,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { registerWriteTools } from '../../src/tools/write-tools.js';
 import { registerBatchTools } from '../../src/tools/batch-tools.js';
+import { registerStreamTools } from '../../src/tools/stream-tools.js';
 import type { ServiceContainer } from '../../src/tools/init-tool.js';
 
 interface ToolResult {
@@ -37,6 +38,7 @@ function buildFakeServer(): FakeServer {
 interface StubState {
   deleteRecordCalls: Array<{ collection: string; id: string }>;
   executeBatchCalls: Array<Array<{ method: string; url: string }>>;
+  deleteFieldCalls: Array<{ collection: string; id: string; field: string }>;
 }
 
 function buildStubServices(state: StubState): ServiceContainer {
@@ -62,6 +64,9 @@ function buildStubServices(state: StubState): ServiceContainer {
       state.executeBatchCalls.push(requests);
       return { responses: requests.map((_, i) => ({ id: String(i + 1), status: 204, body: null })) };
     },
+    async deleteFieldBinary(collection: string, id: string, field: string) {
+      state.deleteFieldCalls.push({ collection, id, field });
+    },
   };
 
   const authManager = { ensureAuthenticated: vi.fn(async () => undefined) };
@@ -86,7 +91,7 @@ function getHandler(server: FakeServer, name: string): RegisteredTool['handler']
 
 describe('bpm_delete_record confirmation', () => {
   it('without confirm returns a preview and does not delete', async () => {
-    const state: StubState = { deleteRecordCalls: [], executeBatchCalls: [] };
+    const state: StubState = { deleteRecordCalls: [], executeBatchCalls: [], deleteFieldCalls: [] };
     const services = buildStubServices(state);
     const server = buildFakeServer();
     registerWriteTools(server as never, services);
@@ -100,7 +105,7 @@ describe('bpm_delete_record confirmation', () => {
   });
 
   it('with confirm=true deletes the record', async () => {
-    const state: StubState = { deleteRecordCalls: [], executeBatchCalls: [] };
+    const state: StubState = { deleteRecordCalls: [], executeBatchCalls: [], deleteFieldCalls: [] };
     const services = buildStubServices(state);
     const server = buildFakeServer();
     registerWriteTools(server as never, services);
@@ -122,7 +127,7 @@ describe('bpm_delete_record confirmation', () => {
 
 describe('bpm_delete_by_filter confirmation', () => {
   it('without confirm returns a preview with the id list and does not delete', async () => {
-    const state: StubState = { deleteRecordCalls: [], executeBatchCalls: [] };
+    const state: StubState = { deleteRecordCalls: [], executeBatchCalls: [], deleteFieldCalls: [] };
     const services = buildStubServices(state);
     const server = buildFakeServer();
     registerWriteTools(server as never, services);
@@ -140,7 +145,7 @@ describe('bpm_delete_by_filter confirmation', () => {
   });
 
   it('with confirm=true deletes the matched records', async () => {
-    const state: StubState = { deleteRecordCalls: [], executeBatchCalls: [] };
+    const state: StubState = { deleteRecordCalls: [], executeBatchCalls: [], deleteFieldCalls: [] };
     const services = buildStubServices(state);
     const server = buildFakeServer();
     registerWriteTools(server as never, services);
@@ -158,7 +163,7 @@ describe('bpm_delete_by_filter confirmation', () => {
   });
 
   it('expected_count mismatch aborts even with confirm=true', async () => {
-    const state: StubState = { deleteRecordCalls: [], executeBatchCalls: [] };
+    const state: StubState = { deleteRecordCalls: [], executeBatchCalls: [], deleteFieldCalls: [] };
     const services = buildStubServices(state);
     const server = buildFakeServer();
     registerWriteTools(server as never, services);
@@ -178,7 +183,7 @@ describe('bpm_delete_by_filter confirmation', () => {
 
 describe('bpm_batch_delete confirmation', () => {
   it('without confirm returns a preview and does not call executeBatch', async () => {
-    const state: StubState = { deleteRecordCalls: [], executeBatchCalls: [] };
+    const state: StubState = { deleteRecordCalls: [], executeBatchCalls: [], deleteFieldCalls: [] };
     const services = buildStubServices(state);
     const server = buildFakeServer();
     registerBatchTools(server as never, services);
@@ -192,7 +197,7 @@ describe('bpm_batch_delete confirmation', () => {
   });
 
   it('with confirm=true executes the batch delete', async () => {
-    const state: StubState = { deleteRecordCalls: [], executeBatchCalls: [] };
+    const state: StubState = { deleteRecordCalls: [], executeBatchCalls: [], deleteFieldCalls: [] };
     const services = buildStubServices(state);
     const server = buildFakeServer();
     registerBatchTools(server as never, services);
@@ -203,5 +208,44 @@ describe('bpm_batch_delete confirmation', () => {
     expect(state.executeBatchCalls).toHaveLength(1);
     expect(state.executeBatchCalls[0]).toHaveLength(2);
     expect(result.structuredContent?.requires_confirmation).toBeUndefined();
+  });
+});
+
+describe('bpm_field_delete confirmation', () => {
+  it('without confirm returns a preview and does not clear the field', async () => {
+    const state: StubState = { deleteRecordCalls: [], executeBatchCalls: [], deleteFieldCalls: [] };
+    const services = buildStubServices(state);
+    const server = buildFakeServer();
+    registerStreamTools(server as never, services);
+
+    const handler = getHandler(server, 'bpm_field_delete');
+    const result = await handler({
+      collection: 'Contact',
+      id: '11111111-2222-3333-4444-555555555555',
+      field: 'Photo',
+    });
+
+    expect(state.deleteFieldCalls).toHaveLength(0);
+    expect(result.structuredContent?.requires_confirmation).toBe(true);
+  });
+
+  it('with confirm=true clears the field', async () => {
+    const state: StubState = { deleteRecordCalls: [], executeBatchCalls: [], deleteFieldCalls: [] };
+    const services = buildStubServices(state);
+    const server = buildFakeServer();
+    registerStreamTools(server as never, services);
+
+    const handler = getHandler(server, 'bpm_field_delete');
+    const result = await handler({
+      collection: 'Contact',
+      id: '11111111-2222-3333-4444-555555555555',
+      field: 'Photo',
+      confirm: true,
+    });
+
+    expect(state.deleteFieldCalls).toEqual([
+      { collection: 'Contact', id: '11111111-2222-3333-4444-555555555555', field: 'Photo' },
+    ]);
+    expect(result.structuredContent?.deleted).toBe(true);
   });
 });
