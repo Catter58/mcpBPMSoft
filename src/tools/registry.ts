@@ -94,9 +94,10 @@ export const TOOLS: ToolDescriptor[] = [
   {
     name: 'bpm_delete_record',
     title: 'Удалить запись',
-    description: 'Удаляет запись из коллекции по UUID (DELETE). Действие необратимо.',
+    description:
+      'Удаляет запись из коллекции по UUID (DELETE). Действие необратимо. Без confirm=true вернёт только описание записи, которая будет удалена, — ничего не удаляя; повторите вызов с confirm=true после согласия пользователя.',
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
-    blurb: 'удалить запись по UUID',
+    blurb: 'удалить запись по UUID (требует confirm=true)',
     category: 'write',
   },
   {
@@ -332,7 +333,16 @@ export function getTool(name: string): ToolDescriptor {
 }
 
 export function listToolBlurbs(): string {
-  const order: ToolDescriptor['category'][] = ['init', 'read', 'write', 'schema', 'workflow', 'process', 'batch', 'stream'];
+  const order: ToolDescriptor['category'][] = [
+    'init',
+    'read',
+    'write',
+    'schema',
+    'workflow',
+    'process',
+    'batch',
+    'stream',
+  ];
   const lines: string[] = [];
   for (const cat of order) {
     const tools = TOOLS.filter((t) => t.category === cat);
