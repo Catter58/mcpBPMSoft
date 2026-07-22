@@ -23,9 +23,11 @@ export function confirmationResponse(
   descriptionLines: string[],
   structuredExtra: Record<string, unknown>
 ): CallToolResult {
-  const text = [...descriptionLines, '', `Для подтверждения повторите вызов ${toolName} с параметром confirm=true.`].join(
-    '\n'
-  );
+  const text = [
+    ...descriptionLines,
+    '',
+    `Для подтверждения повторите вызов ${toolName} с параметром confirm=true.`,
+  ].join('\n');
 
   return {
     content: [{ type: 'text', text }],
