@@ -207,9 +207,9 @@ export const TOOLS: ToolDescriptor[] = [
     name: 'bpm_batch_delete',
     title: 'Пакетное удаление',
     description:
-      'Удаляет несколько записей по UUID в одном $batch (только OData v4). Поддерживает continue_on_error. Действие необратимо.',
+      'Удаляет несколько записей по UUID в одном $batch (только OData v4). Поддерживает continue_on_error. Действие необратимо. Без confirm=true вернёт только список ID, которые будут удалены, — ничего не удаляя; повторите вызов с confirm=true после согласия пользователя.',
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
-    blurb: 'пакетное удаление (OData v4)',
+    blurb: 'пакетное удаление (OData v4, требует confirm=true)',
     category: 'batch',
   },
 

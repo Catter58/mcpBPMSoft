@@ -5,6 +5,7 @@
 
 import { describe, it, expect, vi } from 'vitest';
 import { registerWriteTools } from '../../src/tools/write-tools.js';
+import { registerBatchTools } from '../../src/tools/batch-tools.js';
 import type { ServiceContainer } from '../../src/tools/init-tool.js';
 
 interface ToolResult {
@@ -35,6 +36,7 @@ function buildFakeServer(): FakeServer {
 
 interface StubState {
   deleteRecordCalls: Array<{ collection: string; id: string }>;
+  executeBatchCalls: Array<Array<{ method: string; url: string }>>;
 }
 
 function buildStubServices(state: StubState): ServiceContainer {
@@ -52,6 +54,13 @@ function buildStubServices(state: StubState): ServiceContainer {
     },
     async deleteRecord(collection: string, id: string) {
       state.deleteRecordCalls.push({ collection, id });
+    },
+    buildRecordPath(collection: string, id: string) {
+      return `/${collection}(${id})`;
+    },
+    async executeBatch(requests: Array<{ method: string; url: string }>, _continueOnError: boolean) {
+      state.executeBatchCalls.push(requests);
+      return { responses: requests.map((_, i) => ({ id: String(i + 1), status: 204, body: null })) };
     },
   };
 
@@ -77,7 +86,7 @@ function getHandler(server: FakeServer, name: string): RegisteredTool['handler']
 
 describe('bpm_delete_record confirmation', () => {
   it('without confirm returns a preview and does not delete', async () => {
-    const state: StubState = { deleteRecordCalls: [] };
+    const state: StubState = { deleteRecordCalls: [], executeBatchCalls: [] };
     const services = buildStubServices(state);
     const server = buildFakeServer();
     registerWriteTools(server as never, services);
@@ -91,7 +100,7 @@ describe('bpm_delete_record confirmation', () => {
   });
 
   it('with confirm=true deletes the record', async () => {
-    const state: StubState = { deleteRecordCalls: [] };
+    const state: StubState = { deleteRecordCalls: [], executeBatchCalls: [] };
     const services = buildStubServices(state);
     const server = buildFakeServer();
     registerWriteTools(server as never, services);
@@ -113,7 +122,7 @@ describe('bpm_delete_record confirmation', () => {
 
 describe('bpm_delete_by_filter confirmation', () => {
   it('without confirm returns a preview with the id list and does not delete', async () => {
-    const state: StubState = { deleteRecordCalls: [] };
+    const state: StubState = { deleteRecordCalls: [], executeBatchCalls: [] };
     const services = buildStubServices(state);
     const server = buildFakeServer();
     registerWriteTools(server as never, services);
@@ -131,7 +140,7 @@ describe('bpm_delete_by_filter confirmation', () => {
   });
 
   it('with confirm=true deletes the matched records', async () => {
-    const state: StubState = { deleteRecordCalls: [] };
+    const state: StubState = { deleteRecordCalls: [], executeBatchCalls: [] };
     const services = buildStubServices(state);
     const server = buildFakeServer();
     registerWriteTools(server as never, services);
@@ -149,7 +158,7 @@ describe('bpm_delete_by_filter confirmation', () => {
   });
 
   it('expected_count mismatch aborts even with confirm=true', async () => {
-    const state: StubState = { deleteRecordCalls: [] };
+    const state: StubState = { deleteRecordCalls: [], executeBatchCalls: [] };
     const services = buildStubServices(state);
     const server = buildFakeServer();
     registerWriteTools(server as never, services);
@@ -164,5 +173,35 @@ describe('bpm_delete_by_filter confirmation', () => {
 
     expect(state.deleteRecordCalls).toHaveLength(0);
     expect(result.isError).toBe(true);
+  });
+});
+
+describe('bpm_batch_delete confirmation', () => {
+  it('without confirm returns a preview and does not call executeBatch', async () => {
+    const state: StubState = { deleteRecordCalls: [], executeBatchCalls: [] };
+    const services = buildStubServices(state);
+    const server = buildFakeServer();
+    registerBatchTools(server as never, services);
+
+    const handler = getHandler(server, 'bpm_batch_delete');
+    const result = await handler({ collection: 'Contact', ids: ['id-1', 'id-2', 'id-3'] });
+
+    expect(state.executeBatchCalls).toHaveLength(0);
+    expect(result.structuredContent?.requires_confirmation).toBe(true);
+    expect(result.structuredContent?.count).toBe(3);
+  });
+
+  it('with confirm=true executes the batch delete', async () => {
+    const state: StubState = { deleteRecordCalls: [], executeBatchCalls: [] };
+    const services = buildStubServices(state);
+    const server = buildFakeServer();
+    registerBatchTools(server as never, services);
+
+    const handler = getHandler(server, 'bpm_batch_delete');
+    const result = await handler({ collection: 'Contact', ids: ['id-1', 'id-2'], confirm: true });
+
+    expect(state.executeBatchCalls).toHaveLength(1);
+    expect(state.executeBatchCalls[0]).toHaveLength(2);
+    expect(result.structuredContent?.requires_confirmation).toBeUndefined();
   });
 });

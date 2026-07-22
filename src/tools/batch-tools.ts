@@ -13,6 +13,7 @@ import type { ServiceContainer } from './init-tool.js';
 import { formatToolError } from '../utils/errors.js';
 import { getTool } from './registry.js';
 import { notInitialized } from './_guards.js';
+import { confirmParam, confirmationRequired, confirmationResponse, previewIdList } from '../utils/confirm.js';
 
 export function registerBatchTools(server: McpServer, services: ServiceContainer): void {
   // bpm_batch_create
@@ -213,6 +214,7 @@ export function registerBatchTools(server: McpServer, services: ServiceContainer
           collection: z.string().describe('Имя коллекции (EntitySet)'),
           ids: z.array(z.string()).describe('Массив UUID записей для удаления'),
           continue_on_error: z.boolean().optional().describe('Не прерывать batch на первой ошибке'),
+          confirm: confirmParam,
         },
         annotations: meta.annotations,
       },
@@ -222,6 +224,17 @@ export function registerBatchTools(server: McpServer, services: ServiceContainer
           await services.authManager.ensureAuthenticated();
           if (params.ids.length === 0) {
             return { content: [{ type: 'text', text: 'Массив ID пуст. Нечего удалять.' }], isError: true };
+          }
+
+          if (confirmationRequired(params)) {
+            return confirmationResponse(
+              meta.name,
+              [
+                `Будет удалено ${params.ids.length} записей из ${params.collection}:`,
+                previewIdList(params.ids),
+              ],
+              { collection: params.collection, ids: params.ids, count: params.ids.length }
+            );
           }
 
           const batchRequests = params.ids.map((id) => ({
