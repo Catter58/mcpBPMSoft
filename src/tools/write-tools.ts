@@ -15,7 +15,7 @@ import type { ServiceContainer } from './init-tool.js';
 import { formatToolError, LookupResolutionError } from '../utils/errors.js';
 import { getTool } from './registry.js';
 import { notInitialized } from './_guards.js';
-import { confirmParam, confirmationRequired, confirmationResponse } from '../utils/confirm.js';
+import { confirmParam, confirmationRequired, confirmationResponse, previewIdList } from '../utils/confirm.js';
 
 function formatLookupAmbiguity(error: LookupResolutionError): CallToolResult {
   return {
@@ -314,6 +314,7 @@ export function registerWriteTools(server: McpServer, services: ServiceContainer
           collection: z.string().describe('Имя коллекции (EntitySet)'),
           filter: z.string().describe('OData $filter — обязателен'),
           expected_count: z.number().int().positive().describe('Сколько записей должно совпадать; иначе откат'),
+          confirm: confirmParam,
         },
         annotations: meta.annotations,
       },
@@ -343,10 +344,22 @@ export function registerWriteTools(server: McpServer, services: ServiceContainer
             };
           }
 
+          const ids = records.value.map((rec) => String(rec.Id ?? rec.id));
+
+          if (confirmationRequired(params)) {
+            return confirmationResponse(
+              meta.name,
+              [
+                `По фильтру найдено ${ids.length} записей в ${params.collection}, которые будут удалены:`,
+                previewIdList(ids),
+              ],
+              { collection: params.collection, filter: params.filter, count: ids.length, ids }
+            );
+          }
+
           const succeeded: string[] = [];
           const failed: Array<{ id: string; error: string }> = [];
-          for (const rec of records.value) {
-            const id = String(rec.Id ?? rec.id);
+          for (const id of ids) {
             try {
               await services.odataClient.deleteRecord(params.collection, id);
               succeeded.push(id);
@@ -361,7 +374,7 @@ export function registerWriteTools(server: McpServer, services: ServiceContainer
                 type: 'text',
                 text: [
                   `Удаление по фильтру ${params.collection}:`,
-                  `  Запросов: ${records.value.length}`,
+                  `  Запросов: ${ids.length}`,
                   `  Успешно: ${succeeded.length}`,
                   `  Ошибок: ${failed.length}`,
                   failed.length ? '\nОшибки:\n' + failed.map((f) => `  ${f.id}: ${f.error}`).join('\n') : '',

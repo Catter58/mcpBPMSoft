@@ -113,9 +113,9 @@ export const TOOLS: ToolDescriptor[] = [
     name: 'bpm_delete_by_filter',
     title: 'Удалить по фильтру',
     description:
-      'Находит записи по $filter и удаляет каждую через DELETE. Требует параметр expected_count: при несовпадении операция отменяется. Действие необратимо.',
+      'Находит записи по $filter и удаляет каждую через DELETE. Требует параметр expected_count: при несовпадении операция отменяется. Действие необратимо. Без confirm=true вернёт только список ID, которые будут удалены, — ничего не удаляя; повторите вызов с confirm=true после согласия пользователя.',
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
-    blurb: 'массовое удаление по фильтру (с защитным expected_count)',
+    blurb: 'массовое удаление по фильтру (expected_count + confirm=true)',
     category: 'write',
   },
 

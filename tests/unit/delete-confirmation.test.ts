@@ -42,6 +42,14 @@ function buildStubServices(state: StubState): ServiceContainer {
     async getRecord(collection: string, id: string) {
       return { Id: id, Name: `Test ${collection} ${id}` };
     },
+    async getRecords(_collection: string, _query?: { $filter?: string; $select?: string; $top?: number }) {
+      return {
+        value: [
+          { Id: 'aaaaaaaa-0000-0000-0000-000000000001' },
+          { Id: 'aaaaaaaa-0000-0000-0000-000000000002' },
+        ],
+      };
+    },
     async deleteRecord(collection: string, id: string) {
       state.deleteRecordCalls.push({ collection, id });
     },
@@ -100,5 +108,61 @@ describe('bpm_delete_record confirmation', () => {
     ]);
     expect(result.structuredContent?.requires_confirmation).toBeUndefined();
     expect(result.structuredContent?.deleted).toBe(true);
+  });
+});
+
+describe('bpm_delete_by_filter confirmation', () => {
+  it('without confirm returns a preview with the id list and does not delete', async () => {
+    const state: StubState = { deleteRecordCalls: [] };
+    const services = buildStubServices(state);
+    const server = buildFakeServer();
+    registerWriteTools(server as never, services);
+
+    const handler = getHandler(server, 'bpm_delete_by_filter');
+    const result = await handler({ collection: 'Contact', filter: "Name eq 'X'", expected_count: 2 });
+
+    expect(state.deleteRecordCalls).toHaveLength(0);
+    expect(result.structuredContent?.requires_confirmation).toBe(true);
+    expect(result.structuredContent?.count).toBe(2);
+    expect(result.structuredContent?.ids).toEqual([
+      'aaaaaaaa-0000-0000-0000-000000000001',
+      'aaaaaaaa-0000-0000-0000-000000000002',
+    ]);
+  });
+
+  it('with confirm=true deletes the matched records', async () => {
+    const state: StubState = { deleteRecordCalls: [] };
+    const services = buildStubServices(state);
+    const server = buildFakeServer();
+    registerWriteTools(server as never, services);
+
+    const handler = getHandler(server, 'bpm_delete_by_filter');
+    const result = await handler({
+      collection: 'Contact',
+      filter: "Name eq 'X'",
+      expected_count: 2,
+      confirm: true,
+    });
+
+    expect(state.deleteRecordCalls).toHaveLength(2);
+    expect(result.structuredContent?.requires_confirmation).toBeUndefined();
+  });
+
+  it('expected_count mismatch aborts even with confirm=true', async () => {
+    const state: StubState = { deleteRecordCalls: [] };
+    const services = buildStubServices(state);
+    const server = buildFakeServer();
+    registerWriteTools(server as never, services);
+
+    const handler = getHandler(server, 'bpm_delete_by_filter');
+    const result = await handler({
+      collection: 'Contact',
+      filter: "Name eq 'X'",
+      expected_count: 5,
+      confirm: true,
+    });
+
+    expect(state.deleteRecordCalls).toHaveLength(0);
+    expect(result.isError).toBe(true);
   });
 });
