@@ -333,16 +333,7 @@ export function getTool(name: string): ToolDescriptor {
 }
 
 export function listToolBlurbs(): string {
-  const order: ToolDescriptor['category'][] = [
-    'init',
-    'read',
-    'write',
-    'schema',
-    'workflow',
-    'process',
-    'batch',
-    'stream',
-  ];
+  const order: ToolDescriptor['category'][] = ['init', 'read', 'write', 'schema', 'workflow', 'process', 'batch', 'stream'];
   const lines: string[] = [];
   for (const cat of order) {
     const tools = TOOLS.filter((t) => t.category === cat);
