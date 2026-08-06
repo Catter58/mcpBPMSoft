@@ -44,13 +44,13 @@ export function registerSchemaTools(server: McpServer, services: ServiceContaine
                     : 'Список коллекций пуст.',
                 },
               ],
-              structuredContent: { count: 0, sets: [] },
+              structuredContent: { count: 0, has_more: false, sets: [] },
             };
           }
           const list = sets.map((s) => `  - ${s.name} (${s.entityType})`).join('\n');
           return {
             content: [{ type: 'text', text: `Найдено коллекций: ${sets.length}\n\n${list}` }],
-            structuredContent: { count: sets.length, sets },
+            structuredContent: { count: sets.length, has_more: false, sets },
           };
         } catch (error) {
           const toolError = formatToolError(error);
@@ -283,7 +283,7 @@ export function registerSchemaTools(server: McpServer, services: ServiceContaine
                     : `Поле "${params.search}" не найдено.\nСначала загрузите нужные схемы через bpm_get_schema.`,
                 },
               ],
-              structuredContent: { count: 0, results: [] },
+              structuredContent: { count: 0, has_more: false, results: [] },
             };
           }
 
@@ -298,7 +298,7 @@ export function registerSchemaTools(server: McpServer, services: ServiceContaine
 
           return {
             content: [{ type: 'text', text: lines.join('\n') }],
-            structuredContent: { count: results.length, results },
+            structuredContent: { count: results.length, has_more: false, results },
           };
         } catch (error) {
           const toolError = formatToolError(error);

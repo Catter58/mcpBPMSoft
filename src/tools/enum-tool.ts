@@ -116,6 +116,7 @@ export function registerEnumTool(server: McpServer, services: ServiceContainer):
             lookup_collection: lookup.lookupCollection,
             display_column: lookup.displayColumn,
             count: values.length,
+            has_more: values.length === top,
             from_cache: fromCache,
             values,
           },

@@ -151,9 +151,8 @@ export function registerReadTools(server: McpServer, services: ServiceContainer)
               collection,
               count: result.value.length,
               total_count: result['@odata.count'],
-              next_link: result['@odata.nextLink'],
+              has_more: hasMore || truncated,
               cursor: nextCursor,
-              truncated,
               records: result.value,
             },
           };
@@ -381,9 +380,8 @@ export function registerReadTools(server: McpServer, services: ServiceContainer)
               warnings: compiled.warnings,
               count: result.value.length,
               total_count: result['@odata.count'],
-              next_link: result['@odata.nextLink'],
+              has_more: hasMore || truncated,
               cursor: nextCursor,
-              truncated,
               records: result.value,
             },
           };
