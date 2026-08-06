@@ -162,9 +162,29 @@ describe('compileFilter — primitives', () => {
     expect(r.filter).toBe('IsVip eq true');
   });
 
-  it('contains escapes single quotes inside the value', async () => {
+  it('contains is case-insensitive and escapes single quotes inside the value', async () => {
     const r = await compile([{ field: 'Name', op: 'содержит', value: "O'Brien" }]);
-    expect(r.filter).toBe("contains(Name, 'O''Brien')");
+    expect(r.filter).toBe("contains(tolower(Name), 'o''brien')");
+  });
+
+  it('contains under v3 uses substringof', async () => {
+    const r = await compile([{ field: 'Name', op: 'содержит', value: 'Иванов' }], { v: 3 });
+    expect(r.filter).toBe("substringof('иванов', tolower(Name))");
+  });
+
+  it('not_contains keeps the negation', async () => {
+    const r = await compile([{ field: 'Name', op: 'не содержит', value: 'Тест' }]);
+    expect(r.filter).toBe("not contains(tolower(Name), 'тест')");
+  });
+
+  it('similar_to normalizes the value down to its core (кавычки/орг-формы)', async () => {
+    const r = await compile([{ field: 'Name', op: 'похоже на', value: 'АО «ЛАНИТ»' }]);
+    expect(r.filter).toBe("contains(tolower(Name), 'ланит')");
+  });
+
+  it('similar_to under v3', async () => {
+    const r = await compile([{ field: 'Name', op: 'similar_to', value: 'ООО "Ромашка"' }], { v: 3 });
+    expect(r.filter).toBe("substringof('ромашка', tolower(Name))");
   });
 });
 

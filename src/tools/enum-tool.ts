@@ -43,6 +43,16 @@ export function registerEnumTool(server: McpServer, services: ServiceContainer):
           .optional()
           .describe(`Максимум значений (по умолчанию ${DEFAULT_TOP}, ограничено лимитами BPMSoft)`),
       },
+      outputSchema: {
+        collection: z.string(),
+        field: z.string(),
+        lookup_collection: z.string(),
+        display_column: z.string(),
+        count: z.number().int(),
+        has_more: z.boolean(),
+        from_cache: z.boolean(),
+        values: z.array(z.object({ id: z.string(), name: z.string() })),
+      },
       annotations: meta.annotations,
     },
     async (params): Promise<CallToolResult> => {
@@ -116,6 +126,7 @@ export function registerEnumTool(server: McpServer, services: ServiceContainer):
             lookup_collection: lookup.lookupCollection,
             display_column: lookup.displayColumn,
             count: values.length,
+            has_more: values.length === top,
             from_cache: fromCache,
             values,
           },

@@ -68,8 +68,8 @@ export async function findOrCreate(
     );
   }
 
-  const resolvedData = await services.lookupResolver.resolveDataLookups(resolvedCollection, createWith);
-  const created = await services.odataClient.createRecord<Record<string, unknown>>(resolvedCollection, resolvedData);
+  const resolved = await services.lookupResolver.resolveDataLookups(resolvedCollection, createWith);
+  const created = await services.odataClient.createRecord<Record<string, unknown>>(resolvedCollection, resolved.data);
   const id = String((created as { Id?: unknown; id?: unknown }).Id ?? (created as { id?: unknown }).id ?? '');
   return { id, created: true, record: created };
 }

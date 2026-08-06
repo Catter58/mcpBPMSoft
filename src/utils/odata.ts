@@ -6,6 +6,8 @@
  * $filter expressions or URL paths.
  */
 
+import { BpmApiError } from './errors.js';
+
 const SAFE_IDENT_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const SAFE_PATH_RE = /^[A-Za-z_][A-Za-z0-9_/]*$/;
 const GUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
@@ -21,8 +23,14 @@ export function isSafePath(name: string): boolean {
 
 export function assertSafeIdentifier(name: string, label = 'identifier'): void {
   if (!isSafeIdentifier(name)) {
-    throw new Error(
-      `Недопустимое значение для ${label}: "${name}". Разрешены только латинские буквы, цифры и подчёркивания, начало — с буквы или подчёркивания.`
+    throw new BpmApiError(
+      `Недопустимое значение для ${label}: "${name}". Разрешены только латинские буквы, цифры и подчёркивания, начало — с буквы или подчёркивания.`,
+      400,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      'unsafe_identifier'
     );
   }
 }
@@ -57,4 +65,21 @@ export function escapeODataString(value: string): string {
     .replace(/\n/g, '')
     .replace(/\r/g, '')
     .replace(/\t/g, ' ');
+}
+
+/**
+ * Builds a substring-match expression valid for the given OData version:
+ * v4 — contains(field, 'v'); v3 — substringof('v', field).
+ * With caseInsensitive the field is wrapped in tolower(); pass the value
+ * already lower-cased (e.g. NormalizedName.normalized / .core).
+ */
+export function containsExpression(
+  fieldPath: string,
+  value: string,
+  odataVersion: 3 | 4,
+  opts: { caseInsensitive?: boolean } = {}
+): string {
+  const literal = `'${escapeODataString(value)}'`;
+  const field = opts.caseInsensitive ? `tolower(${fieldPath})` : fieldPath;
+  return odataVersion === 3 ? `substringof(${literal}, ${field})` : `contains(${field}, ${literal})`;
 }

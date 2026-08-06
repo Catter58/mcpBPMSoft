@@ -110,6 +110,8 @@ export interface LookupCandidate {
   id: string;
   displayValue: string;
   additionalInfo?: Record<string, unknown>;
+  /** Score ранжирования при fuzzy-каскаде (100 exact … 40 substring) */
+  score?: number;
 }
 
 export interface LookupResult {
@@ -125,6 +127,12 @@ export interface LookupResult {
   candidates: LookupCandidate[];
   /** Error message if resolution failed */
   error?: string;
+  /** Резолв прошёл не через точный eq (contains/core-каскад) */
+  fuzzy?: boolean;
+  /** Какой этап каскада дал результат */
+  matchType?: 'exact' | 'contains' | 'core';
+  /** Фактическое значение в базе (при fuzzy-резолве) */
+  matchedValue?: string;
 }
 
 export interface BatchRequest {
@@ -177,8 +185,25 @@ export interface ToolSuccess {
   message?: string;
 }
 
+/** Машиночитаемый код ошибки — стабильный контракт для LLM-агента. */
+export type ToolErrorCode =
+  | 'auth_required'
+  | 'not_found'
+  | 'lookup_ambiguous'
+  | 'unsafe_identifier'
+  | 'batch_unsupported'
+  | 'confirm_required'
+  | 'expected_count_mismatch'
+  | 'odata_error'
+  | 'validation'
+  | 'network'
+  | 'not_initialized'
+  | 'unknown';
+
 export interface ToolError {
   success: false;
+  /** Машиночитаемый код для программной обработки */
+  code: ToolErrorCode;
   error: string;
   httpStatus?: number;
   collection?: string;

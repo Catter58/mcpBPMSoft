@@ -38,6 +38,12 @@ export function registerProcessTools(server: McpServer, services: ServiceContain
               'Имя выходного параметра процесса. Если задано — сервер вернёт его значение в поле result.'
             ),
         },
+        outputSchema: {
+          process_name: z.string(),
+          status: z.number().int(),
+          result: z.unknown().optional(),
+          raw: z.string().optional(),
+        },
         annotations: meta.annotations,
       },
       async (params): Promise<CallToolResult> => {
@@ -101,6 +107,11 @@ export function registerProcessTools(server: McpServer, services: ServiceContain
             .string()
             .describe('UID элемента процесса (GUID 8-4-4-4-12) для возобновления.'),
         },
+        outputSchema: {
+          element_uid: z.string(),
+          status: z.number().int(),
+          raw: z.string().optional(),
+        },
         annotations: meta.annotations,
       },
       async (params): Promise<CallToolResult> => {
@@ -157,6 +168,12 @@ export function registerProcessTools(server: McpServer, services: ServiceContain
             .string()
             .optional()
             .describe('UUID родительского сообщения (если это ответ на существующее).'),
+        },
+        outputSchema: {
+          collection: z.string(),
+          entity_id: z.string(),
+          parent_id: z.string().optional(),
+          social_message: z.record(z.string(), z.unknown()),
         },
         annotations: meta.annotations,
       },

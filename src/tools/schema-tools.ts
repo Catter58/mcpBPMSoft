@@ -14,6 +14,7 @@ import type { ServiceContainer } from './init-tool.js';
 import { formatToolError } from '../utils/errors.js';
 import { getTool } from './registry.js';
 import { notInitialized } from './_guards.js';
+import { lookupCandidateShape } from './_schemas.js';
 
 export function registerSchemaTools(server: McpServer, services: ServiceContainer): void {
   // bpm_get_collections
@@ -26,6 +27,11 @@ export function registerSchemaTools(server: McpServer, services: ServiceContaine
         description: meta.description,
         inputSchema: {
           pattern: z.string().optional().describe('Фильтр по имени (поиск подстроки, регистронезависимый)'),
+        },
+        outputSchema: {
+          count: z.number().int(),
+          has_more: z.boolean(),
+          sets: z.array(z.object({ name: z.string(), entityType: z.string() })),
         },
         annotations: meta.annotations,
       },
@@ -44,13 +50,13 @@ export function registerSchemaTools(server: McpServer, services: ServiceContaine
                     : 'Список коллекций пуст.',
                 },
               ],
-              structuredContent: { count: 0, sets: [] },
+              structuredContent: { count: 0, has_more: false, sets: [] },
             };
           }
           const list = sets.map((s) => `  - ${s.name} (${s.entityType})`).join('\n');
           return {
             content: [{ type: 'text', text: `Найдено коллекций: ${sets.length}\n\n${list}` }],
-            structuredContent: { count: sets.length, sets },
+            structuredContent: { count: sets.length, has_more: false, sets },
           };
         } catch (error) {
           const toolError = formatToolError(error);
@@ -73,6 +79,25 @@ export function registerSchemaTools(server: McpServer, services: ServiceContaine
         description: meta.description,
         inputSchema: {
           collection: z.string().describe('Имя коллекции (EntitySet)'),
+        },
+        outputSchema: {
+          collection: z.string(),
+          entity: z.string(),
+          property_count: z.number().int(),
+          lookup_count: z.number().int(),
+          has_captions: z.boolean(),
+          properties: z.array(
+            z.object({
+              name: z.string(),
+              caption: z.string().nullable(),
+              type: z.string(),
+              required: z.boolean(),
+              isLookup: z.boolean(),
+              lookupCollection: z.string().nullable(),
+              lookupDisplayColumn: z.string().nullable(),
+            })
+          ),
+          hint: z.string(),
         },
         annotations: meta.annotations,
       },
@@ -167,7 +192,18 @@ export function registerSchemaTools(server: McpServer, services: ServiceContaine
           fuzzy: z
             .boolean()
             .optional()
-            .describe('При отсутствии точного совпадения повторять поиск через contains() (default: false)'),
+            .describe(
+              'Каскадный нечёткий поиск при отсутствии точного совпадения: игнорирует кавычки/орг-формы/регистр («Ланит» найдёт «АО «ЛАНИТ»»). Default: true. false — только точный eq.'
+            ),
+        },
+        outputSchema: {
+          resolved: z.boolean(),
+          id: z.string().optional(),
+          fuzzy: z.boolean().optional(),
+          match_type: z.enum(['exact', 'contains', 'core']).optional(),
+          matched_value: z.string().optional(),
+          matchCount: z.number().int().optional(),
+          candidates: z.array(lookupCandidateShape).optional(),
         },
         annotations: meta.annotations,
       },
@@ -180,18 +216,28 @@ export function registerSchemaTools(server: McpServer, services: ServiceContaine
             params.collection,
             params.field || 'Name',
             params.value,
-            { fuzzy: params.fuzzy }
+            { fuzzy: params.fuzzy ?? true }
           );
 
           if (result.resolved) {
+            const fuzzyNote = result.fuzzy && result.matchedValue
+              ? `\n(неточное совпадение: "${result.matchedValue}")`
+              : '';
             return {
               content: [
                 {
                   type: 'text',
-                  text: `Найдено: ${params.collection}.${params.field || 'Name'} = "${params.value}"\nUUID: ${result.id}`,
+                  text: `Найдено: ${params.collection}.${params.field || 'Name'} = "${params.value}"\nUUID: ${result.id}${fuzzyNote}`,
                 },
               ],
-              structuredContent: { resolved: true, id: result.id, candidates: result.candidates },
+              structuredContent: {
+                resolved: true,
+                id: result.id,
+                fuzzy: result.fuzzy ?? false,
+                match_type: result.matchType,
+                matched_value: result.matchedValue,
+                candidates: result.candidates,
+              },
             };
           }
 
@@ -200,7 +246,7 @@ export function registerSchemaTools(server: McpServer, services: ServiceContaine
               content: [
                 {
                   type: 'text',
-                  text: `Значение "${params.value}" не найдено в ${params.collection}.${params.field || 'Name'}${params.fuzzy ? ' (даже при нечётком поиске)' : ''}`,
+                  text: `Значение "${params.value}" не найдено в ${params.collection}.${params.field || 'Name'}${(params.fuzzy ?? true) ? ' (даже при нечётком поиске)' : ''}`,
                 },
               ],
               isError: true,
@@ -209,14 +255,14 @@ export function registerSchemaTools(server: McpServer, services: ServiceContaine
           }
 
           const candidateList = result.candidates
-            .map((c, i) => `  ${i + 1}. "${c.displayValue}" (ID: ${c.id})`)
+            .map((c, i) => `  ${i + 1}. "${c.displayValue}"${c.score !== undefined ? ` [score ${c.score}]` : ''} (ID: ${c.id})`)
             .join('\n');
 
           return {
             content: [
               {
                 type: 'text',
-                text: `Найдено ${result.matchCount} ${params.fuzzy ? 'нечёткое' : ''} совпадений для "${params.value}" в ${params.collection}.${params.field || 'Name'}:\n${candidateList}\n\nУточните значение для точного совпадения.`,
+                text: `Найдено ${result.matchCount} совпадений для "${params.value}" в ${params.collection}.${params.field || 'Name'}:\n${candidateList}\n\nУточните значение (кандидаты отранжированы по релевантности) или передайте UUID напрямую.`,
               },
             ],
             structuredContent: {
@@ -248,6 +294,19 @@ export function registerSchemaTools(server: McpServer, services: ServiceContaine
           search: z.string().describe('Текст для поиска по русскому или английскому названию'),
           collection: z.string().optional().describe('Коллекция для поиска (если опущена — по уже загруженным схемам)'),
         },
+        outputSchema: {
+          count: z.number().int(),
+          has_more: z.boolean(),
+          results: z.array(
+            z.object({
+              collection: z.string(),
+              fieldName: z.string(),
+              caption: z.string(),
+              type: z.string(),
+              isLookup: z.boolean(),
+            })
+          ),
+        },
         annotations: meta.annotations,
       },
       async (params): Promise<CallToolResult> => {
@@ -271,7 +330,7 @@ export function registerSchemaTools(server: McpServer, services: ServiceContaine
                     : `Поле "${params.search}" не найдено.\nСначала загрузите нужные схемы через bpm_get_schema.`,
                 },
               ],
-              structuredContent: { count: 0, results: [] },
+              structuredContent: { count: 0, has_more: false, results: [] },
             };
           }
 
@@ -286,7 +345,7 @@ export function registerSchemaTools(server: McpServer, services: ServiceContaine
 
           return {
             content: [{ type: 'text', text: lines.join('\n') }],
-            structuredContent: { count: results.length, results },
+            structuredContent: { count: results.length, has_more: false, results },
           };
         } catch (error) {
           const toolError = formatToolError(error);

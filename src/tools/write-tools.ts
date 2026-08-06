@@ -14,8 +14,10 @@ import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import type { ServiceContainer } from './init-tool.js';
 import { formatToolError, LookupResolutionError } from '../utils/errors.js';
 import { getTool } from './registry.js';
-import { notInitialized } from './_guards.js';
+import { notInitialized, lookupNotesText, lookupNotesStructured } from './_guards.js';
+import type { ResolvedLookupNote } from '../lookup/lookup-resolver.js';
 import { confirmParam, confirmationRequired, confirmationResponse, previewIdList } from '../utils/confirm.js';
+import { confirmShape, recordShape, resolvedLookupNoteShape } from './_schemas.js';
 
 function formatLookupAmbiguity(error: LookupResolutionError): CallToolResult {
   return {
@@ -56,6 +58,11 @@ export function registerWriteTools(server: McpServer, services: ServiceContainer
             .optional()
             .describe('Если true, проверяет наличие всех non-nullable полей в data до отправки (по метаданным).'),
         },
+        outputSchema: {
+          collection: z.string(),
+          record: recordShape,
+          resolved_lookups: z.array(resolvedLookupNoteShape).optional(),
+        },
         annotations: meta.annotations,
       },
       async (params): Promise<CallToolResult> => {
@@ -79,8 +86,11 @@ export function registerWriteTools(server: McpServer, services: ServiceContainer
           }
 
           let resolvedData: Record<string, unknown>;
+          let notes: ResolvedLookupNote[];
           try {
-            resolvedData = await services.lookupResolver.resolveDataLookups(params.collection, params.data);
+            const resolved = await services.lookupResolver.resolveDataLookups(params.collection, params.data);
+            resolvedData = resolved.data;
+            notes = resolved.notes;
           } catch (error) {
             if (error instanceof LookupResolutionError && error.matchCount > 1) {
               return formatLookupAmbiguity(error);
@@ -90,11 +100,23 @@ export function registerWriteTools(server: McpServer, services: ServiceContainer
 
           const created = await services.odataClient.createRecord(params.collection, resolvedData);
 
+          const notesLine = lookupNotesText(notes);
           return {
             content: [
-              { type: 'text', text: `Запись создана в ${params.collection}:\n${JSON.stringify(created, null, 2)}` },
+              {
+                type: 'text',
+                text: [
+                  `Запись создана в ${params.collection}:`,
+                  JSON.stringify(created, null, 2),
+                  notesLine ?? '',
+                ].filter(Boolean).join('\n'),
+              },
             ],
-            structuredContent: { collection: params.collection, record: created as unknown as Record<string, unknown> },
+            structuredContent: {
+              collection: params.collection,
+              record: created as unknown as Record<string, unknown>,
+              ...(notes.length ? { resolved_lookups: lookupNotesStructured(notes) } : {}),
+            },
           };
         } catch (error) {
           const toolError = formatToolError(error, params.collection);
@@ -122,6 +144,12 @@ export function registerWriteTools(server: McpServer, services: ServiceContainer
             .record(z.string(), z.unknown())
             .describe('Поля для обновления. Lookup-поля с текстовыми значениями разрешаются автоматически.'),
         },
+        outputSchema: {
+          collection: z.string(),
+          id: z.string(),
+          updated_fields: z.array(z.string()),
+          resolved_lookups: z.array(resolvedLookupNoteShape).optional(),
+        },
         annotations: meta.annotations,
       },
       async (params): Promise<CallToolResult> => {
@@ -130,8 +158,11 @@ export function registerWriteTools(server: McpServer, services: ServiceContainer
           await services.authManager.ensureAuthenticated();
 
           let resolvedData: Record<string, unknown>;
+          let notes: ResolvedLookupNote[];
           try {
-            resolvedData = await services.lookupResolver.resolveDataLookups(params.collection, params.data);
+            const resolved = await services.lookupResolver.resolveDataLookups(params.collection, params.data);
+            resolvedData = resolved.data;
+            notes = resolved.notes;
           } catch (error) {
             if (error instanceof LookupResolutionError && error.matchCount > 1) {
               return formatLookupAmbiguity(error);
@@ -141,17 +172,23 @@ export function registerWriteTools(server: McpServer, services: ServiceContainer
 
           await services.odataClient.updateRecord(params.collection, params.id, resolvedData);
 
+          const notesLine = lookupNotesText(notes);
           return {
             content: [
               {
                 type: 'text',
-                text: `Запись ${params.collection}(${params.id}) успешно обновлена.\nОбновлённые поля: ${Object.keys(resolvedData).join(', ')}`,
+                text: [
+                  `Запись ${params.collection}(${params.id}) успешно обновлена.`,
+                  `Обновлённые поля: ${Object.keys(resolvedData).join(', ')}`,
+                  notesLine ?? '',
+                ].filter(Boolean).join('\n'),
               },
             ],
             structuredContent: {
               collection: params.collection,
               id: params.id,
               updated_fields: Object.keys(resolvedData),
+              ...(notes.length ? { resolved_lookups: lookupNotesStructured(notes) } : {}),
             },
           };
         } catch (error) {
@@ -177,6 +214,12 @@ export function registerWriteTools(server: McpServer, services: ServiceContainer
           collection: z.string().describe('Имя коллекции (EntitySet)'),
           id: z.string().describe('UUID записи для удаления'),
           confirm: confirmParam,
+        },
+        outputSchema: {
+          ...confirmShape,
+          collection: z.string(),
+          id: z.string(),
+          deleted: z.boolean().optional(),
         },
         annotations: meta.annotations,
       },
@@ -224,6 +267,15 @@ export function registerWriteTools(server: McpServer, services: ServiceContainer
           data: z.record(z.string(), z.unknown()).describe('Поля для обновления (lookup резолвятся)'),
           expected_count: z.number().int().positive().describe('Сколько записей должен вернуть фильтр; иначе откат'),
         },
+        outputSchema: {
+          code: z.string().optional(),
+          collection: z.string().optional(),
+          succeeded: z.array(z.string()).optional(),
+          failed: z.array(z.object({ id: z.string(), error: z.string() })).optional(),
+          found: z.number().int().optional(),
+          expected: z.number().int().optional(),
+          resolved_lookups: z.array(resolvedLookupNoteShape).optional(),
+        },
         annotations: meta.annotations,
       },
       async (params): Promise<CallToolResult> => {
@@ -248,13 +300,16 @@ export function registerWriteTools(server: McpServer, services: ServiceContainer
                 },
               ],
               isError: true,
-              structuredContent: { found: records.value.length, expected: params.expected_count },
+              structuredContent: { code: 'expected_count_mismatch', found: records.value.length, expected: params.expected_count },
             };
           }
 
           let resolvedData: Record<string, unknown>;
+          let notes: ResolvedLookupNote[];
           try {
-            resolvedData = await services.lookupResolver.resolveDataLookups(params.collection, params.data);
+            const resolved = await services.lookupResolver.resolveDataLookups(params.collection, params.data);
+            resolvedData = resolved.data;
+            notes = resolved.notes;
           } catch (error) {
             if (error instanceof LookupResolutionError && error.matchCount > 1) {
               return formatLookupAmbiguity(error);
@@ -283,6 +338,7 @@ export function registerWriteTools(server: McpServer, services: ServiceContainer
                   `  Запросов: ${records.value.length}`,
                   `  Успешно: ${succeeded.length}`,
                   `  Ошибок: ${failed.length}`,
+                  lookupNotesText(notes) ?? '',
                   failed.length ? '\nОшибки:\n' + failed.map((f) => `  ${f.id}: ${f.error}`).join('\n') : '',
                 ].filter(Boolean).join('\n'),
               },
@@ -292,6 +348,7 @@ export function registerWriteTools(server: McpServer, services: ServiceContainer
               collection: params.collection,
               succeeded,
               failed,
+              ...(notes.length ? { resolved_lookups: lookupNotesStructured(notes) } : {}),
             },
           };
         } catch (error) {
@@ -315,6 +372,17 @@ export function registerWriteTools(server: McpServer, services: ServiceContainer
           filter: z.string().describe('OData $filter — обязателен'),
           expected_count: z.number().int().positive().describe('Сколько записей должно совпадать; иначе откат'),
           confirm: confirmParam,
+        },
+        outputSchema: {
+          ...confirmShape,
+          collection: z.string().optional(),
+          filter: z.string().optional(),
+          count: z.number().int().optional(),
+          ids: z.array(z.string()).optional(),
+          succeeded: z.array(z.string()).optional(),
+          failed: z.array(z.object({ id: z.string(), error: z.string() })).optional(),
+          found: z.number().int().optional(),
+          expected: z.number().int().optional(),
         },
         annotations: meta.annotations,
       },
@@ -340,7 +408,7 @@ export function registerWriteTools(server: McpServer, services: ServiceContainer
                 },
               ],
               isError: true,
-              structuredContent: { found: records.value.length, expected: params.expected_count },
+              structuredContent: { code: 'expected_count_mismatch', found: records.value.length, expected: params.expected_count },
             };
           }
 

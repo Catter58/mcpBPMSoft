@@ -31,6 +31,6 @@ export function confirmationResponse(
 
   return {
     content: [{ type: 'text', text }],
-    structuredContent: { requires_confirmation: true, ...structuredExtra },
+    structuredContent: { requires_confirmation: true, code: 'confirm_required', ...structuredExtra },
   };
 }

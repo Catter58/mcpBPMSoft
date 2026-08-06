@@ -9,12 +9,27 @@ import type { BpmConfig, LookupResult, LookupCandidate } from '../types/index.js
 import { ODataClient } from '../client/odata-client.js';
 import { MetadataManager } from '../metadata/metadata-manager.js';
 import { LookupResolutionError } from '../utils/errors.js';
-import { assertSafeIdentifier, escapeODataString } from '../utils/odata.js';
+import { assertSafeIdentifier, escapeODataString, containsExpression } from '../utils/odata.js';
+import { normalizeName, scoreCandidate, pickConfidentIndex } from '../utils/name-normalize.js';
 import { getAuthCacheScope } from '../auth/request-context.js';
 
 interface CacheEntry {
   result: LookupResult;
   timestamp: number;
+}
+
+/** Пометка о неточно (fuzzy) разрешённом lookup-поле на write-пути. */
+export interface ResolvedLookupNote {
+  field: string;
+  input: string;
+  matchedValue: string;
+  matchType: 'contains' | 'core';
+}
+
+/** Результат resolveDataLookups: подготовленные данные + пометки о fuzzy-резолвах. */
+export interface ResolvedData {
+  data: Record<string, unknown>;
+  notes: ResolvedLookupNote[];
 }
 
 const DEFAULT_CACHE_MAX = 1000;
@@ -23,6 +38,8 @@ export class LookupResolver {
   /** LRU is implemented via Map insertion order: re-set on hit, delete oldest on overflow. */
   private cache = new Map<string, CacheEntry>();
   private readonly maxCacheSize: number;
+  /** BPMSoft-инстанс отклонил tolower() в $filter — до конца жизни процесса работаем case-sensitive. */
+  private tolowerUnsupported = false;
 
   constructor(
     private config: BpmConfig,
@@ -55,13 +72,41 @@ export class LookupResolver {
     const escaped = escapeODataString(displayValue);
     const filter = `${displayColumn} eq '${escaped}'`;
     let candidates = await this.queryCandidates(lookupCollection, displayColumn, filter);
+    let matchType: 'exact' | 'contains' | 'core' = 'exact';
 
-    let usedFuzzy = false;
     if (candidates.length === 0 && options.fuzzy) {
-      const fuzzyFilter = `contains(${displayColumn},'${escaped}')`;
-      candidates = await this.queryCandidates(lookupCollection, displayColumn, fuzzyFilter);
-      usedFuzzy = candidates.length > 0;
+      const query = normalizeName(displayValue);
+      matchType = 'contains';
+      candidates = await this.queryContains(lookupCollection, displayColumn, query.normalized);
+      if (candidates.length === 0 && query.core !== query.normalized) {
+        matchType = 'core';
+        candidates = await this.queryContains(lookupCollection, displayColumn, query.core);
+      }
+      if (candidates.length > 0) {
+        const scores = candidates.map((c) => scoreCandidate(query, normalizeName(c.displayValue)));
+        candidates = candidates
+          .map((c, i) => ({ ...c, score: scores[i] }))
+          .sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
+        const confident = pickConfidentIndex(scores);
+        if (confident !== null) {
+          const winner = candidates[0];
+          const result: LookupResult = {
+            resolved: true,
+            id: winner.id,
+            searchValue: displayValue,
+            matchCount: 1,
+            candidates: [winner],
+            fuzzy: true,
+            matchType,
+            matchedValue: winner.displayValue,
+          };
+          this.cacheSet(cacheKey, { result, timestamp: Date.now() });
+          return result;
+        }
+      }
     }
+
+    const usedFuzzy = matchType !== 'exact' && candidates.length > 0;
 
     let result: LookupResult;
     if (candidates.length === 0) {
@@ -79,6 +124,7 @@ export class LookupResolver {
         searchValue: displayValue,
         matchCount: 1,
         candidates,
+        matchType: 'exact',
       };
     } else {
       result = {
@@ -97,6 +143,31 @@ export class LookupResolver {
   }
 
   /**
+   * Substring-этап каскада: contains/substringof по нормализованному значению.
+   * Первый 4xx на tolower() переключает резолвер в case-sensitive режим навсегда.
+   */
+  private async queryContains(
+    lookupCollection: string,
+    displayColumn: string,
+    loweredValue: string
+  ): Promise<LookupCandidate[]> {
+    const version = this.config.odata_version;
+    if (!this.tolowerUnsupported) {
+      try {
+        const filter = containsExpression(displayColumn, loweredValue, version, { caseInsensitive: true });
+        return await this.queryCandidates(lookupCollection, displayColumn, filter, 50);
+      } catch (error) {
+        const status = (error as { httpStatus?: number }).httpStatus;
+        if (status === undefined || status < 400 || status >= 500) throw error;
+        this.tolowerUnsupported = true;
+        console.error('[lookup-resolver] tolower() отклонён сервером, перехожу на case-sensitive contains');
+      }
+    }
+    const filter = containsExpression(displayColumn, loweredValue, version);
+    return this.queryCandidates(lookupCollection, displayColumn, filter, 50);
+  }
+
+  /**
    * Process a data object for create/update.
    *
    * Accepts BOTH english identifiers ("CityId") and Russian captions ("Город")
@@ -105,11 +176,9 @@ export class LookupResolver {
    *
    * Detects lookup fields and resolves human-readable values to UUIDs.
    */
-  async resolveDataLookups(
-    collection: string,
-    data: Record<string, unknown>
-  ): Promise<Record<string, unknown>> {
+  async resolveDataLookups(collection: string, data: Record<string, unknown>): Promise<ResolvedData> {
     const resolved: Record<string, unknown> = {};
+    const notes: ResolvedLookupNote[] = [];
     // Force metadata load early so a wrong collection fails fast
     await this.metadataManager.getEntityMetadata(collection);
 
@@ -134,21 +203,51 @@ export class LookupResolver {
         continue;
       }
 
-      const lookupResult = await this.resolve(lookupInfo.lookupCollection, value, lookupInfo.displayColumn);
+      const lookupResult = await this.resolve(lookupInfo.lookupCollection, value, lookupInfo.displayColumn, {
+        fuzzy: true,
+      });
 
       if (lookupResult.resolved && lookupResult.id) {
         resolved[normalizedKey] = lookupResult.id;
+        if (lookupResult.fuzzy && lookupResult.matchedValue && lookupResult.matchType !== 'exact') {
+          notes.push({
+            field: normalizedKey,
+            input: value,
+            matchedValue: lookupResult.matchedValue,
+            matchType: lookupResult.matchType ?? 'contains',
+          });
+        }
       } else {
-        throw new LookupResolutionError(
-          rawKey,
-          value,
-          lookupResult.matchCount,
-          lookupResult.candidates
-        );
+        // Значение не разрешилось — обогащаем ошибку допустимыми значениями
+        // справочника, чтобы LLM-агент мог сразу выбрать корректное.
+        let validValues: string[] | undefined;
+        if (lookupResult.matchCount === 0) {
+          validValues = await this.sampleValues(lookupInfo.lookupCollection, lookupInfo.displayColumn);
+        }
+        throw new LookupResolutionError(rawKey, value, lookupResult.matchCount, lookupResult.candidates, {
+          lookupCollection: lookupInfo.lookupCollection,
+          displayColumn: lookupInfo.displayColumn,
+          validValues,
+        });
       }
     }
 
-    return resolved;
+    return { data: resolved, notes };
+  }
+
+  /** Выборка первых значений справочника для контекста ошибок (ошибки сети глотаются). */
+  private async sampleValues(lookupCollection: string, displayColumn: string): Promise<string[] | undefined> {
+    try {
+      const response = await this.odataClient.getRecords<Record<string, unknown>>(lookupCollection, {
+        $select: `Id,${displayColumn}`,
+        $top: 20,
+        $orderby: `${displayColumn} asc`,
+      });
+      const values = response.value.map((r) => String(r[displayColumn] ?? '')).filter(Boolean);
+      return values.length > 0 ? values : undefined;
+    } catch {
+      return undefined;
+    }
   }
 
   /** Manually look up a value — exposed as bpm_lookup_value tool */
@@ -168,12 +267,13 @@ export class LookupResolver {
   private async queryCandidates(
     lookupCollection: string,
     displayColumn: string,
-    filter: string
+    filter: string,
+    top: number = 10
   ): Promise<LookupCandidate[]> {
     const response = await this.odataClient.getRecords<Record<string, unknown>>(lookupCollection, {
       $filter: filter,
       $select: `Id,${displayColumn}`,
-      $top: 10,
+      $top: top,
     });
     return response.value.map((record) => ({
       id: String(record.Id || record.id),

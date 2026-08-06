@@ -57,6 +57,11 @@ export function registerLogActivityTool(server: McpServer, services: ServiceCont
         due_date: z.string().optional().describe('Срок выполнения (ISO-8601).'),
         notes: z.string().optional().describe('Заметки (Notes/Description).'),
       },
+      outputSchema: {
+        activity_id: z.string(),
+        used_fields: z.record(z.string(), z.string()),
+        warnings: z.array(z.string()),
+      },
       annotations: meta.annotations,
     },
     async (params): Promise<CallToolResult> => {
@@ -117,7 +122,8 @@ export function registerLogActivityTool(server: McpServer, services: ServiceCont
             const ownerLookup = await services.lookupResolver.resolve(
               ownerField.lookupCollection ?? 'Contact',
               params.owner_name,
-              ownerField.lookupDisplayColumn ?? 'Name'
+              ownerField.lookupDisplayColumn ?? 'Name',
+              { fuzzy: true }
             );
             if (ownerLookup.resolved && ownerLookup.id) {
               data[ownerField.name] = ownerLookup.id;
@@ -144,8 +150,11 @@ export function registerLogActivityTool(server: McpServer, services: ServiceCont
           }
         }
 
-        const resolvedData = await services.lookupResolver.resolveDataLookups('Activity', data);
-        const created = await services.odataClient.createRecord<Record<string, unknown>>('Activity', resolvedData);
+        const resolved = await services.lookupResolver.resolveDataLookups('Activity', data);
+        for (const n of resolved.notes) {
+          warnings.push(`Поле ${n.field}: "${n.input}" разрешено неточно как "${n.matchedValue}"`);
+        }
+        const created = await services.odataClient.createRecord<Record<string, unknown>>('Activity', resolved.data);
         const activityId = String(
           (created as { Id?: unknown; id?: unknown }).Id ?? (created as { id?: unknown }).id ?? ''
         );

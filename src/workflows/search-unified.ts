@@ -12,7 +12,9 @@ import type { ServiceContainer } from '../tools/init-tool.js';
 import { formatToolError } from '../utils/errors.js';
 import { getTool } from '../tools/registry.js';
 import { notInitialized } from '../tools/_guards.js';
-import { escapeODataString } from '../utils/odata.js';
+import { containsExpression } from '../utils/odata.js';
+import { normalizeName } from '../utils/name-normalize.js';
+import type { ODataVersion } from '../types/index.js';
 
 const DEFAULT_COLLECTIONS = ['Contact', 'Account', 'Lead', 'Opportunity'];
 const RESULTS_CAP = 20;
@@ -21,6 +23,34 @@ interface UnifiedHit {
   collection: string;
   id: string;
   name: string;
+  match_type: 'contains' | 'core';
+}
+
+interface CollectionFetcher {
+  (filter: string): Promise<Array<Record<string, unknown>>>;
+}
+
+/**
+ * contains по значению с tolower(); при 4xx повторяет case-sensitive.
+ * Возвращает найденные записи (фолбэк-состояние живёт у вызывающего).
+ */
+async function fetchContains(
+  fetcher: CollectionFetcher,
+  value: string,
+  version: ODataVersion,
+  state: { tolowerUnsupported: boolean }
+): Promise<Array<Record<string, unknown>>> {
+  if (!state.tolowerUnsupported) {
+    try {
+      return await fetcher(containsExpression('Name', value, version, { caseInsensitive: true }));
+    } catch (error) {
+      const status = (error as { httpStatus?: number }).httpStatus;
+      if (status === undefined || status < 400 || status >= 500) throw error;
+      state.tolowerUnsupported = true;
+      console.error('[bpm_search_unified] tolower() отклонён сервером, перехожу на case-sensitive contains');
+    }
+  }
+  return fetcher(containsExpression('Name', value, version));
 }
 
 export function registerSearchUnifiedTool(server: McpServer, services: ServiceContainer): void {
@@ -45,6 +75,22 @@ export function registerSearchUnifiedTool(server: McpServer, services: ServiceCo
           .optional()
           .describe('Сколько записей выбирать в каждой коллекции (по умолчанию 5).'),
       },
+      outputSchema: {
+        query: z.string(),
+        count: z.number().int(),
+        total_found: z.number().int(),
+        has_more: z.boolean(),
+        results: z.array(
+          z.object({
+            collection: z.string(),
+            id: z.string(),
+            name: z.string(),
+            match_type: z.enum(['contains', 'core']),
+          })
+        ),
+        counts_by_collection: z.record(z.string(), z.number()),
+        skipped: z.array(z.string()).optional(),
+      },
       annotations: meta.annotations,
     },
     async (params): Promise<CallToolResult> => {
@@ -56,8 +102,9 @@ export function registerSearchUnifiedTool(server: McpServer, services: ServiceCo
           ? params.collections
           : DEFAULT_COLLECTIONS;
         const top = params.top ?? 5;
-        const escaped = escapeODataString(params.query);
-        const filter = `contains(Name,'${escaped}')`;
+        const query = normalizeName(params.query);
+        const version = services.config.odata_version;
+        const tolowerState = { tolowerUnsupported: false };
 
         const existingSets = await services.metadataManager.getEntitySets();
         const existingNames = new Set(existingSets.map((s) => s.name));
@@ -72,15 +119,27 @@ export function registerSearchUnifiedTool(server: McpServer, services: ServiceCo
             continue;
           }
           try {
-            const response = await services.odataClient.getRecords<Record<string, unknown>>(coll, {
-              $filter: filter,
-              $top: top,
-              $select: 'Id,Name',
-            });
-            const hits = response.value.map((rec) => ({
+            const fetcher: CollectionFetcher = async (filter) => {
+              const response = await services.odataClient.getRecords<Record<string, unknown>>(coll, {
+                $filter: filter,
+                $top: top,
+                $select: 'Id,Name',
+              });
+              return response.value;
+            };
+
+            let matchType: 'contains' | 'core' = 'contains';
+            let records = await fetchContains(fetcher, query.normalized, version, tolowerState);
+            if (records.length === 0 && query.core !== query.normalized) {
+              matchType = 'core';
+              records = await fetchContains(fetcher, query.core, version, tolowerState);
+            }
+
+            const hits = records.map((rec) => ({
               collection: coll,
               id: String(rec.Id ?? rec.id ?? ''),
               name: String(rec.Name ?? ''),
+              match_type: matchType,
             }));
             results.push(...hits);
             countsByCollection[coll] = hits.length;
@@ -92,20 +151,24 @@ export function registerSearchUnifiedTool(server: McpServer, services: ServiceCo
         }
 
         const capped = results.slice(0, RESULTS_CAP);
+        const hasMore = results.length > RESULTS_CAP;
 
         return {
           content: [
             {
               type: 'text',
               text: [
-                `Поиск "${params.query}" завершён. Совпадений: ${capped.length}${results.length > RESULTS_CAP ? ` (показано ${RESULTS_CAP} из ${results.length})` : ''}.`,
-                ...capped.map((h) => `  • [${h.collection}] ${h.name} — ${h.id}`),
+                `Поиск "${params.query}" завершён. Совпадений: ${capped.length}${hasMore ? ` (показано ${RESULTS_CAP} из ${results.length})` : ''}.`,
+                ...capped.map((h) => `  • [${h.collection}] ${h.name} — ${h.id}${h.match_type === 'core' ? ' (по ядру имени)' : ''}`),
                 skipped.length ? `\nПропущено: ${skipped.join(', ')}` : '',
               ].filter(Boolean).join('\n'),
             },
           ],
           structuredContent: {
             query: params.query,
+            count: capped.length,
+            total_found: results.length,
+            has_more: hasMore,
             results: capped,
             counts_by_collection: countsByCollection,
             ...(skipped.length ? { skipped } : {}),

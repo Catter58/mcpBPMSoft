@@ -17,6 +17,7 @@ import { notInitialized } from './_guards.js';
 import { compileFilter, type Criterion } from '../utils/filter-compiler.js';
 import { renderRecordsText, type RenderFormat } from '../utils/render.js';
 import { decodeCursor, buildNextCursor, type CursorState } from '../utils/cursor.js';
+import { paginationShape, recordShape } from './_schemas.js';
 
 const DEFAULT_TOP = 100;
 const DEFAULT_MAX_RECORDS = 1000;
@@ -60,6 +61,11 @@ export function registerReadTools(server: McpServer, services: ServiceContainer)
             .string()
             .optional()
             .describe('Opaque-курсор предыдущего ответа для получения следующей страницы. При его передаче все остальные параметры запроса наследуются от того ответа.'),
+        },
+        outputSchema: {
+          collection: z.string(),
+          ...paginationShape,
+          records: z.array(recordShape),
         },
         annotations: meta.annotations,
       },
@@ -151,9 +157,8 @@ export function registerReadTools(server: McpServer, services: ServiceContainer)
               collection,
               count: result.value.length,
               total_count: result['@odata.count'],
-              next_link: result['@odata.nextLink'],
+              has_more: hasMore || truncated,
               cursor: nextCursor,
-              truncated,
               records: result.value,
             },
           };
@@ -181,6 +186,11 @@ export function registerReadTools(server: McpServer, services: ServiceContainer)
           id: z.string().describe('UUID записи'),
           select: z.string().optional().describe('Поля для выборки через запятую'),
           expand: z.string().optional().describe('Развернуть связанные сущности'),
+        },
+        outputSchema: {
+          collection: z.string(),
+          id: z.string(),
+          record: recordShape,
         },
         annotations: meta.annotations,
       },
@@ -226,6 +236,11 @@ export function registerReadTools(server: McpServer, services: ServiceContainer)
           collection: z.string().describe('Имя коллекции (EntitySet)'),
           filter: z.string().optional().describe('OData $filter выражение'),
         },
+        outputSchema: {
+          collection: z.string(),
+          filter: z.string().optional(),
+          count: z.number().int(),
+        },
         annotations: meta.annotations,
       },
       async (params): Promise<CallToolResult> => {
@@ -263,7 +278,7 @@ export function registerReadTools(server: McpServer, services: ServiceContainer)
       op: z
         .string()
         .describe(
-          'Оператор: равно/eq, не равно/ne, больше/gt, больше или равно/ge, меньше/lt, меньше или равно/le, содержит/contains, не содержит/not_contains, начинается с/startswith, заканчивается на/endswith, в списке/in, пусто/is_null, не пусто/is_not_null, за последние N дней/in_last_days, за последние N часов/in_last_hours, между/between'
+          'Оператор: равно/eq, не равно/ne, больше/gt, больше или равно/ge, меньше/lt, меньше или равно/le, содержит/contains (регистронезависимо), не содержит/not_contains, начинается с/startswith, заканчивается на/endswith, в списке/in, пусто/is_null, не пусто/is_not_null, за последние N дней/in_last_days, за последние N часов/in_last_hours, между/between, похоже на/similar_to (нечёткий: кавычки, орг-формы АО/ООО/... и регистр игнорируются)'
         ),
       value: z.unknown().optional().describe('Значение (отсутствует для is_null/is_not_null)'),
       value_to: z.unknown().optional().describe('Верхняя граница для оператора between'),
@@ -305,6 +320,16 @@ export function registerReadTools(server: McpServer, services: ServiceContainer)
             .describe(
               "Формат выдачи: 'compact' (по умолчанию) — превью; 'full' — полный JSON; 'markdown' — таблица."
             ),
+        },
+        outputSchema: {
+          collection: z.string(),
+          compiled_filter: z.string(),
+          used_fields: z.array(
+            z.object({ input: z.string(), resolved: z.string(), caption: z.string().optional() })
+          ),
+          warnings: z.array(z.string()),
+          ...paginationShape,
+          records: z.array(recordShape),
         },
         annotations: meta.annotations,
       },
@@ -381,9 +406,8 @@ export function registerReadTools(server: McpServer, services: ServiceContainer)
               warnings: compiled.warnings,
               count: result.value.length,
               total_count: result['@odata.count'],
-              next_link: result['@odata.nextLink'],
+              has_more: hasMore || truncated,
               cursor: nextCursor,
-              truncated,
               records: result.value,
             },
           };

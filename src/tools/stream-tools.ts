@@ -23,6 +23,7 @@ import { getTool } from './registry.js';
 import { notInitialized } from './_guards.js';
 import { isSafeIdentifier } from '../utils/odata.js';
 import { confirmParam, confirmationRequired, confirmationResponse } from '../utils/confirm.js';
+import { confirmShape } from './_schemas.js';
 
 export function registerStreamTools(server: McpServer, services: ServiceContainer): void {
   // bpm_upload_file (SysImage)
@@ -39,6 +40,12 @@ export function registerStreamTools(server: McpServer, services: ServiceContaine
           target_collection: z.string().optional().describe('Коллекция записи, к которой привязывается файл (вместе с target_id и target_field)'),
           target_id: z.string().optional().describe('UUID записи, к которой привязывается файл'),
           target_field: z.string().optional().describe('Поле-ссылка в записи, куда записывается UUID загруженного файла'),
+        },
+        outputSchema: {
+          image_id: z.string(),
+          name: z.string(),
+          size_bytes: z.number().int(),
+          linked: z.boolean(),
         },
         annotations: meta.annotations,
       },
@@ -139,6 +146,13 @@ export function registerStreamTools(server: McpServer, services: ServiceContaine
           image_id: z.string().describe('UUID записи в SysImage'),
           save_path: z.string().optional().describe('Путь для сохранения файла'),
         },
+        outputSchema: {
+          image_id: z.string(),
+          name: z.string(),
+          mime_type: z.string(),
+          size_bytes: z.number().int(),
+          saved_to: z.string().optional(),
+        },
         annotations: meta.annotations,
       },
       async (params): Promise<CallToolResult> => {
@@ -223,6 +237,12 @@ export function registerStreamTools(server: McpServer, services: ServiceContaine
           field: z.string().describe('Имя бинарного поля сущности'),
           file_path: z.string().describe('Локальный путь к файлу'),
         },
+        outputSchema: {
+          collection: z.string(),
+          id: z.string(),
+          field: z.string(),
+          size_bytes: z.number().int(),
+        },
         annotations: meta.annotations,
       },
       async (params): Promise<CallToolResult> => {
@@ -293,6 +313,13 @@ export function registerStreamTools(server: McpServer, services: ServiceContaine
           field: z.string().describe('Имя бинарного поля сущности'),
           save_path: z.string().optional().describe('Локальный путь для сохранения файла'),
         },
+        outputSchema: {
+          collection: z.string(),
+          id: z.string(),
+          field: z.string(),
+          size_bytes: z.number().int(),
+          saved_to: z.string().optional(),
+        },
         annotations: meta.annotations,
       },
       async (params): Promise<CallToolResult> => {
@@ -351,6 +378,13 @@ export function registerStreamTools(server: McpServer, services: ServiceContaine
           id: z.string().describe('UUID записи'),
           field: z.string().describe('Имя бинарного поля сущности'),
           confirm: confirmParam,
+        },
+        outputSchema: {
+          ...confirmShape,
+          collection: z.string(),
+          id: z.string(),
+          field: z.string(),
+          deleted: z.boolean().optional(),
         },
         annotations: meta.annotations,
       },
