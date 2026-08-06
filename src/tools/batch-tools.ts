@@ -15,6 +15,7 @@ import { getTool } from './registry.js';
 import { notInitialized, lookupNotesText, lookupNotesStructured } from './_guards.js';
 import type { ResolvedLookupNote } from '../lookup/lookup-resolver.js';
 import { confirmParam, confirmationRequired, confirmationResponse, previewIdList } from '../utils/confirm.js';
+import { confirmShape, resolvedLookupNoteShape } from './_schemas.js';
 
 export function registerBatchTools(server: McpServer, services: ServiceContainer): void {
   // bpm_batch_create
@@ -31,6 +32,15 @@ export function registerBatchTools(server: McpServer, services: ServiceContainer
             .array(z.record(z.string(), z.unknown()))
             .describe('Массив записей для создания (lookup-поля резолвятся)'),
           continue_on_error: z.boolean().optional().describe('Не прерывать batch на первой ошибке (Prefer: continue-on-error)'),
+        },
+        outputSchema: {
+          collection: z.string(),
+          total: z.number().int(),
+          succeeded: z.number().int(),
+          failed: z.number().int(),
+          created: z.array(z.union([z.string(), z.null()])),
+          first_failed_index: z.number().int().nullable(),
+          resolved_lookups: z.array(resolvedLookupNoteShape).optional(),
         },
         annotations: meta.annotations,
       },
@@ -133,6 +143,14 @@ export function registerBatchTools(server: McpServer, services: ServiceContainer
             .describe('Массив обновлений [{id, data}]'),
           continue_on_error: z.boolean().optional().describe('Не прерывать batch на первой ошибке'),
         },
+        outputSchema: {
+          collection: z.string(),
+          total: z.number().int(),
+          succeeded: z.number().int(),
+          failed: z.number().int(),
+          first_failed_index: z.number().int().nullable(),
+          resolved_lookups: z.array(resolvedLookupNoteShape).optional(),
+        },
         annotations: meta.annotations,
       },
       async (params): Promise<CallToolResult> => {
@@ -226,6 +244,16 @@ export function registerBatchTools(server: McpServer, services: ServiceContainer
           ids: z.array(z.string()).describe('Массив UUID записей для удаления'),
           continue_on_error: z.boolean().optional().describe('Не прерывать batch на первой ошибке'),
           confirm: confirmParam,
+        },
+        outputSchema: {
+          ...confirmShape,
+          collection: z.string(),
+          total: z.number().int().optional(),
+          succeeded: z.number().int().optional(),
+          failed: z.number().int().optional(),
+          first_failed_index: z.number().int().nullable().optional(),
+          ids: z.array(z.string()).optional(),
+          count: z.number().int().optional(),
         },
         annotations: meta.annotations,
       },

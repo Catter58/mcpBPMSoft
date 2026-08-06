@@ -17,6 +17,7 @@ import { getTool } from './registry.js';
 import { notInitialized, lookupNotesText, lookupNotesStructured } from './_guards.js';
 import type { ResolvedLookupNote } from '../lookup/lookup-resolver.js';
 import { confirmParam, confirmationRequired, confirmationResponse, previewIdList } from '../utils/confirm.js';
+import { confirmShape, recordShape, resolvedLookupNoteShape } from './_schemas.js';
 
 function formatLookupAmbiguity(error: LookupResolutionError): CallToolResult {
   return {
@@ -56,6 +57,11 @@ export function registerWriteTools(server: McpServer, services: ServiceContainer
             .boolean()
             .optional()
             .describe('Если true, проверяет наличие всех non-nullable полей в data до отправки (по метаданным).'),
+        },
+        outputSchema: {
+          collection: z.string(),
+          record: recordShape,
+          resolved_lookups: z.array(resolvedLookupNoteShape).optional(),
         },
         annotations: meta.annotations,
       },
@@ -138,6 +144,12 @@ export function registerWriteTools(server: McpServer, services: ServiceContainer
             .record(z.string(), z.unknown())
             .describe('Поля для обновления. Lookup-поля с текстовыми значениями разрешаются автоматически.'),
         },
+        outputSchema: {
+          collection: z.string(),
+          id: z.string(),
+          updated_fields: z.array(z.string()),
+          resolved_lookups: z.array(resolvedLookupNoteShape).optional(),
+        },
         annotations: meta.annotations,
       },
       async (params): Promise<CallToolResult> => {
@@ -203,6 +215,12 @@ export function registerWriteTools(server: McpServer, services: ServiceContainer
           id: z.string().describe('UUID записи для удаления'),
           confirm: confirmParam,
         },
+        outputSchema: {
+          ...confirmShape,
+          collection: z.string(),
+          id: z.string(),
+          deleted: z.boolean().optional(),
+        },
         annotations: meta.annotations,
       },
       async (params): Promise<CallToolResult> => {
@@ -248,6 +266,15 @@ export function registerWriteTools(server: McpServer, services: ServiceContainer
           filter: z.string().describe('OData $filter — обязателен, не должен быть пустым'),
           data: z.record(z.string(), z.unknown()).describe('Поля для обновления (lookup резолвятся)'),
           expected_count: z.number().int().positive().describe('Сколько записей должен вернуть фильтр; иначе откат'),
+        },
+        outputSchema: {
+          code: z.string().optional(),
+          collection: z.string().optional(),
+          succeeded: z.array(z.string()).optional(),
+          failed: z.array(z.object({ id: z.string(), error: z.string() })).optional(),
+          found: z.number().int().optional(),
+          expected: z.number().int().optional(),
+          resolved_lookups: z.array(resolvedLookupNoteShape).optional(),
         },
         annotations: meta.annotations,
       },
@@ -345,6 +372,17 @@ export function registerWriteTools(server: McpServer, services: ServiceContainer
           filter: z.string().describe('OData $filter — обязателен'),
           expected_count: z.number().int().positive().describe('Сколько записей должно совпадать; иначе откат'),
           confirm: confirmParam,
+        },
+        outputSchema: {
+          ...confirmShape,
+          collection: z.string().optional(),
+          filter: z.string().optional(),
+          count: z.number().int().optional(),
+          ids: z.array(z.string()).optional(),
+          succeeded: z.array(z.string()).optional(),
+          failed: z.array(z.object({ id: z.string(), error: z.string() })).optional(),
+          found: z.number().int().optional(),
+          expected: z.number().int().optional(),
         },
         annotations: meta.annotations,
       },
