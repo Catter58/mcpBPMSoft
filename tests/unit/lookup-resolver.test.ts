@@ -68,7 +68,7 @@ describe('LookupResolver.resolve', () => {
     expect(r.candidates).toHaveLength(2);
   });
 
-  it('falls back to fuzzy contains() and returns matchCount>0, resolved=false', async () => {
+  it('falls back to fuzzy contains() and resolves a single confident candidate', async () => {
     let call = 0;
     const od = makeStubODataClient((filter) => {
       call += 1;
@@ -83,9 +83,10 @@ describe('LookupResolver.resolve', () => {
     const resolver = new LookupResolver(makeCfg(), od as never, {} as never);
 
     const r = await resolver.resolve('City', 'Mos', 'Name', { fuzzy: true });
-    expect(r.resolved).toBe(false);
-    expect(r.matchCount).toBe(1);
-    expect(r.candidates).toHaveLength(1);
+    expect(r.resolved).toBe(true);
+    expect(r.id).toBe('a');
+    expect(r.fuzzy).toBe(true);
+    expect(r.matchedValue).toBe('Moscow');
     expect(od.calls).toHaveLength(2);
   });
 });

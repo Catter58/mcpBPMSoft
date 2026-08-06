@@ -9,7 +9,8 @@ import type { BpmConfig, LookupResult, LookupCandidate } from '../types/index.js
 import { ODataClient } from '../client/odata-client.js';
 import { MetadataManager } from '../metadata/metadata-manager.js';
 import { LookupResolutionError } from '../utils/errors.js';
-import { assertSafeIdentifier, escapeODataString } from '../utils/odata.js';
+import { assertSafeIdentifier, escapeODataString, containsExpression } from '../utils/odata.js';
+import { normalizeName, scoreCandidate, pickConfidentIndex } from '../utils/name-normalize.js';
 import { getAuthCacheScope } from '../auth/request-context.js';
 
 interface CacheEntry {
@@ -23,6 +24,8 @@ export class LookupResolver {
   /** LRU is implemented via Map insertion order: re-set on hit, delete oldest on overflow. */
   private cache = new Map<string, CacheEntry>();
   private readonly maxCacheSize: number;
+  /** BPMSoft-инстанс отклонил tolower() в $filter — до конца жизни процесса работаем case-sensitive. */
+  private tolowerUnsupported = false;
 
   constructor(
     private config: BpmConfig,
@@ -55,13 +58,41 @@ export class LookupResolver {
     const escaped = escapeODataString(displayValue);
     const filter = `${displayColumn} eq '${escaped}'`;
     let candidates = await this.queryCandidates(lookupCollection, displayColumn, filter);
+    let matchType: 'exact' | 'contains' | 'core' = 'exact';
 
-    let usedFuzzy = false;
     if (candidates.length === 0 && options.fuzzy) {
-      const fuzzyFilter = `contains(${displayColumn},'${escaped}')`;
-      candidates = await this.queryCandidates(lookupCollection, displayColumn, fuzzyFilter);
-      usedFuzzy = candidates.length > 0;
+      const query = normalizeName(displayValue);
+      matchType = 'contains';
+      candidates = await this.queryContains(lookupCollection, displayColumn, query.normalized);
+      if (candidates.length === 0 && query.core !== query.normalized) {
+        matchType = 'core';
+        candidates = await this.queryContains(lookupCollection, displayColumn, query.core);
+      }
+      if (candidates.length > 0) {
+        const scores = candidates.map((c) => scoreCandidate(query, normalizeName(c.displayValue)));
+        candidates = candidates
+          .map((c, i) => ({ ...c, score: scores[i] }))
+          .sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
+        const confident = pickConfidentIndex(scores);
+        if (confident !== null) {
+          const winner = candidates[0];
+          const result: LookupResult = {
+            resolved: true,
+            id: winner.id,
+            searchValue: displayValue,
+            matchCount: 1,
+            candidates: [winner],
+            fuzzy: true,
+            matchType,
+            matchedValue: winner.displayValue,
+          };
+          this.cacheSet(cacheKey, { result, timestamp: Date.now() });
+          return result;
+        }
+      }
     }
+
+    const usedFuzzy = matchType !== 'exact' && candidates.length > 0;
 
     let result: LookupResult;
     if (candidates.length === 0) {
@@ -79,6 +110,7 @@ export class LookupResolver {
         searchValue: displayValue,
         matchCount: 1,
         candidates,
+        matchType: 'exact',
       };
     } else {
       result = {
@@ -94,6 +126,31 @@ export class LookupResolver {
 
     this.cacheSet(cacheKey, { result, timestamp: Date.now() });
     return result;
+  }
+
+  /**
+   * Substring-этап каскада: contains/substringof по нормализованному значению.
+   * Первый 4xx на tolower() переключает резолвер в case-sensitive режим навсегда.
+   */
+  private async queryContains(
+    lookupCollection: string,
+    displayColumn: string,
+    loweredValue: string
+  ): Promise<LookupCandidate[]> {
+    const version = this.config.odata_version;
+    if (!this.tolowerUnsupported) {
+      try {
+        const filter = containsExpression(displayColumn, loweredValue, version, { caseInsensitive: true });
+        return await this.queryCandidates(lookupCollection, displayColumn, filter, 50);
+      } catch (error) {
+        const status = (error as { httpStatus?: number }).httpStatus;
+        if (status === undefined || status < 400 || status >= 500) throw error;
+        this.tolowerUnsupported = true;
+        console.error('[lookup-resolver] tolower() отклонён сервером, перехожу на case-sensitive contains');
+      }
+    }
+    const filter = containsExpression(displayColumn, loweredValue, version);
+    return this.queryCandidates(lookupCollection, displayColumn, filter, 50);
   }
 
   /**
@@ -168,12 +225,13 @@ export class LookupResolver {
   private async queryCandidates(
     lookupCollection: string,
     displayColumn: string,
-    filter: string
+    filter: string,
+    top: number = 10
   ): Promise<LookupCandidate[]> {
     const response = await this.odataClient.getRecords<Record<string, unknown>>(lookupCollection, {
       $filter: filter,
       $select: `Id,${displayColumn}`,
-      $top: 10,
+      $top: top,
     });
     return response.value.map((record) => ({
       id: String(record.Id || record.id),

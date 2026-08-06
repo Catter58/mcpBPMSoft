@@ -110,6 +110,8 @@ export interface LookupCandidate {
   id: string;
   displayValue: string;
   additionalInfo?: Record<string, unknown>;
+  /** Score ранжирования при fuzzy-каскаде (100 exact … 40 substring) */
+  score?: number;
 }
 
 export interface LookupResult {
@@ -125,6 +127,12 @@ export interface LookupResult {
   candidates: LookupCandidate[];
   /** Error message if resolution failed */
   error?: string;
+  /** Резолв прошёл не через точный eq (contains/core-каскад) */
+  fuzzy?: boolean;
+  /** Какой этап каскада дал результат */
+  matchType?: 'exact' | 'contains' | 'core';
+  /** Фактическое значение в базе (при fuzzy-резолве) */
+  matchedValue?: string;
 }
 
 export interface BatchRequest {
