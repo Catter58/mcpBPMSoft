@@ -7,24 +7,36 @@
  *   - actionable next steps for the LLM agent (`next_steps`)
  */
 
-import type { ToolError, ODataErrorResponse } from '../types/index.js';
+import type { ToolError, ToolErrorCode, ODataErrorResponse } from '../types/index.js';
+
+function codeFromStatus(httpStatus: number): ToolErrorCode {
+  if (httpStatus === 401 || httpStatus === 403) return 'auth_required';
+  if (httpStatus === 404) return 'not_found';
+  if (httpStatus === 400) return 'validation';
+  return 'odata_error';
+}
 
 export class BpmApiError extends Error {
+  public readonly code: ToolErrorCode;
+
   constructor(
     message: string,
     public readonly httpStatus: number,
     public readonly collection?: string,
     public readonly details?: string,
     public readonly suggestions?: string[],
-    public readonly nextSteps?: string[]
+    public readonly nextSteps?: string[],
+    code?: ToolErrorCode
   ) {
     super(message);
     this.name = 'BpmApiError';
+    this.code = code ?? codeFromStatus(httpStatus);
   }
 
   toToolError(): ToolError {
     return {
       success: false,
+      code: this.code,
       error: this.message,
       httpStatus: this.httpStatus,
       collection: this.collection,
@@ -176,6 +188,7 @@ export function formatToolError(error: unknown, collection?: string): ToolError 
   if (error instanceof LookupResolutionError) {
     return {
       success: false,
+      code: error.matchCount > 1 ? 'lookup_ambiguous' : 'not_found',
       error: error.message,
       collection,
       details:
@@ -188,8 +201,13 @@ export function formatToolError(error: unknown, collection?: string): ToolError 
   }
 
   if (error instanceof Error) {
+    const isNetwork =
+      error.name === 'AbortError' ||
+      error.name === 'TimeoutError' ||
+      (error instanceof TypeError && /fetch|network/i.test(error.message));
     return {
       success: false,
+      code: isNetwork ? 'network' : 'unknown',
       error: error.message,
       collection,
       next_steps: defaultNextSteps(undefined, collection),
@@ -198,13 +216,14 @@ export function formatToolError(error: unknown, collection?: string): ToolError 
 
   return {
     success: false,
+    code: 'unknown',
     error: String(error),
     collection,
     next_steps: defaultNextSteps(undefined, collection),
   };
 }
 
-function defaultNextSteps(httpStatus?: number, collection?: string): string[] | undefined {
+function defaultNextSteps(httpStatus?: number, collection?: string): string[] {
   if (httpStatus === 401 || httpStatus === 403) {
     return [
       'Сессия BPMSoft могла истечь — переавторизуйтесь в BPMSoft и повторите запрос с актуальными BPMCSRF/cookies.',
@@ -224,5 +243,8 @@ function defaultNextSteps(httpStatus?: number, collection?: string): string[] | 
   if (httpStatus === 429 || httpStatus === 503) {
     return ['Сервер сообщил о перегрузке. Подождите несколько секунд и повторите запрос.'];
   }
-  return undefined;
+  return [
+    'Проверьте параметры вызова и повторите.',
+    `При повторении ошибки сверьте имена через bpm_get_schema${collection ? `(${collection})` : ''} или bpm_get_collections.`,
+  ];
 }

@@ -6,6 +6,8 @@
  * $filter expressions or URL paths.
  */
 
+import { BpmApiError } from './errors.js';
+
 const SAFE_IDENT_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const SAFE_PATH_RE = /^[A-Za-z_][A-Za-z0-9_/]*$/;
 const GUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
@@ -21,8 +23,14 @@ export function isSafePath(name: string): boolean {
 
 export function assertSafeIdentifier(name: string, label = 'identifier'): void {
   if (!isSafeIdentifier(name)) {
-    throw new Error(
-      `Недопустимое значение для ${label}: "${name}". Разрешены только латинские буквы, цифры и подчёркивания, начало — с буквы или подчёркивания.`
+    throw new BpmApiError(
+      `Недопустимое значение для ${label}: "${name}". Разрешены только латинские буквы, цифры и подчёркивания, начало — с буквы или подчёркивания.`,
+      400,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      'unsafe_identifier'
     );
   }
 }

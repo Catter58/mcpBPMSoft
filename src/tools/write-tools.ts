@@ -273,7 +273,7 @@ export function registerWriteTools(server: McpServer, services: ServiceContainer
                 },
               ],
               isError: true,
-              structuredContent: { found: records.value.length, expected: params.expected_count },
+              structuredContent: { code: 'expected_count_mismatch', found: records.value.length, expected: params.expected_count },
             };
           }
 
@@ -370,7 +370,7 @@ export function registerWriteTools(server: McpServer, services: ServiceContainer
                 },
               ],
               isError: true,
-              structuredContent: { found: records.value.length, expected: params.expected_count },
+              structuredContent: { code: 'expected_count_mismatch', found: records.value.length, expected: params.expected_count },
             };
           }
 

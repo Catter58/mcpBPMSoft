@@ -185,8 +185,25 @@ export interface ToolSuccess {
   message?: string;
 }
 
+/** Машиночитаемый код ошибки — стабильный контракт для LLM-агента. */
+export type ToolErrorCode =
+  | 'auth_required'
+  | 'not_found'
+  | 'lookup_ambiguous'
+  | 'unsafe_identifier'
+  | 'batch_unsupported'
+  | 'confirm_required'
+  | 'expected_count_mismatch'
+  | 'odata_error'
+  | 'validation'
+  | 'network'
+  | 'not_initialized'
+  | 'unknown';
+
 export interface ToolError {
   success: false;
+  /** Машиночитаемый код для программной обработки */
+  code: ToolErrorCode;
   error: string;
   httpStatus?: number;
   collection?: string;

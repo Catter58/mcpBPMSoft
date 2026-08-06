@@ -10,7 +10,16 @@ export const NOT_INITIALIZED_RESULT: CallToolResult = {
   content: [
     {
       type: 'text',
-      text: 'Сервер не инициализирован. Сначала вызовите bpm_init с параметрами подключения.',
+      text: JSON.stringify(
+        {
+          success: false,
+          code: 'not_initialized',
+          error: 'Сервер не инициализирован. Сначала вызовите bpm_init с параметрами подключения.',
+          next_steps: ['Вызовите bpm_init с URL, логином и паролем BPMSoft.'],
+        },
+        null,
+        2
+      ),
     },
   ],
   isError: true,

@@ -73,7 +73,8 @@ describe('formatToolError', () => {
 
   it('handles a generic Error', () => {
     const out = formatToolError(new Error('plain'), 'Contact');
-    expect(out).toEqual({ success: false, error: 'plain', collection: 'Contact' });
+    expect(out).toMatchObject({ success: false, code: 'unknown', error: 'plain', collection: 'Contact' });
+    expect(out.next_steps && out.next_steps.length).toBeGreaterThan(0);
   });
 
   it('handles a plain string', () => {
@@ -93,5 +94,35 @@ describe('AuthRequiredError', () => {
     expect(tool.error).toMatch(/BPMCSRF/);
     expect(tool.error).toMatch(/CsrfToken/);
     expect(tool.next_steps && tool.next_steps.length).toBeTruthy();
+  });
+});
+
+describe('ToolError.code', () => {
+  it('BpmApiError выводит код из httpStatus', () => {
+    expect(new BpmApiError('x', 401).code).toBe('auth_required');
+    expect(new BpmApiError('x', 403).code).toBe('auth_required');
+    expect(new BpmApiError('x', 404).code).toBe('not_found');
+    expect(new BpmApiError('x', 400).code).toBe('validation');
+    expect(new BpmApiError('x', 500).code).toBe('odata_error');
+  });
+
+  it('явный код имеет приоритет над httpStatus', () => {
+    const err = new BpmApiError('x', 0, undefined, undefined, undefined, undefined, 'batch_unsupported');
+    expect(err.code).toBe('batch_unsupported');
+    expect(err.toToolError().code).toBe('batch_unsupported');
+  });
+
+  it('LookupResolutionError: >1 матчей → lookup_ambiguous, 0 → not_found', () => {
+    const many = formatToolError(new LookupResolutionError('CityId', 'X', 3, []));
+    expect(many.code).toBe('lookup_ambiguous');
+    const none = formatToolError(new LookupResolutionError('CityId', 'X', 0, []));
+    expect(none.code).toBe('not_found');
+  });
+
+  it('next_steps непустой для любого кода', () => {
+    for (const err of [new BpmApiError('x', 500), new Error('generic'), 'string']) {
+      const out = formatToolError(err);
+      expect(out.next_steps && out.next_steps.length).toBeGreaterThan(0);
+    }
   });
 });

@@ -36,6 +36,7 @@ describe('confirmationResponse', () => {
 
     expect(result.structuredContent).toEqual({
       requires_confirmation: true,
+      code: 'confirm_required',
       collection: 'Contact',
       id: 'abc',
     });

@@ -189,7 +189,13 @@ export class ODataClient {
         'Пакетные запросы ($batch) не поддерживаются в режиме OData 3 для BPMSoft 1.8. Используйте OData 4 или выполните операции последовательно.',
         0,
         undefined,
-        'odata_version=3'
+        'odata_version=3',
+        undefined,
+        [
+          'Выполните операции по одной через bpm_create_record/bpm_update_record/bpm_delete_record.',
+          'Или переключите подключение на OData v4 (platform=net8), если инстанс это поддерживает.',
+        ],
+        'batch_unsupported'
       );
     }
 
