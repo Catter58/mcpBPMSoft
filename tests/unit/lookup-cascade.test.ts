@@ -157,6 +157,71 @@ describe('LookupResolver fuzzy cascade', () => {
     });
   });
 
+  it('resolveDataLookups: русский caption + значение справочника по имени (Активность → Результат «Выполнена»)', async () => {
+    // Пользовательский сценарий: обновить активность, поставить результат «Выполнена».
+    // Ключ «Результат» — caption, значение — имя записи справочника ActivityResult.
+    const od = makeStubODataClient((f) =>
+      f.includes("eq 'Выполнена'") ? [{ Id: 'res-1', Name: 'Выполнена' }] : []
+    );
+    const mm = {
+      async getEntityMetadata() {
+        return { properties: [], lookupFields: [] };
+      },
+      async resolveFieldReference(_c: string, key: string) {
+        // Caption-словарь метаданных: «Результат» → ResultId
+        return { name: key === 'Результат' ? 'ResultId' : key };
+      },
+      async getLookupInfo(_c: string, field: string) {
+        return field === 'ResultId' ? { lookupCollection: 'ActivityResult', displayColumn: 'Name' } : null;
+      },
+    };
+    const resolver = new LookupResolver(makeCfg(), od as never, mm as never);
+    const res = await resolver.resolveDataLookups('Activity', { Результат: 'Выполнена' });
+    expect(res.data).toEqual({ ResultId: 'res-1' });
+    expect(res.notes).toHaveLength(0);
+    // Запрос ушёл именно в справочник ActivityResult
+    expect(od.calls[0].collection).toBe('ActivityResult');
+  });
+
+  it('resolveDataLookups: значение не найдено → ошибка содержит допустимые значения справочника', async () => {
+    const od = makeStubODataClient((f) => {
+      // Ни один этап каскада не находит «Сделано»; выборка всех значений справочника
+      // (запрос без фильтра) возвращает полный список.
+      if (f === 'undefined' || f === '') {
+        return [
+          { Id: 'r1', Name: 'Выполнена' },
+          { Id: 'r2', Name: 'Отменена' },
+          { Id: 'r3', Name: 'Перенесена' },
+        ];
+      }
+      return [];
+    });
+    const mm = {
+      async getEntityMetadata() {
+        return { properties: [], lookupFields: [] };
+      },
+      async resolveFieldReference(_c: string, key: string) {
+        return { name: key === 'Результат' ? 'ResultId' : key };
+      },
+      async getLookupInfo(_c: string, field: string) {
+        return field === 'ResultId' ? { lookupCollection: 'ActivityResult', displayColumn: 'Name' } : null;
+      },
+    };
+    const resolver = new LookupResolver(makeCfg(), od as never, mm as never);
+    let thrown: unknown;
+    try {
+      await resolver.resolveDataLookups('Activity', { Результат: 'Сделано' });
+    } catch (e) {
+      thrown = e;
+    }
+    expect(thrown).toBeInstanceOf(Error);
+    const err = thrown as Error & { suggestions?: string[]; nextSteps?: string[] };
+    expect(err.message).toContain('Сделано');
+    expect(err.message).toContain('Допустимые значения');
+    expect(err.suggestions).toContain('Выполнена');
+    expect((err.nextSteps ?? []).join(' ')).toContain('bpm_get_enum_values');
+  });
+
   it('resolveDataLookups: точный матч не попадает в notes', async () => {
     const od = makeStubODataClient((f) =>
       f.includes("eq 'Москва'") ? [{ Id: 'city-1', Name: 'Москва' }] : []

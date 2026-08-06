@@ -88,9 +88,7 @@ export class AuthRequiredError extends BpmApiError {
 
 export class NotFoundError extends BpmApiError {
   constructor(collection: string, id?: string) {
-    const msg = id
-      ? `Запись не найдена: ${collection}(${id})`
-      : `Коллекция не найдена: ${collection}`;
+    const msg = id ? `Запись не найдена: ${collection}(${id})` : `Коллекция не найдена: ${collection}`;
     const next: string[] = id
       ? [
           `Возможно, ID устарел. Найдите актуальную запись: bpm_lookup_value(${collection}, Name, "<имя из контекста>")`,
@@ -105,6 +103,15 @@ export class NotFoundError extends BpmApiError {
   }
 }
 
+export interface LookupErrorContext {
+  /** Справочник, в котором искали значение (например, ActivityResult) */
+  lookupCollection?: string;
+  /** Колонка отображения (обычно Name) */
+  displayColumn?: string;
+  /** Выборка допустимых значений справочника — контекст для LLM-агента */
+  validValues?: string[];
+}
+
 export class LookupResolutionError extends Error {
   public readonly suggestions?: string[];
   public readonly nextSteps?: string[];
@@ -113,24 +120,37 @@ export class LookupResolutionError extends Error {
     public readonly field: string,
     public readonly searchValue: string,
     public readonly matchCount: number,
-    public readonly candidates: Array<{ id: string; displayValue: string }>
+    public readonly candidates: Array<{ id: string; displayValue: string }>,
+    public readonly context: LookupErrorContext = {}
   ) {
-    const msg =
+    const dict = context.lookupCollection ? ` (справочник ${context.lookupCollection})` : '';
+    let msg =
       matchCount === 0
-        ? `Lookup "${field}": значение "${searchValue}" не найдено`
-        : `Lookup "${field}": найдено ${matchCount} совпадений для "${searchValue}", требуется уточнение`;
+        ? `Lookup "${field}"${dict}: значение "${searchValue}" не найдено`
+        : `Lookup "${field}"${dict}: найдено ${matchCount} совпадений для "${searchValue}", требуется уточнение`;
+    if (matchCount === 0 && context.validValues && context.validValues.length > 0) {
+      msg += `. Допустимые значения: ${context.validValues.slice(0, 10).join(', ')}${context.validValues.length > 10 ? ', …' : ''}`;
+    }
     super(msg);
     this.name = 'LookupResolutionError';
 
     if (matchCount === 0) {
-      this.nextSteps = [
-        `Попробуйте bpm_lookup_value с fuzzy=true — он также найдёт неточные совпадения через contains().`,
-        `Если не уверены в названии справочника — используйте bpm_get_enum_values для просмотра всех допустимых значений.`,
-      ];
+      if (context.validValues && context.validValues.length > 0) {
+        this.suggestions = context.validValues.slice(0, 10);
+        this.nextSteps = [
+          `Повторите вызов, подставив одно из допустимых значений (список выше — из ${context.lookupCollection ?? 'справочника'}).`,
+          `Полный список значений: bpm_get_enum_values(field=${field}).`,
+        ];
+      } else {
+        this.nextSteps = [
+          `Попробуйте bpm_lookup_value — нечёткий каскад найдёт значение по неточному имени.`,
+          `Полный список допустимых значений даёт bpm_get_enum_values(field=${field}).`,
+        ];
+      }
     } else {
       this.suggestions = candidates.slice(0, 5).map((c) => `${c.displayValue} (${c.id})`);
       this.nextSteps = [
-        `Уточните значение, чтобы оно совпало точно (case-sensitive).`,
+        `Уточните значение, чтобы оно однозначно совпало с одним из кандидатов.`,
         `Или передайте UUID одного из кандидатов напрямую вместо текста.`,
       ];
     }
@@ -154,7 +174,10 @@ export class UnknownFieldError extends BpmApiError {
 }
 
 export class UnknownCollectionError extends BpmApiError {
-  constructor(public readonly collectionQuery: string, suggestions: string[]) {
+  constructor(
+    public readonly collectionQuery: string,
+    suggestions: string[]
+  ) {
     const msg = `Коллекция "${collectionQuery}" не найдена`;
     super(msg, 404, collectionQuery, undefined, suggestions, [
       `Запросите список коллекций: bpm_get_collections${suggestions.length ? `(pattern="${collectionQuery.slice(0, 4)}")` : ''}.`,

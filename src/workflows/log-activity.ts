@@ -122,7 +122,8 @@ export function registerLogActivityTool(server: McpServer, services: ServiceCont
             const ownerLookup = await services.lookupResolver.resolve(
               ownerField.lookupCollection ?? 'Contact',
               params.owner_name,
-              ownerField.lookupDisplayColumn ?? 'Name'
+              ownerField.lookupDisplayColumn ?? 'Name',
+              { fuzzy: true }
             );
             if (ownerLookup.resolved && ownerLookup.id) {
               data[ownerField.name] = ownerLookup.id;

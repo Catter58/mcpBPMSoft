@@ -123,7 +123,8 @@ export function registerSetStatusTool(server: McpServer, services: ServiceContai
         const lookupResult = await services.lookupResolver.resolve(
           lookupInfo.lookupCollection,
           params.status,
-          lookupInfo.displayColumn
+          lookupInfo.displayColumn,
+          { fuzzy: true }
         );
         if (!lookupResult.resolved || !lookupResult.id) {
           throw new BpmApiError(

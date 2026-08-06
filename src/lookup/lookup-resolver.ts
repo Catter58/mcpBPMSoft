@@ -218,16 +218,36 @@ export class LookupResolver {
           });
         }
       } else {
-        throw new LookupResolutionError(
-          rawKey,
-          value,
-          lookupResult.matchCount,
-          lookupResult.candidates
-        );
+        // Значение не разрешилось — обогащаем ошибку допустимыми значениями
+        // справочника, чтобы LLM-агент мог сразу выбрать корректное.
+        let validValues: string[] | undefined;
+        if (lookupResult.matchCount === 0) {
+          validValues = await this.sampleValues(lookupInfo.lookupCollection, lookupInfo.displayColumn);
+        }
+        throw new LookupResolutionError(rawKey, value, lookupResult.matchCount, lookupResult.candidates, {
+          lookupCollection: lookupInfo.lookupCollection,
+          displayColumn: lookupInfo.displayColumn,
+          validValues,
+        });
       }
     }
 
     return { data: resolved, notes };
+  }
+
+  /** Выборка первых значений справочника для контекста ошибок (ошибки сети глотаются). */
+  private async sampleValues(lookupCollection: string, displayColumn: string): Promise<string[] | undefined> {
+    try {
+      const response = await this.odataClient.getRecords<Record<string, unknown>>(lookupCollection, {
+        $select: `Id,${displayColumn}`,
+        $top: 20,
+        $orderby: `${displayColumn} asc`,
+      });
+      const values = response.value.map((r) => String(r[displayColumn] ?? '')).filter(Boolean);
+      return values.length > 0 ? values : undefined;
+    } catch {
+      return undefined;
+    }
   }
 
   /** Manually look up a value — exposed as bpm_lookup_value tool */
