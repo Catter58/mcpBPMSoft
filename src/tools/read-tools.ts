@@ -263,7 +263,7 @@ export function registerReadTools(server: McpServer, services: ServiceContainer)
       op: z
         .string()
         .describe(
-          'Оператор: равно/eq, не равно/ne, больше/gt, больше или равно/ge, меньше/lt, меньше или равно/le, содержит/contains, не содержит/not_contains, начинается с/startswith, заканчивается на/endswith, в списке/in, пусто/is_null, не пусто/is_not_null, за последние N дней/in_last_days, за последние N часов/in_last_hours, между/between'
+          'Оператор: равно/eq, не равно/ne, больше/gt, больше или равно/ge, меньше/lt, меньше или равно/le, содержит/contains (регистронезависимо), не содержит/not_contains, начинается с/startswith, заканчивается на/endswith, в списке/in, пусто/is_null, не пусто/is_not_null, за последние N дней/in_last_days, за последние N часов/in_last_hours, между/between, похоже на/similar_to (нечёткий: кавычки, орг-формы АО/ООО/... и регистр игнорируются)'
         ),
       value: z.unknown().optional().describe('Значение (отсутствует для is_null/is_not_null)'),
       value_to: z.unknown().optional().describe('Верхняя граница для оператора between'),

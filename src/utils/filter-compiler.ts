@@ -22,7 +22,8 @@
 
 import type { MetadataManager } from '../metadata/metadata-manager.js';
 import { UnknownFieldError } from './errors.js';
-import { escapeODataString, isSafeIdentifier } from './odata.js';
+import { containsExpression, escapeODataString, isSafeIdentifier } from './odata.js';
+import { normalizeName } from './name-normalize.js';
 
 export interface Criterion {
   /** Field name, caption ("Город") or navigation path ("Account.City"). */
@@ -72,7 +73,8 @@ type CanonicalOp =
   | 'in_last_days'
   | 'in_last_hours'
   | 'between'
-  | 'not_contains';
+  | 'not_contains'
+  | 'similar_to';
 
 const OP_ALIASES: Record<string, CanonicalOp> = {
   // eq
@@ -116,6 +118,9 @@ const OP_ALIASES: Record<string, CanonicalOp> = {
   // not contains
   'не содержит': 'not_contains',
   'not_contains': 'not_contains',
+  // fuzzy similarity (кавычки/орг-формы/регистр игнорируются)
+  'похоже на': 'similar_to',
+  'similar_to': 'similar_to',
 };
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -176,7 +181,8 @@ function canonicalOp(input: string): CanonicalOp {
       `больше или равно/ge, меньше/lt, меньше или равно/le, содержит/contains, ` +
       `не содержит/not_contains, начинается с/startswith, заканчивается на/endswith, ` +
       `в списке/in, пусто/is_null, не пусто/is_not_null, ` +
-      `за последние N дней/in_last_days, за последние N часов/in_last_hours, между/between.`
+      `за последние N дней/in_last_days, за последние N часов/in_last_hours, между/between, ` +
+      `похоже на/similar_to.`
   );
 }
 
@@ -307,10 +313,18 @@ function buildExpression(
       return `${fieldPath} ${op} ${literalize(criterion.value, odataVersion, isLookup)}`;
 
     case 'contains':
-      return `contains(${fieldPath}, ${stringLiteral(criterion.value)})`;
+      return containsExpression(fieldPath, lowerValue(criterion.value), odataVersion, { caseInsensitive: true });
 
     case 'not_contains':
-      return `not contains(${fieldPath}, ${stringLiteral(criterion.value)})`;
+      return `not ${containsExpression(fieldPath, lowerValue(criterion.value), odataVersion, { caseInsensitive: true })}`;
+
+    case 'similar_to':
+      return containsExpression(
+        fieldPath,
+        normalizeName(String(criterion.value ?? '')).core,
+        odataVersion,
+        { caseInsensitive: true }
+      );
 
     case 'startswith':
       return `startswith(${fieldPath}, ${stringLiteral(criterion.value)})`;
@@ -386,6 +400,10 @@ function literalize(value: unknown, odataVersion: 3 | 4, isLookup: boolean): str
 
   // Fallback — toString, escaped as string. Better than crashing.
   return stringLiteral(String(value));
+}
+
+function lowerValue(value: unknown): string {
+  return String(value ?? '').toLowerCase();
 }
 
 function stringLiteral(value: unknown): string {
