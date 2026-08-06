@@ -165,6 +165,14 @@ const LIMITS = [
   'Lookup-поля: v4 — суффикс Id (CityId), v3 — без суффикса (City).',
 ];
 
+const scenarioShape = z.object({
+  id: z.string(),
+  title: z.string(),
+  user_intent: z.string(),
+  recommended_tools: z.array(z.string()),
+  notes: z.string().optional(),
+});
+
 export function registerWorkflowCatalogTool(server: McpServer, _services: ServiceContainer): void {
   const meta = getTool('bpm_workflow_catalog');
   server.registerTool(
@@ -177,6 +185,19 @@ export function registerWorkflowCatalogTool(server: McpServer, _services: Servic
           .string()
           .optional()
           .describe('Если указан — вернуть детали только этого сценария (id из общего каталога).'),
+      },
+      outputSchema: {
+        scenario: scenarioShape.optional(),
+        scenarios: z.array(scenarioShape).optional(),
+        entity_graph: z
+          .object({
+            entities: z.array(z.string()),
+            relations: z.array(
+              z.object({ from: z.string(), to: z.string(), via: z.string(), meaning: z.string() })
+            ),
+          })
+          .optional(),
+        limits: z.array(z.string()).optional(),
       },
       annotations: meta.annotations,
     },

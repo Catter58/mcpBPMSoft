@@ -11,6 +11,7 @@
  * metadataManager / odataClient.
  */
 
+import * as z from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import type { ServiceContainer } from './init-tool.js';
@@ -66,6 +67,24 @@ export function registerDescribeInstanceTool(server: McpServer, services: Servic
       title: meta.title,
       description: meta.description,
       inputSchema: {},
+      outputSchema: {
+        collections_total: z.number().int(),
+        custom_collections_total: z.number().int(),
+        custom_collections_sample: z.array(z.string()),
+        main_entities: z.array(
+          z.object({
+            name: z.string(),
+            caption: z.string().nullable(),
+            total_fields: z.number().int(),
+            lookup_fields: z.number().int(),
+            custom_fields_count: z.number().int(),
+            custom_fields_sample: z.array(z.string()),
+            record_count: z.number().int().nullable(),
+          })
+        ),
+        generated_at: z.number(),
+        from_cache: z.boolean(),
+      },
       annotations: meta.annotations,
     },
     async (): Promise<CallToolResult> => {

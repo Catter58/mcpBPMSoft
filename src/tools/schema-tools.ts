@@ -14,6 +14,7 @@ import type { ServiceContainer } from './init-tool.js';
 import { formatToolError } from '../utils/errors.js';
 import { getTool } from './registry.js';
 import { notInitialized } from './_guards.js';
+import { lookupCandidateShape } from './_schemas.js';
 
 export function registerSchemaTools(server: McpServer, services: ServiceContainer): void {
   // bpm_get_collections
@@ -26,6 +27,11 @@ export function registerSchemaTools(server: McpServer, services: ServiceContaine
         description: meta.description,
         inputSchema: {
           pattern: z.string().optional().describe('Фильтр по имени (поиск подстроки, регистронезависимый)'),
+        },
+        outputSchema: {
+          count: z.number().int(),
+          has_more: z.boolean(),
+          sets: z.array(z.object({ name: z.string(), entityType: z.string() })),
         },
         annotations: meta.annotations,
       },
@@ -73,6 +79,25 @@ export function registerSchemaTools(server: McpServer, services: ServiceContaine
         description: meta.description,
         inputSchema: {
           collection: z.string().describe('Имя коллекции (EntitySet)'),
+        },
+        outputSchema: {
+          collection: z.string(),
+          entity: z.string(),
+          property_count: z.number().int(),
+          lookup_count: z.number().int(),
+          has_captions: z.boolean(),
+          properties: z.array(
+            z.object({
+              name: z.string(),
+              caption: z.string().nullable(),
+              type: z.string(),
+              required: z.boolean(),
+              isLookup: z.boolean(),
+              lookupCollection: z.string().nullable(),
+              lookupDisplayColumn: z.string().nullable(),
+            })
+          ),
+          hint: z.string(),
         },
         annotations: meta.annotations,
       },
@@ -171,6 +196,15 @@ export function registerSchemaTools(server: McpServer, services: ServiceContaine
               'Каскадный нечёткий поиск при отсутствии точного совпадения: игнорирует кавычки/орг-формы/регистр («Ланит» найдёт «АО «ЛАНИТ»»). Default: true. false — только точный eq.'
             ),
         },
+        outputSchema: {
+          resolved: z.boolean(),
+          id: z.string().optional(),
+          fuzzy: z.boolean().optional(),
+          match_type: z.enum(['exact', 'contains', 'core']).optional(),
+          matched_value: z.string().optional(),
+          matchCount: z.number().int().optional(),
+          candidates: z.array(lookupCandidateShape).optional(),
+        },
         annotations: meta.annotations,
       },
       async (params): Promise<CallToolResult> => {
@@ -259,6 +293,19 @@ export function registerSchemaTools(server: McpServer, services: ServiceContaine
         inputSchema: {
           search: z.string().describe('Текст для поиска по русскому или английскому названию'),
           collection: z.string().optional().describe('Коллекция для поиска (если опущена — по уже загруженным схемам)'),
+        },
+        outputSchema: {
+          count: z.number().int(),
+          has_more: z.boolean(),
+          results: z.array(
+            z.object({
+              collection: z.string(),
+              fieldName: z.string(),
+              caption: z.string(),
+              type: z.string(),
+              isLookup: z.boolean(),
+            })
+          ),
         },
         annotations: meta.annotations,
       },
