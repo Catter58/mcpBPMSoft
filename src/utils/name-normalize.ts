@@ -18,18 +18,38 @@ export interface NormalizedName {
 const QUOTE_RE = /[«»„“”‟"'’‘`]/g;
 
 const LEGAL_FORMS = new Set([
-  'ао', 'оао', 'зао', 'пао', 'ооо', 'ип', 'ано', 'нко', 'гуп', 'муп', 'фгуп', 'фгбу',
-  'тоо', 'нпо', 'нпп', 'пк', 'спк', 'чоп', 'тсж',
-  'llc', 'ltd', 'inc', 'gmbh', 'jsc', 'pjsc', 'ojsc', 'co', 'corp',
+  'ао',
+  'оао',
+  'зао',
+  'пао',
+  'ооо',
+  'ип',
+  'ано',
+  'нко',
+  'гуп',
+  'муп',
+  'фгуп',
+  'фгбу',
+  'тоо',
+  'нпо',
+  'нпп',
+  'пк',
+  'спк',
+  'чоп',
+  'тсж',
+  'llc',
+  'ltd',
+  'inc',
+  'gmbh',
+  'jsc',
+  'pjsc',
+  'ojsc',
+  'co',
+  'corp',
 ]);
 
 export function normalizeName(raw: string): NormalizedName {
-  const normalized = raw
-    .toLowerCase()
-    .replace(/ё/g, 'е')
-    .replace(QUOTE_RE, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
+  const normalized = raw.toLowerCase().replace(/ё/g, 'е').replace(QUOTE_RE, ' ').replace(/\s+/g, ' ').trim();
 
   const allTokens = normalized.split(' ').filter(Boolean);
   let start = 0;

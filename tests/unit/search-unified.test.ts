@@ -18,7 +18,10 @@ interface RegisteredTool {
   handler: (args: Record<string, unknown>) => Promise<ToolResult>;
 }
 
-function buildFakeServer(): { registered: RegisteredTool[]; registerTool: (n: string, m: unknown, h: RegisteredTool['handler']) => void } {
+function buildFakeServer(): {
+  registered: RegisteredTool[];
+  registerTool: (n: string, m: unknown, h: RegisteredTool['handler']) => void;
+} {
   const registered: RegisteredTool[] = [];
   return {
     registered,
@@ -41,14 +44,20 @@ function makeCfg(): BpmConfig {
   };
 }
 
-function buildServices(filters: string[], responder: (filter: string) => Array<Record<string, unknown>>): ServiceContainer {
+function buildServices(
+  filters: string[],
+  responder: (filter: string) => Array<Record<string, unknown>>
+): ServiceContainer {
   return {
     config: makeCfg(),
     httpClient: null!,
     authManager: { async ensureAuthenticated() {} } as never,
     metadataManager: {
       async getEntitySets() {
-        return [{ name: 'Contact', entityType: 'Contact' }, { name: 'Account', entityType: 'Account' }];
+        return [
+          { name: 'Contact', entityType: 'Contact' },
+          { name: 'Account', entityType: 'Account' },
+        ];
       },
     } as never,
     odataClient: {

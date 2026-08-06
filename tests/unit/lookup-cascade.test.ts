@@ -27,9 +27,7 @@ interface StubODataClient {
   calls: Array<{ collection: string; filter?: string; top?: number }>;
 }
 
-function makeStubODataClient(
-  responder: (filter: string) => Array<Record<string, unknown>>
-): StubODataClient {
+function makeStubODataClient(responder: (filter: string) => Array<Record<string, unknown>>): StubODataClient {
   const calls: Array<{ collection: string; filter?: string; top?: number }> = [];
   return {
     calls,
