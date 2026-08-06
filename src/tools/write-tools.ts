@@ -14,7 +14,8 @@ import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import type { ServiceContainer } from './init-tool.js';
 import { formatToolError, LookupResolutionError } from '../utils/errors.js';
 import { getTool } from './registry.js';
-import { notInitialized } from './_guards.js';
+import { notInitialized, lookupNotesText, lookupNotesStructured } from './_guards.js';
+import type { ResolvedLookupNote } from '../lookup/lookup-resolver.js';
 import { confirmParam, confirmationRequired, confirmationResponse, previewIdList } from '../utils/confirm.js';
 
 function formatLookupAmbiguity(error: LookupResolutionError): CallToolResult {
@@ -79,8 +80,11 @@ export function registerWriteTools(server: McpServer, services: ServiceContainer
           }
 
           let resolvedData: Record<string, unknown>;
+          let notes: ResolvedLookupNote[];
           try {
-            resolvedData = await services.lookupResolver.resolveDataLookups(params.collection, params.data);
+            const resolved = await services.lookupResolver.resolveDataLookups(params.collection, params.data);
+            resolvedData = resolved.data;
+            notes = resolved.notes;
           } catch (error) {
             if (error instanceof LookupResolutionError && error.matchCount > 1) {
               return formatLookupAmbiguity(error);
@@ -90,11 +94,23 @@ export function registerWriteTools(server: McpServer, services: ServiceContainer
 
           const created = await services.odataClient.createRecord(params.collection, resolvedData);
 
+          const notesLine = lookupNotesText(notes);
           return {
             content: [
-              { type: 'text', text: `Запись создана в ${params.collection}:\n${JSON.stringify(created, null, 2)}` },
+              {
+                type: 'text',
+                text: [
+                  `Запись создана в ${params.collection}:`,
+                  JSON.stringify(created, null, 2),
+                  notesLine ?? '',
+                ].filter(Boolean).join('\n'),
+              },
             ],
-            structuredContent: { collection: params.collection, record: created as unknown as Record<string, unknown> },
+            structuredContent: {
+              collection: params.collection,
+              record: created as unknown as Record<string, unknown>,
+              ...(notes.length ? { resolved_lookups: lookupNotesStructured(notes) } : {}),
+            },
           };
         } catch (error) {
           const toolError = formatToolError(error, params.collection);
@@ -130,8 +146,11 @@ export function registerWriteTools(server: McpServer, services: ServiceContainer
           await services.authManager.ensureAuthenticated();
 
           let resolvedData: Record<string, unknown>;
+          let notes: ResolvedLookupNote[];
           try {
-            resolvedData = await services.lookupResolver.resolveDataLookups(params.collection, params.data);
+            const resolved = await services.lookupResolver.resolveDataLookups(params.collection, params.data);
+            resolvedData = resolved.data;
+            notes = resolved.notes;
           } catch (error) {
             if (error instanceof LookupResolutionError && error.matchCount > 1) {
               return formatLookupAmbiguity(error);
@@ -141,17 +160,23 @@ export function registerWriteTools(server: McpServer, services: ServiceContainer
 
           await services.odataClient.updateRecord(params.collection, params.id, resolvedData);
 
+          const notesLine = lookupNotesText(notes);
           return {
             content: [
               {
                 type: 'text',
-                text: `Запись ${params.collection}(${params.id}) успешно обновлена.\nОбновлённые поля: ${Object.keys(resolvedData).join(', ')}`,
+                text: [
+                  `Запись ${params.collection}(${params.id}) успешно обновлена.`,
+                  `Обновлённые поля: ${Object.keys(resolvedData).join(', ')}`,
+                  notesLine ?? '',
+                ].filter(Boolean).join('\n'),
               },
             ],
             structuredContent: {
               collection: params.collection,
               id: params.id,
               updated_fields: Object.keys(resolvedData),
+              ...(notes.length ? { resolved_lookups: lookupNotesStructured(notes) } : {}),
             },
           };
         } catch (error) {
@@ -253,8 +278,11 @@ export function registerWriteTools(server: McpServer, services: ServiceContainer
           }
 
           let resolvedData: Record<string, unknown>;
+          let notes: ResolvedLookupNote[];
           try {
-            resolvedData = await services.lookupResolver.resolveDataLookups(params.collection, params.data);
+            const resolved = await services.lookupResolver.resolveDataLookups(params.collection, params.data);
+            resolvedData = resolved.data;
+            notes = resolved.notes;
           } catch (error) {
             if (error instanceof LookupResolutionError && error.matchCount > 1) {
               return formatLookupAmbiguity(error);
@@ -283,6 +311,7 @@ export function registerWriteTools(server: McpServer, services: ServiceContainer
                   `  Запросов: ${records.value.length}`,
                   `  Успешно: ${succeeded.length}`,
                   `  Ошибок: ${failed.length}`,
+                  lookupNotesText(notes) ?? '',
                   failed.length ? '\nОшибки:\n' + failed.map((f) => `  ${f.id}: ${f.error}`).join('\n') : '',
                 ].filter(Boolean).join('\n'),
               },
@@ -292,6 +321,7 @@ export function registerWriteTools(server: McpServer, services: ServiceContainer
               collection: params.collection,
               succeeded,
               failed,
+              ...(notes.length ? { resolved_lookups: lookupNotesStructured(notes) } : {}),
             },
           };
         } catch (error) {

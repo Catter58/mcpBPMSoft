@@ -130,6 +130,56 @@ describe('LookupResolver fuzzy cascade', () => {
     expect(r.fuzzy).toBe(true);
   });
 
+  it('resolveDataLookups: единственный fuzzy-матч принимается и попадает в notes', async () => {
+    const od = makeStubODataClient((f) => {
+      if (f.includes('eq')) return [];
+      if (f.includes("'ао ланит'") || f.includes("'ланит'")) return [{ Id: 'acc-1', Name: 'АО «ЛАНИТ»' }];
+      return [];
+    });
+    const mm = {
+      async getEntityMetadata() {
+        return { properties: [], lookupFields: [] };
+      },
+      async resolveFieldReference(_c: string, key: string) {
+        return { name: key };
+      },
+      async getLookupInfo(_c: string, field: string) {
+        return field === 'AccountId' ? { lookupCollection: 'Account', displayColumn: 'Name' } : null;
+      },
+    };
+    const resolver = new LookupResolver(makeCfg(), od as never, mm as never);
+    const res = await resolver.resolveDataLookups('Contact', { AccountId: 'АО ЛАНИТ', Notes: 'текст' });
+    expect(res.data.AccountId).toBe('acc-1');
+    expect(res.data.Notes).toBe('текст');
+    expect(res.notes).toHaveLength(1);
+    expect(res.notes[0]).toMatchObject({
+      field: 'AccountId',
+      input: 'АО ЛАНИТ',
+      matchedValue: 'АО «ЛАНИТ»',
+    });
+  });
+
+  it('resolveDataLookups: точный матч не попадает в notes', async () => {
+    const od = makeStubODataClient((f) =>
+      f.includes("eq 'Москва'") ? [{ Id: 'city-1', Name: 'Москва' }] : []
+    );
+    const mm = {
+      async getEntityMetadata() {
+        return { properties: [], lookupFields: [] };
+      },
+      async resolveFieldReference(_c: string, key: string) {
+        return { name: key };
+      },
+      async getLookupInfo() {
+        return { lookupCollection: 'City', displayColumn: 'Name' };
+      },
+    };
+    const resolver = new LookupResolver(makeCfg(), od as never, mm as never);
+    const res = await resolver.resolveDataLookups('Contact', { CityId: 'Москва' });
+    expect(res.data.CityId).toBe('city-1');
+    expect(res.notes).toHaveLength(0);
+  });
+
   it('tolower-отказ: 400 на CI-фильтре → ретрай без tolower, флаг залипает', async () => {
     const calls: string[] = [];
     const od = {

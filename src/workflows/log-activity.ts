@@ -144,8 +144,11 @@ export function registerLogActivityTool(server: McpServer, services: ServiceCont
           }
         }
 
-        const resolvedData = await services.lookupResolver.resolveDataLookups('Activity', data);
-        const created = await services.odataClient.createRecord<Record<string, unknown>>('Activity', resolvedData);
+        const resolved = await services.lookupResolver.resolveDataLookups('Activity', data);
+        for (const n of resolved.notes) {
+          warnings.push(`Поле ${n.field}: "${n.input}" разрешено неточно как "${n.matchedValue}"`);
+        }
+        const created = await services.odataClient.createRecord<Record<string, unknown>>('Activity', resolved.data);
         const activityId = String(
           (created as { Id?: unknown; id?: unknown }).Id ?? (created as { id?: unknown }).id ?? ''
         );

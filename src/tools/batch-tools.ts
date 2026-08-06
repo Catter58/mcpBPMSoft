@@ -12,7 +12,8 @@ import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import type { ServiceContainer } from './init-tool.js';
 import { formatToolError } from '../utils/errors.js';
 import { getTool } from './registry.js';
-import { notInitialized } from './_guards.js';
+import { notInitialized, lookupNotesText, lookupNotesStructured } from './_guards.js';
+import type { ResolvedLookupNote } from '../lookup/lookup-resolver.js';
 import { confirmParam, confirmationRequired, confirmationResponse, previewIdList } from '../utils/confirm.js';
 
 export function registerBatchTools(server: McpServer, services: ServiceContainer): void {
@@ -43,10 +44,12 @@ export function registerBatchTools(server: McpServer, services: ServiceContainer
           }
 
           const resolvedRecords: Record<string, unknown>[] = [];
+          const allNotes: ResolvedLookupNote[] = [];
           for (let i = 0; i < params.records.length; i++) {
             try {
               const resolved = await services.lookupResolver.resolveDataLookups(params.collection, params.records[i]);
-              resolvedRecords.push(resolved);
+              resolvedRecords.push(resolved.data);
+              allNotes.push(...resolved.notes);
             } catch (error) {
               return {
                 content: [
@@ -82,6 +85,8 @@ export function registerBatchTools(server: McpServer, services: ServiceContainer
             `  Успешно создано: ${succeeded.length}`,
             `  Ошибок: ${failed.length}`,
           ];
+          const notesLine = lookupNotesText(allNotes);
+          if (notesLine) lines.push(notesLine);
           if (failed.length > 0) {
             lines.push('', 'Ошибки:');
             failed.forEach((f) => lines.push(`  #${f.index + 1}: HTTP ${f.status} — ${JSON.stringify(f.body).slice(0, 300)}`));
@@ -97,6 +102,7 @@ export function registerBatchTools(server: McpServer, services: ServiceContainer
               failed: failed.length,
               created: succeeded.map((s) => (s.body as Record<string, unknown> | null)?.Id ?? null),
               first_failed_index: failed.length > 0 ? failed[0].index : null,
+              ...(allNotes.length ? { resolved_lookups: lookupNotesStructured(allNotes) } : {}),
             },
           };
         } catch (error) {
@@ -139,14 +145,16 @@ export function registerBatchTools(server: McpServer, services: ServiceContainer
           }
 
           const batchRequests: Array<{ method: 'PATCH'; url: string; body: Record<string, unknown> }> = [];
+          const allNotes: ResolvedLookupNote[] = [];
           for (let i = 0; i < params.updates.length; i++) {
             const update = params.updates[i];
             try {
-              const resolvedData = await services.lookupResolver.resolveDataLookups(params.collection, update.data);
+              const resolved = await services.lookupResolver.resolveDataLookups(params.collection, update.data);
+              allNotes.push(...resolved.notes);
               batchRequests.push({
                 method: 'PATCH',
                 url: services.odataClient.buildRecordPath(params.collection, update.id),
-                body: resolvedData,
+                body: resolved.data,
               });
             } catch (error) {
               return {
@@ -176,6 +184,8 @@ export function registerBatchTools(server: McpServer, services: ServiceContainer
             `  Успешно обновлено: ${succeeded.length}`,
             `  Ошибок: ${failed.length}`,
           ];
+          const notesLine = lookupNotesText(allNotes);
+          if (notesLine) lines.push(notesLine);
           if (failed.length > 0) {
             lines.push('', 'Ошибки:');
             failed.forEach((f) =>
@@ -192,6 +202,7 @@ export function registerBatchTools(server: McpServer, services: ServiceContainer
               succeeded: succeeded.length,
               failed: failed.length,
               first_failed_index: failed.length > 0 ? failed[0].index : null,
+              ...(allNotes.length ? { resolved_lookups: lookupNotesStructured(allNotes) } : {}),
             },
           };
         } catch (error) {

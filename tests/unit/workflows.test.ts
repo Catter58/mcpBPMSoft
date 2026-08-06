@@ -191,7 +191,7 @@ function buildStubServices(state: StubState): ServiceContainer {
       return { resolved: false, searchValue: value, matchCount: 0, candidates: [] };
     },
     async resolveDataLookups(_collection: string, data: Record<string, unknown>) {
-      return { ...data };
+      return { data: { ...data }, notes: [] };
     },
   };
 

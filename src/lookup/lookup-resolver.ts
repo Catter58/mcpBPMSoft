@@ -18,6 +18,20 @@ interface CacheEntry {
   timestamp: number;
 }
 
+/** Пометка о неточно (fuzzy) разрешённом lookup-поле на write-пути. */
+export interface ResolvedLookupNote {
+  field: string;
+  input: string;
+  matchedValue: string;
+  matchType: 'contains' | 'core';
+}
+
+/** Результат resolveDataLookups: подготовленные данные + пометки о fuzzy-резолвах. */
+export interface ResolvedData {
+  data: Record<string, unknown>;
+  notes: ResolvedLookupNote[];
+}
+
 const DEFAULT_CACHE_MAX = 1000;
 
 export class LookupResolver {
@@ -162,11 +176,9 @@ export class LookupResolver {
    *
    * Detects lookup fields and resolves human-readable values to UUIDs.
    */
-  async resolveDataLookups(
-    collection: string,
-    data: Record<string, unknown>
-  ): Promise<Record<string, unknown>> {
+  async resolveDataLookups(collection: string, data: Record<string, unknown>): Promise<ResolvedData> {
     const resolved: Record<string, unknown> = {};
+    const notes: ResolvedLookupNote[] = [];
     // Force metadata load early so a wrong collection fails fast
     await this.metadataManager.getEntityMetadata(collection);
 
@@ -191,10 +203,20 @@ export class LookupResolver {
         continue;
       }
 
-      const lookupResult = await this.resolve(lookupInfo.lookupCollection, value, lookupInfo.displayColumn);
+      const lookupResult = await this.resolve(lookupInfo.lookupCollection, value, lookupInfo.displayColumn, {
+        fuzzy: true,
+      });
 
       if (lookupResult.resolved && lookupResult.id) {
         resolved[normalizedKey] = lookupResult.id;
+        if (lookupResult.fuzzy && lookupResult.matchedValue && lookupResult.matchType !== 'exact') {
+          notes.push({
+            field: normalizedKey,
+            input: value,
+            matchedValue: lookupResult.matchedValue,
+            matchType: lookupResult.matchType ?? 'contains',
+          });
+        }
       } else {
         throw new LookupResolutionError(
           rawKey,
@@ -205,7 +227,7 @@ export class LookupResolver {
       }
     }
 
-    return resolved;
+    return { data: resolved, notes };
   }
 
   /** Manually look up a value — exposed as bpm_lookup_value tool */

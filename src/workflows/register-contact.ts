@@ -88,8 +88,11 @@ export function registerRegisterContactTool(server: McpServer, services: Service
           }
         }
 
-        const resolvedData = await services.lookupResolver.resolveDataLookups('Contact', contactData);
-        const created = await services.odataClient.createRecord<Record<string, unknown>>('Contact', resolvedData);
+        const resolved = await services.lookupResolver.resolveDataLookups('Contact', contactData);
+        for (const n of resolved.notes) {
+          warnings.push(`Поле ${n.field}: "${n.input}" разрешено неточно как "${n.matchedValue}"`);
+        }
+        const created = await services.odataClient.createRecord<Record<string, unknown>>('Contact', resolved.data);
         const contactId = String((created as { Id?: unknown; id?: unknown }).Id ?? (created as { id?: unknown }).id ?? '');
 
         return {

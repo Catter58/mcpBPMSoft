@@ -4,6 +4,7 @@
 
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import type { ServiceContainer } from './init-tool.js';
+import type { ResolvedLookupNote } from '../lookup/lookup-resolver.js';
 
 export const NOT_INITIALIZED_RESULT: CallToolResult = {
   content: [
@@ -54,4 +55,23 @@ export function structuredResult(text: string, structured: Record<string, unknow
     structuredContent: structured,
     isError,
   };
+}
+
+/** Человекочитаемая строка о fuzzy-резолвах lookup-полей (null, если их не было). */
+export function lookupNotesText(notes: ResolvedLookupNote[]): string | null {
+  if (notes.length === 0) return null;
+  const parts = notes.map((n) => `${n.field}: "${n.input}" → "${n.matchedValue}"`);
+  return `Неточно разрешены lookup-поля: ${parts.join('; ')}`;
+}
+
+/** snake_case-представление notes для structuredContent (resolved_lookups). */
+export function lookupNotesStructured(
+  notes: ResolvedLookupNote[]
+): Array<{ field: string; input: string; matched_value: string; match_type: 'contains' | 'core' }> {
+  return notes.map((n) => ({
+    field: n.field,
+    input: n.input,
+    matched_value: n.matchedValue,
+    match_type: n.matchType,
+  }));
 }
