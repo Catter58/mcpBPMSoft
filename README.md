@@ -125,6 +125,81 @@ npm start
 
 ---
 
+## Подключение к уже работающему HTTP-серверу
+
+Если сервер запущен отдельно (`MCP_TRANSPORT=http`, порт `8007`), MCP-клиент подключается к нему по URL — **без** `command`/`args`. Транспорт задаётся полем `type: "http"` (не `transport`). В штатной схеме заголовки авторизации **прокидываются автоматически** — их не хардкодят в конфиге:
+
+```json
+{
+  "mcpServers": {
+    "bpmsoft": {
+      "type": "http",
+      "url": "http://bpmsoft-mcp-host:8007/mcp"
+    }
+  }
+}
+```
+
+Авторизация per-request: заголовок `BPMCSRF` и cookie (`.ASPXAUTH`, `BPMSESSIONID`, `CsrfToken`) сервер извлекает из **каждого входящего** запроса (`extractAuthFromHeaders`, `src/auth/request-context.ts`) и пробрасывает в BPMSoft. Кто их подставляет:
+
+- **Фронтящий reverse proxy** (штатно, паттерн mcp-proxy-server) — берёт живую сессию пользователя и добавляет заголовки к каждому проксируемому запросу.
+- **Сам MCP-клиент**, если умеет форвардить сессионные заголовки/cookie.
+
+Хардкодить токен в `headers` конфига **не нужно и вредно** — CSRF-токен и сессия протухают, статичное значение сломается. Явные `headers` уместны только для разовой ручной отладки (`curl`, Postman):
+
+```bash
+curl -X POST http://bpmsoft-mcp-host:8007/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "BPMCSRF: <csrf-token>" \
+  -H "Cookie: .ASPXAUTH=<...>; BPMSESSIONID=<...>; CsrfToken=<...>" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+```
+
+Замечания:
+
+- Сервер stateless и принимает **любой POST** — путь в URL игнорируется, `/mcp` взят по соглашению.
+- Запрос без валидных заголовков → `AuthRequiredError`. Секреты на сервере не хранятся.
+- `GET`/`DELETE` не поддерживаются (stateless JSON-режим) — вернётся `405`.
+- В production ставьте перед сервером HTTPS reverse proxy и используйте `https://` URL — см. раздел о безопасности.
+
+---
+
+## Запуск в Docker
+
+Production-образ (multi-stage `Dockerfile`): транспорт, host и порт уже зашиты в `ENV` (`MCP_TRANSPORT=http`, `MCP_HTTP_HOST=0.0.0.0`, `MCP_HTTP_PORT=8007`), контейнер работает под non-root `node`.
+
+```bash
+# сборка
+docker build -t mcp-bpmsoft .
+
+# запуск — BPMSOFT_URL единственный обязательный env
+docker run -d --name mcp-bpmsoft \
+  -p 8007:8007 \
+  -e BPMSOFT_URL=https://bpm.example.ru \
+  mcp-bpmsoft
+```
+
+Опциональные env (значения по умолчанию — OData v4 / net8):
+
+```bash
+docker run -d --name mcp-bpmsoft \
+  -p 8007:8007 \
+  -e BPMSOFT_URL=https://bpm.example.ru \
+  -e BPMSOFT_ODATA_VERSION=4 \
+  -e BPMSOFT_PLATFORM=net8 \
+  mcp-bpmsoft
+```
+
+Замечания:
+
+- `MCP_TRANSPORT`/`MCP_HTTP_HOST`/`MCP_HTTP_PORT` переопределять не нужно — образ уже настроен на HTTP. Меняете внешний порт маппингом (`-p 9000:8007`), а не env.
+- Контейнер слушает `0.0.0.0:8007` внутри — наружу не публикуйте напрямую. В production перед контейнером ставьте HTTPS reverse proxy, а порт ограничьте фаерволом (см. раздел о безопасности).
+- Логи идут в `stderr`: `docker logs -f mcp-bpmsoft`. Строка `MCP BPMSoft OData Server running on http (port 8007)` = сервер поднялся.
+- Dev-образ с watch — `Dockerfile.dev`: `docker build -f Dockerfile.dev -t mcp-bpmsoft:dev .`
+
+---
+
 ## Примеры диалогов
 
 ### Пример 1 — поиск с человеческим языком
@@ -263,7 +338,7 @@ Claude → bpm_post_feed
 |---|---|
 | `bpm_get_collections` | Список доступных EntitySet |
 | `bpm_get_schema` | Поля коллекции с русскими подписями, типами, lookup-связями |
-| `bpm_lookup_value` | Найти UUID справочного значения; `fuzzy=true` — нечёткий поиск через `contains()` |
+| `bpm_lookup_value` | Найти UUID справочного значения; по умолчанию нечёткий каскад (регистр, кавычки, орг-формы АО/ООО игнорируются — «Ланит» найдёт «АО «ЛАНИТ»») |
 | `bpm_get_enum_values` | Все значения справочника, к которому привязано lookup-поле (например, все ActivityCategory) |
 | `bpm_workflow_catalog` | **Карта типичных сценариев + связи между сущностями + ограничения BPMSoft 1.8.** Хорошо вызывать в начале сессии. |
 | `bpm_find_field` | Найти поле по фрагменту русского/английского названия в уже загруженных схемах |
