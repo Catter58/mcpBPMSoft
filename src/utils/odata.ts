@@ -58,3 +58,20 @@ export function escapeODataString(value: string): string {
     .replace(/\r/g, '')
     .replace(/\t/g, ' ');
 }
+
+/**
+ * Builds a substring-match expression valid for the given OData version:
+ * v4 — contains(field, 'v'); v3 — substringof('v', field).
+ * With caseInsensitive the field is wrapped in tolower(); pass the value
+ * already lower-cased (e.g. NormalizedName.normalized / .core).
+ */
+export function containsExpression(
+  fieldPath: string,
+  value: string,
+  odataVersion: 3 | 4,
+  opts: { caseInsensitive?: boolean } = {}
+): string {
+  const literal = `'${escapeODataString(value)}'`;
+  const field = opts.caseInsensitive ? `tolower(${fieldPath})` : fieldPath;
+  return odataVersion === 3 ? `substringof(${literal}, ${field})` : `contains(${field}, ${literal})`;
+}
