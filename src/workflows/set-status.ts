@@ -38,6 +38,13 @@ export function registerSetStatusTool(server: McpServer, services: ServiceContai
             'Явное имя поля-статуса (если в коллекции несколько кандидатов: StatusId, StageId и т.п.)'
           ),
       },
+      outputSchema: {
+        collection: z.string(),
+        id: z.string(),
+        status_field: z.string(),
+        status_id: z.string(),
+        status_value: z.string(),
+      },
       annotations: meta.annotations,
     },
     async (params): Promise<CallToolResult> => {

@@ -57,6 +57,11 @@ export function registerLogActivityTool(server: McpServer, services: ServiceCont
         due_date: z.string().optional().describe('Срок выполнения (ISO-8601).'),
         notes: z.string().optional().describe('Заметки (Notes/Description).'),
       },
+      outputSchema: {
+        activity_id: z.string(),
+        used_fields: z.record(z.string(), z.string()),
+        warnings: z.array(z.string()),
+      },
       annotations: meta.annotations,
     },
     async (params): Promise<CallToolResult> => {

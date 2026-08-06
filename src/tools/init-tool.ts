@@ -85,6 +85,14 @@ export function registerInitTool(
           .optional()
           .describe('Платформа: net8 (по умолчанию) или netframework'),
       },
+      outputSchema: {
+        url: z.string(),
+        odata_endpoint: z.string(),
+        odata_version: z.number(),
+        platform: z.string(),
+        username: z.string().optional(),
+        initialized: z.boolean(),
+      },
       annotations: meta.annotations,
     },
     async (params): Promise<CallToolResult> => {

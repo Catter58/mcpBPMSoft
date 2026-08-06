@@ -75,6 +75,22 @@ export function registerSearchUnifiedTool(server: McpServer, services: ServiceCo
           .optional()
           .describe('Сколько записей выбирать в каждой коллекции (по умолчанию 5).'),
       },
+      outputSchema: {
+        query: z.string(),
+        count: z.number().int(),
+        total_found: z.number().int(),
+        has_more: z.boolean(),
+        results: z.array(
+          z.object({
+            collection: z.string(),
+            id: z.string(),
+            name: z.string(),
+            match_type: z.enum(['contains', 'core']),
+          })
+        ),
+        counts_by_collection: z.record(z.string(), z.number()),
+        skipped: z.array(z.string()).optional(),
+      },
       annotations: meta.annotations,
     },
     async (params): Promise<CallToolResult> => {

@@ -39,6 +39,13 @@ export function registerRegisterContactTool(server: McpServer, services: Service
             'Дополнительные поля контакта. Имена полей могут быть на русском (caption) или латинице.'
           ),
       },
+      outputSchema: {
+        contact_id: z.string(),
+        account_id: z.string().nullable(),
+        account_created: z.boolean(),
+        contact_created: z.boolean(),
+        warnings: z.array(z.string()),
+      },
       annotations: meta.annotations,
     },
     async (params): Promise<CallToolResult> => {
