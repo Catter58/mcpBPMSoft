@@ -14,8 +14,8 @@
       }
     },
 
-    "_variant_B_http": {
-      "_comment": "Вариант B: HTTP-транспорт (production). Сервер слушает порт MCP_HTTP_PORT (default 8007). MCP-клиент подключается по HTTP и передаёт заголовок BPMCSRF + Cookie с каждым запросом.",
+    "_variant_B_http_launch_server": {
+      "_comment": "Вариант B1: локально ЗАПУСТИТЬ сервер в HTTP-режиме через клиент, который умеет спавнить процесс (command/args/env). Сервер слушает MCP_HTTP_PORT (default 8007). Это НЕ подключение к уже работающему серверу — см. вариант B2.",
       "command": "node",
       "args": ["/path/to/mcpBPMSoft/build/index.js"],
       "env": {
@@ -25,6 +25,12 @@
         "BPMSOFT_ODATA_VERSION": "4",
         "BPMSOFT_PLATFORM":      "net8"
       }
+    },
+
+    "_variant_B2_http_remote": {
+      "_comment": "Вариант B2: ПОДКЛЮЧЕНИЕ к уже работающему Streamable HTTP серверу. Транспорт задаётся полем type:\"http\" + url (НЕ command/args). Путь в url игнорируется сервером (принимается любой POST) — /mcp по соглашению. Заголовки авторизации (BPMCSRF + Cookie) НЕ хардкодятся: сервер извлекает их из каждого входящего запроса, а подставляет их фронтящий reverse proxy или сам клиент из живой сессии пользователя (паттерн mcp-proxy-server). Статичный токен протухнет. В production ставьте перед сервером HTTPS reverse proxy и используйте https:// url.",
+      "type": "http",
+      "url": "http://bpmsoft-mcp-host:8007/mcp"
     }
   }
 }

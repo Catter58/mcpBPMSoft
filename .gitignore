@@ -12,3 +12,7 @@ coverage/
 
 .idea/
 .vscode/
+.gitignore
+.serena/
+.claude/
+docs/
