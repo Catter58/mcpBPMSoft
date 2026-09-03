@@ -188,9 +188,24 @@ export class UnknownCollectionError extends BpmApiError {
 }
 
 export function parseODataError(body: unknown): string | undefined {
+  // BPMSoft отдаёт ошибку строкой JSON при text-ответах ($count) — пробуем распарсить.
+  if (typeof body === 'string') {
+    const trimmed = body.trim();
+    if (!trimmed.startsWith('{')) return undefined;
+    try {
+      return parseODataError(JSON.parse(trimmed));
+    } catch {
+      return undefined;
+    }
+  }
   if (body && typeof body === 'object' && 'error' in body) {
     const errorBody = body as ODataErrorResponse;
-    return errorBody.error?.message;
+    const message = errorBody.error?.message as unknown;
+    if (typeof message === 'string') return message;
+    // v3-форма: { message: { lang, value } }
+    if (message && typeof message === 'object' && typeof (message as { value?: unknown }).value === 'string') {
+      return (message as { value: string }).value;
+    }
   }
   return undefined;
 }

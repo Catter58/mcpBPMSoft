@@ -31,22 +31,27 @@ interface CollectionFetcher {
 }
 
 /**
+ * Поддержка tolower() — свойство инстанса, а не вызова: сервер пришпилен к одному
+ * BPMSOFT_URL, поэтому запоминаем отказ на весь процесс и не тратим лишний 4xx
+ * round-trip на каждый поиск.
+ */
+const tolowerState = { tolowerUnsupported: false };
+
+/**
  * contains по значению с tolower(); при 4xx повторяет case-sensitive.
- * Возвращает найденные записи (фолбэк-состояние живёт у вызывающего).
  */
 async function fetchContains(
   fetcher: CollectionFetcher,
   value: string,
-  version: ODataVersion,
-  state: { tolowerUnsupported: boolean }
+  version: ODataVersion
 ): Promise<Array<Record<string, unknown>>> {
-  if (!state.tolowerUnsupported) {
+  if (!tolowerState.tolowerUnsupported) {
     try {
       return await fetcher(containsExpression('Name', value, version, { caseInsensitive: true }));
     } catch (error) {
       const status = (error as { httpStatus?: number }).httpStatus;
       if (status === undefined || status < 400 || status >= 500) throw error;
-      state.tolowerUnsupported = true;
+      tolowerState.tolowerUnsupported = true;
       console.error('[bpm_search_unified] tolower() отклонён сервером, перехожу на case-sensitive contains');
     }
   }
@@ -104,7 +109,6 @@ export function registerSearchUnifiedTool(server: McpServer, services: ServiceCo
         const top = params.top ?? 5;
         const query = normalizeName(params.query);
         const version = services.config.odata_version;
-        const tolowerState = { tolowerUnsupported: false };
 
         const existingSets = await services.metadataManager.getEntitySets();
         const existingNames = new Set(existingSets.map((s) => s.name));
@@ -129,10 +133,10 @@ export function registerSearchUnifiedTool(server: McpServer, services: ServiceCo
             };
 
             let matchType: 'contains' | 'core' = 'contains';
-            let records = await fetchContains(fetcher, query.normalized, version, tolowerState);
+            let records = await fetchContains(fetcher, query.normalized, version);
             if (records.length === 0 && query.core !== query.normalized) {
               matchType = 'core';
-              records = await fetchContains(fetcher, query.core, version, tolowerState);
+              records = await fetchContains(fetcher, query.core, version);
             }
 
             const hits = records.map((rec) => ({

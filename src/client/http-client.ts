@@ -28,6 +28,14 @@ const MAX_REDIRECTS = 5;
 const RETRY_BASE_DELAY_MS = 1000;
 const MAX_RETRY_AFTER_SECONDS = 60; // hard cap to avoid pathological waits
 
+/**
+ * Methods that must never be replayed after a 5xx.
+ * BPMSoft can persist the record and still answer 500 (insert succeeds, response
+ * serialization/business process throws), so retrying a POST creates duplicates.
+ * 429/503 are answered before processing, so they stay retryable for any method.
+ */
+const NON_REPLAYABLE_METHODS = new Set(['POST']);
+
 /** Auth resolved for a single request: a BPMCSRF token and the cookies to send. */
 type ResolvedAuth = { csrfToken: string | null; cookies: Map<string, string> };
 
@@ -195,23 +203,31 @@ export class HttpClient {
         return this.requestWithRetry<T>(options, attempt + 1);
       }
 
-      // 5xx (other than 503): exponential backoff
-      if (response.status >= 500 && response.status !== 503 && attempt < MAX_RETRIES) {
-        const delayMs = RETRY_BASE_DELAY_MS * Math.pow(2, attempt);
+      // 5xx (other than 503): exponential backoff, except for non-replayable methods
+      if (response.status >= 500 && response.status !== 503) {
+        const body = truncate(safeStringify(data), 500);
+        const nonReplayable = NON_REPLAYABLE_METHODS.has(options.method);
+        if (attempt < MAX_RETRIES && !nonReplayable) {
+          const delayMs = RETRY_BASE_DELAY_MS * Math.pow(2, attempt);
+          console.error(
+            `[HttpClient] 5xx (${response.status}) on ${options.method} ${shortUrl(options.url)}: ${body}, retrying in ${delayMs}ms (attempt ${attempt + 1}/${MAX_RETRIES})`
+          );
+          await sleep(delayMs);
+          return this.requestWithRetry<T>(options, attempt + 1);
+        }
         console.error(
-          `[HttpClient] 5xx (${response.status}) on ${options.method} ${shortUrl(options.url)}, retrying in ${delayMs}ms (attempt ${attempt + 1}/${MAX_RETRIES})`
+          `[HttpClient] 5xx (${response.status}) on ${options.method} ${shortUrl(options.url)}: ${body} — не повторяю (${nonReplayable ? 'неидемпотентный метод, запись могла пройти' : 'исчерпаны попытки'})`
         );
-        await sleep(delayMs);
-        return this.requestWithRetry<T>(options, attempt + 1);
       }
 
       if (!response.ok) {
         const odataError = parseODataError(data);
+        const bodySnippet = truncate(safeStringify(data), 1000);
         throw new BpmApiError(
           odataError || `HTTP ${response.status}: ${response.statusText}`,
           response.status,
           undefined,
-          odataError
+          odataError ?? (bodySnippet && bodySnippet !== '{}' ? `Тело ответа: ${bodySnippet}` : undefined)
         );
       }
 

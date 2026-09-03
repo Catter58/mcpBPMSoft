@@ -72,6 +72,7 @@ export class MetadataManager {
   private parsedMetadata: ParsedMetadata | null = null;
   private fullMetadataXml: string | null = null;
   private lastFetchTime = 0;
+  private inflightMetadata: Promise<void> | null = null;
   private odataVersion: ODataVersion;
   private captionCache = new Map<string, Map<string, string>>();
   private captionSupported: boolean | null = null;
@@ -243,12 +244,26 @@ export class MetadataManager {
     return { name: null, suggestions: suggest(query, sets) };
   }
 
+  /**
+   * Загружает $metadata не чаще TTL и ровно один раз на «пачку» параллельных
+   * вызовов: HTTP-транспорт поднимает McpServer на каждый запрос, поэтому без
+   * дедупликации in-flight десятки одновременных tool-вызовов тянут и парсят
+   * многомегабайтный EDMX каждый сам по себе.
+   */
   private async ensureMetadataLoaded(): Promise<void> {
     const ttlMs = this.config.lookup_cache_ttl * 1000;
     if (this.parsedMetadata && Date.now() - this.lastFetchTime < ttlMs) {
       return;
     }
+    if (this.inflightMetadata) return this.inflightMetadata;
 
+    this.inflightMetadata = this.fetchAndParseMetadata().finally(() => {
+      this.inflightMetadata = null;
+    });
+    return this.inflightMetadata;
+  }
+
+  private async fetchAndParseMetadata(): Promise<void> {
     console.error('[MetadataManager] Fetching $metadata...');
     this.fullMetadataXml = await this.odataClient.getMetadataXml();
     this.lastFetchTime = Date.now();

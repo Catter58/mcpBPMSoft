@@ -294,3 +294,70 @@ describe('HttpClient redirect SSRF guard', () => {
     expect(res.data).toEqual({ value: [{ Id: 'x' }] });
   });
 });
+
+describe('HttpClient 5xx replay safety', () => {
+  const auth = () => extractAuthFromHeaders({ BPMCSRF: 't', Cookie: 'CsrfToken=t' });
+
+  it('POST is NOT replayed on 500 (BPMSoft may have persisted the record)', async () => {
+    let count = 0;
+    server.use(
+      http.post(`${ORIGIN}/odata/Activity`, () => {
+        count += 1;
+        return HttpResponse.json({ error: { message: 'boom' } }, { status: 500 });
+      })
+    );
+
+    const client = new HttpClient(makeCfg());
+    client.setAllowedOrigin(ORIGIN);
+
+    await expect(
+      runWithAuth(auth(), () =>
+        client.request({ method: 'POST', url: `${ORIGIN}/odata/Activity`, body: { Title: 'x' } })
+      )
+    ).rejects.toMatchObject({ httpStatus: 500, message: 'boom' });
+
+    expect(count).toBe(1);
+  });
+
+  it('GET is still retried on 500 and the server message reaches the caller', async () => {
+    let count = 0;
+    server.use(
+      http.get(`${ORIGIN}/odata/Contact`, () => {
+        count += 1;
+        return HttpResponse.json({ error: { message: { lang: 'ru', value: 'сломалось' } } }, { status: 500 });
+      })
+    );
+
+    const client = new HttpClient(makeCfg());
+    client.setAllowedOrigin(ORIGIN);
+
+    await expect(
+      runWithAuth(auth(), () => client.request({ method: 'GET', url: `${ORIGIN}/odata/Contact` }))
+    ).rejects.toMatchObject({ httpStatus: 500, message: 'сломалось' });
+
+    expect(count).toBe(1 + 3); // initial + MAX_RETRIES
+  }, 20000);
+
+  it('non-OData 500 body is surfaced in details instead of being dropped', async () => {
+    server.use(
+      http.delete(`${ORIGIN}/odata/ActivityDelete`, () =>
+        HttpResponse.text('<html>Server Error in Application</html>', { status: 500 })
+      )
+    );
+
+    const client = new HttpClient(makeCfg());
+    client.setAllowedOrigin(ORIGIN);
+
+    await expect(
+      runWithAuth(auth(), () =>
+        client.request({
+          method: 'DELETE',
+          url: `${ORIGIN}/odata/ActivityDelete`,
+        })
+      )
+    ).rejects.toMatchObject({
+      httpStatus: 500,
+      details: expect.stringContaining('Server Error in Application'),
+    });
+  }, 20000);
+});
