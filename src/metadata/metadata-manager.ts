@@ -7,19 +7,20 @@
  * Uses fast-xml-parser instead of regex for robust EDMX parsing.
  */
 
+import { createHash } from 'node:crypto';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+
 import { XMLParser } from 'fast-xml-parser';
 
-import type {
-  BpmConfig,
-  EntityMetadata,
-  EntityProperty,
-  ODataVersion,
-} from '../types/index.js';
+import type { BpmConfig, EntityMetadata, EntityProperty, ODataVersion } from '../types/index.js';
 import type { ODataCollectionResponse } from '../types/index.js';
 import { ODataClient } from '../client/odata-client.js';
 import { HttpClient } from '../client/http-client.js';
 import { getODataBaseUrl } from '../config.js';
-import { isSafeIdentifier } from '../utils/odata.js';
+import { isSafeIdentifier, escapeODataString } from '../utils/odata.js';
+import { aliasCandidates } from '../utils/ru-aliases.js';
 
 // EDMX type model (subset we care about)
 interface EdmxProperty {
@@ -75,6 +76,8 @@ export class MetadataManager {
   private inflightMetadata: Promise<void> | null = null;
   private odataVersion: ODataVersion;
   private captionCache = new Map<string, Map<string, string>>();
+  /** Русская подпись объекта → имя EntitySet (null — не нашли). */
+  private captionByCollection = new Map<string, string | null>();
   private captionSupported: boolean | null = null;
 
   private readonly xmlParser: XMLParser;
@@ -221,9 +224,28 @@ export class MetadataManager {
       }
     }
 
+    // 6. Русская подпись из встроенного словаря — спасение для стендов, где
+    //    SysEntitySchemaColumn недоступен и caption'ов колонок нет вовсе.
+    for (const candidate of aliasCandidates(query)) {
+      const hit = metadata.properties.find((p) => p.name === candidate);
+      if (hit) return { name: hit.name };
+      // Для v4 подпись может указывать на базовое имя lookup'а («Город» → City → CityId).
+      if (this.odataVersion === 4 && !candidate.endsWith('Id')) {
+        const withId = metadata.properties.find((p) => p.name === `${candidate}Id`);
+        if (withId) return { name: withId.name };
+      }
+      if (this.odataVersion === 3 && candidate.endsWith('Id')) {
+        const withoutId = metadata.properties.find((p) => p.name === candidate.slice(0, -2));
+        if (withoutId) return { name: withoutId.name };
+      }
+    }
+
     // No match → produce suggestions from {name, caption} pairs
     const { suggestFields } = await import('../utils/suggest.js');
-    const suggestions = suggestFields(query, metadata.properties.map((p) => ({ name: p.name, caption: p.caption })));
+    const suggestions = suggestFields(
+      query,
+      metadata.properties.map((p) => ({ name: p.name, caption: p.caption }))
+    );
     return { name: null, suggestions };
   }
 
@@ -231,7 +253,9 @@ export class MetadataManager {
    * Resolve a (possibly-Russian) collection reference into the canonical EntitySet name.
    * Returns either { name } or { name: null, suggestions: string[] }.
    */
-  async resolveCollectionReference(query: string): Promise<{ name: string } | { name: null; suggestions: string[] }> {
+  async resolveCollectionReference(
+    query: string
+  ): Promise<{ name: string } | { name: null; suggestions: string[] }> {
     await this.ensureMetadataLoaded();
     const sets = Array.from(this.parsedMetadata!.entitySets.keys());
 
@@ -240,8 +264,38 @@ export class MetadataManager {
     const ci = sets.find((s) => s.toLowerCase() === lower);
     if (ci) return { name: ci };
 
+    // Русское имя объекта («Контакт») — единственный доступный источник подписей
+    // сущностей это SysSchema; колонок он не покрывает, но объекты — да.
+    const bySchemaCaption = await this.resolveCollectionByCaption(query);
+    if (bySchemaCaption && sets.includes(bySchemaCaption)) return { name: bySchemaCaption };
+
     const { suggest } = await import('../utils/suggest.js');
     return { name: null, suggestions: suggest(query, sets) };
+  }
+
+  /**
+   * Имя EntitySet по русской подписи объекта через SysSchema.Caption.
+   * Недоступность SysSchema не считается ошибкой — просто нет подсказки.
+   */
+  private async resolveCollectionByCaption(caption: string): Promise<string | null> {
+    if (this.captionByCollection.has(caption)) return this.captionByCollection.get(caption) ?? null;
+    if (!this.httpClient) return null;
+
+    const escaped = escapeODataString(caption);
+    const url = `${getODataBaseUrl(this.config)}/SysSchema?$filter=Caption eq '${escaped}'&$select=Name&$top=5`;
+    try {
+      const response = await this.httpClient.request<ODataCollectionResponse<{ Name: string }>>({
+        method: 'GET',
+        url,
+        contentKind: 'crud',
+      });
+      const name = response.data?.value?.find((row) => typeof row.Name === 'string')?.Name ?? null;
+      this.captionByCollection.set(caption, name);
+      return name;
+    } catch {
+      this.captionByCollection.set(caption, null);
+      return null;
+    }
   }
 
   /**
@@ -264,13 +318,78 @@ export class MetadataManager {
   }
 
   private async fetchAndParseMetadata(): Promise<void> {
-    console.error('[MetadataManager] Fetching $metadata...');
-    this.fullMetadataXml = await this.odataClient.getMetadataXml();
+    const cached = this.readDiskCache();
+    const result = await this.odataClient.getMetadataXml({ etag: cached?.etag });
+
+    let xml: string;
+    if (result.notModified && cached) {
+      console.error('[MetadataManager] $metadata не изменился (304), беру дисковый кэш');
+      xml = cached.xml;
+    } else {
+      xml = result.xml;
+      this.writeDiskCache(xml, result.etag);
+      console.error(`[MetadataManager] Загружен $metadata: ${Math.round(xml.length / 1024)} КБ`);
+    }
+
+    this.fullMetadataXml = xml;
     this.lastFetchTime = Date.now();
-    this.parsedMetadata = this.parseMetadataXml(this.fullMetadataXml);
+    this.parsedMetadata = this.parseMetadataXml(xml);
+    this.cache.clear();
     console.error(
       `[MetadataManager] Parsed ${this.parsedMetadata.entitySets.size} entity sets, ${this.parsedMetadata.entityTypes.size} entity types`
     );
+  }
+
+  /**
+   * Дисковый кэш $metadata. Документ на типовом стенде — 2.5 МБ и несколько
+   * секунд загрузки, а меняется он только при доставке пакетов, поэтому храним
+   * его между перезапусками процесса и проверяем актуальность через ETag.
+   * Отключается `BPMSOFT_METADATA_CACHE=off`, каталог — `BPMSOFT_METADATA_CACHE_DIR`.
+   */
+  private cacheFileBase(): string | null {
+    if ((process.env.BPMSOFT_METADATA_CACHE || '').toLowerCase() === 'off') return null;
+    const dir = process.env.BPMSOFT_METADATA_CACHE_DIR || join(tmpdir(), 'mcp-bpmsoft-metadata');
+    const key = createHash('sha1')
+      .update(`${this.config.bpmsoft_url}|${this.config.odata_version}|${this.config.platform}`)
+      .digest('hex')
+      .slice(0, 16);
+    try {
+      mkdirSync(dir, { recursive: true });
+    } catch {
+      return null;
+    }
+    return join(dir, key);
+  }
+
+  private readDiskCache(): { xml: string; etag?: string } | null {
+    const base = this.cacheFileBase();
+    if (!base) return null;
+    try {
+      const xml = readFileSync(`${base}.xml`, 'utf8');
+      if (!xml) return null;
+      let etag: string | undefined;
+      try {
+        etag = readFileSync(`${base}.etag`, 'utf8').trim() || undefined;
+      } catch {
+        etag = undefined;
+      }
+      return { xml, etag };
+    } catch {
+      return null;
+    }
+  }
+
+  private writeDiskCache(xml: string, etag?: string): void {
+    const base = this.cacheFileBase();
+    if (!base || !xml) return;
+    try {
+      writeFileSync(`${base}.xml`, xml, 'utf8');
+      if (etag) writeFileSync(`${base}.etag`, etag, 'utf8');
+    } catch (error) {
+      console.error(
+        `[MetadataManager] Не удалось сохранить кэш $metadata: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
   }
 
   /** Parse EDMX into normalized maps. Pure function over the XML string. */
@@ -330,7 +449,14 @@ export class MetadataManager {
           }
         }
 
-        properties.push({ name, type, nullable, isLookup, lookupCollection });
+        properties.push({
+          name,
+          type,
+          nullable,
+          isLookup,
+          lookupCollection,
+          lookupNavProperty: isLookup ? lookupCollection : undefined,
+        });
         if (isLookup) lookupFields.push(name);
       }
 
@@ -339,13 +465,19 @@ export class MetadataManager {
         const navName = np['@_Name'];
         const navType = np['@_Type'];
         if (!navName || !navType) continue;
-        const targetCollection = navType.replace(/^Collection\(/, '').replace(/\)$/, '').split('.').pop() || navName;
+        const targetCollection =
+          navType
+            .replace(/^Collection\(/, '')
+            .replace(/\)$/, '')
+            .split('.')
+            .pop() || navName;
         const fkFieldName = this.odataVersion === 4 ? `${navName}Id` : navName;
         const existing = properties.find((p) => p.name === fkFieldName);
         if (existing) {
           existing.isLookup = true;
           existing.lookupCollection = targetCollection;
           existing.lookupDisplayColumn = 'Name';
+          existing.lookupNavProperty = navName;
           if (!lookupFields.includes(fkFieldName)) lookupFields.push(fkFieldName);
         }
       }
@@ -401,7 +533,9 @@ export class MetadataManager {
 
       const schemaUId = schemas[0].UId;
       const columnsUrl = `${baseUrl}/SysEntitySchemaColumn?$filter=SysEntitySchemaUId eq ${this.formatGuid(schemaUId)}&$select=Name,Caption&$top=500`;
-      const columnsResponse = await this.httpClient.request<ODataCollectionResponse<{ Name: string; Caption: string }>>({
+      const columnsResponse = await this.httpClient.request<
+        ODataCollectionResponse<{ Name: string; Caption: string }>
+      >({
         method: 'GET',
         url: columnsUrl,
         contentKind: 'crud',
@@ -420,7 +554,9 @@ export class MetadataManager {
       return captionMap;
     } catch {
       if (this.captionSupported === null) {
-        console.error('[MetadataManager] SysSchema/SysEntitySchemaColumn unavailable, trying VwSysEntitySchemaColumn...');
+        console.error(
+          '[MetadataManager] SysSchema/SysEntitySchemaColumn unavailable, trying VwSysEntitySchemaColumn...'
+        );
         return this.fetchCaptionsAlternative(entityName);
       }
       return null;
@@ -434,7 +570,9 @@ export class MetadataManager {
 
     try {
       const url = `${baseUrl}/VwSysEntitySchemaColumn?$filter=EntitySchemaName eq '${entityName}'&$select=Name,Caption&$top=500`;
-      const response = await this.httpClient.request<ODataCollectionResponse<{ Name: string; Caption: string }>>({
+      const response = await this.httpClient.request<
+        ODataCollectionResponse<{ Name: string; Caption: string }>
+      >({
         method: 'GET',
         url,
         contentKind: 'crud',
@@ -474,8 +612,16 @@ export class MetadataManager {
   async findFieldByCaption(
     searchText: string,
     collection?: string
-  ): Promise<Array<{ collection: string; fieldName: string; caption: string; type: string; isLookup: boolean }>> {
-    const results: Array<{ collection: string; fieldName: string; caption: string; type: string; isLookup: boolean }> = [];
+  ): Promise<
+    Array<{ collection: string; fieldName: string; caption: string; type: string; isLookup: boolean }>
+  > {
+    const results: Array<{
+      collection: string;
+      fieldName: string;
+      caption: string;
+      type: string;
+      isLookup: boolean;
+    }> = [];
     const lowerSearch = searchText.toLowerCase();
 
     const collectFromMetadata = (metadata: EntityMetadata) => {

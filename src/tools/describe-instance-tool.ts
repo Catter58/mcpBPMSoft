@@ -106,9 +106,7 @@ export function registerDescribeInstanceTool(server: McpServer, services: Servic
           presentMainEntities.map(async (name) => buildMainEntitySummary(services, name))
         );
 
-        const customCollections = entitySets
-          .map((s) => s.name)
-          .filter((n) => n.startsWith('Usr'));
+        const customCollections = entitySets.map((s) => s.name).filter((n) => n.startsWith('Usr'));
 
         const summary: InstanceSummary = {
           collections_total: entitySets.length,
@@ -131,10 +129,7 @@ export function registerDescribeInstanceTool(server: McpServer, services: Servic
   );
 }
 
-async function buildMainEntitySummary(
-  services: ServiceContainer,
-  name: string
-): Promise<MainEntitySummary> {
+async function buildMainEntitySummary(services: ServiceContainer, name: string): Promise<MainEntitySummary> {
   let metadata: EntityMetadata | null = null;
   try {
     metadata = await services.metadataManager.getEntityMetadata(name);
@@ -196,7 +191,9 @@ function buildResult(summary: InstanceSummary, fromCache: boolean): CallToolResu
     for (const e of summary.main_entities) {
       const recPart = e.record_count === null ? 'count: n/a' : `${e.record_count} записей`;
       const customPart = e.custom_fields_count > 0 ? `, кастомных полей: ${e.custom_fields_count}` : '';
-      lines.push(`  - ${e.name}: ${recPart}, полей: ${e.total_fields} (lookup: ${e.lookup_fields})${customPart}`);
+      lines.push(
+        `  - ${e.name}: ${recPart}, полей: ${e.total_fields} (lookup: ${e.lookup_fields})${customPart}`
+      );
       if (e.custom_fields_sample.length > 0) {
         lines.push(`      Usr*: ${e.custom_fields_sample.join(', ')}`);
       }

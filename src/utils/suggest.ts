@@ -28,9 +28,9 @@ export function levenshtein(a: string, b: string): number {
     for (let j = 1; j <= b.length; j++) {
       const cost = a.charCodeAt(i - 1) === b.charCodeAt(j - 1) ? 0 : 1;
       curr[j] = Math.min(
-        prev[j] + 1,        // deletion
-        curr[j - 1] + 1,    // insertion
-        prev[j - 1] + cost  // substitution
+        prev[j] + 1, // deletion
+        curr[j - 1] + 1, // insertion
+        prev[j - 1] + cost // substitution
       );
     }
     for (let j = 0; j <= b.length; j++) prev[j] = curr[j];
@@ -59,11 +59,7 @@ export interface SuggestOptions {
  * Returns candidates sorted by distance ascending; filters out matches
  * with normalized distance > maxNormalizedDistance.
  */
-export function suggest(
-  query: string,
-  candidates: string[],
-  options: SuggestOptions = {}
-): string[] {
+export function suggest(query: string, candidates: string[], options: SuggestOptions = {}): string[] {
   const max = options.maxResults ?? 5;
   const threshold = options.maxNormalizedDistance ?? 0.5;
   if (!query || candidates.length === 0) return [];

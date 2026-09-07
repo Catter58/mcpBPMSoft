@@ -1,5 +1,11 @@
 import { describe, it, expect, afterEach } from 'vitest';
-import { buildConfig, getODataBaseUrl, getAuthUrl, tryLoadConfigFromEnv, isEnvCredsAllowed } from '../../src/config.js';
+import {
+  buildConfig,
+  getODataBaseUrl,
+  getAuthUrl,
+  tryLoadConfigFromEnv,
+  isEnvCredsAllowed,
+} from '../../src/config.js';
 import type { BpmConfig } from '../../src/types/index.js';
 
 describe('buildConfig', () => {
@@ -23,9 +29,7 @@ describe('buildConfig', () => {
   });
 
   it('throws when v3 combined with net8', () => {
-    expect(() =>
-      buildConfig('https://bpm.test', 'u', 'p', { odata_version: 3, platform: 'net8' })
-    ).toThrow();
+    expect(() => buildConfig('https://bpm.test', 'u', 'p', { odata_version: 3, platform: 'net8' })).toThrow();
   });
 
   it('accepts v3 + netframework', () => {
@@ -60,23 +64,19 @@ describe('getODataBaseUrl', () => {
   });
 
   it('netframework + v4 -> {url}/0/odata', () => {
-    expect(getODataBaseUrl(makeCfg({ platform: 'netframework' }))).toBe(
-      'https://bpm.test/0/odata'
-    );
+    expect(getODataBaseUrl(makeCfg({ platform: 'netframework' }))).toBe('https://bpm.test/0/odata');
   });
 
   it('netframework + v3 -> {url}/0/ServiceModel/EntityDataService.svc', () => {
-    expect(
-      getODataBaseUrl(makeCfg({ odata_version: 3, platform: 'netframework' }))
-    ).toBe('https://bpm.test/0/ServiceModel/EntityDataService.svc');
+    expect(getODataBaseUrl(makeCfg({ odata_version: 3, platform: 'netframework' }))).toBe(
+      'https://bpm.test/0/ServiceModel/EntityDataService.svc'
+    );
   });
 });
 
 describe('getAuthUrl', () => {
   it('always points to /ServiceModel/AuthService.svc/Login on net8', () => {
-    expect(getAuthUrl(makeCfg())).toBe(
-      'https://bpm.test/ServiceModel/AuthService.svc/Login'
-    );
+    expect(getAuthUrl(makeCfg())).toBe('https://bpm.test/ServiceModel/AuthService.svc/Login');
   });
 
   it('uses the same path on netframework (per official Postman)', () => {
@@ -86,9 +86,9 @@ describe('getAuthUrl', () => {
   });
 
   it('uses the same path on v3', () => {
-    expect(
-      getAuthUrl(makeCfg({ odata_version: 3, platform: 'netframework' }))
-    ).toBe('https://bpm.test/ServiceModel/AuthService.svc/Login');
+    expect(getAuthUrl(makeCfg({ odata_version: 3, platform: 'netframework' }))).toBe(
+      'https://bpm.test/ServiceModel/AuthService.svc/Login'
+    );
   });
 });
 

@@ -42,12 +42,7 @@ function makeStubODataClient(
 describe('LookupResolver.resolve', () => {
   it('returns resolved=true with a single match', async () => {
     const od = makeStubODataClient(() => [{ Id: 'guid-1', Name: 'Moscow' }]);
-    const resolver = new LookupResolver(
-      makeCfg(),
-      od as never,
-      {} as never,
-      { maxCacheSize: 10 }
-    );
+    const resolver = new LookupResolver(makeCfg(), od as never, {} as never, { maxCacheSize: 10 });
 
     const r = await resolver.resolve('City', 'Moscow');
     expect(r.resolved).toBe(true);
@@ -95,12 +90,7 @@ describe('LookupResolver LRU cache', () => {
   it('evicts oldest entry when maxCacheSize=2 and a 3rd unique key is written', async () => {
     let call = 0;
     const od = makeStubODataClient(() => [{ Id: `guid-${++call}`, Name: 'X' }]);
-    const resolver = new LookupResolver(
-      makeCfg(),
-      od as never,
-      {} as never,
-      { maxCacheSize: 2 }
-    );
+    const resolver = new LookupResolver(makeCfg(), od as never, {} as never, { maxCacheSize: 2 });
 
     await resolver.resolve('City', 'A');
     await resolver.resolve('City', 'B');

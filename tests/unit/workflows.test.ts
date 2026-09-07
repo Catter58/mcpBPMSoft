@@ -38,7 +38,13 @@ function buildContactMeta(): EntityMetadata {
       lookupDisplayColumn: 'Name',
     },
   ];
-  return { name: 'Contact', collectionName: 'Contact', properties, lookupFields: ['AccountId'], cachedAt: Date.now() };
+  return {
+    name: 'Contact',
+    collectionName: 'Contact',
+    properties,
+    lookupFields: ['AccountId'],
+    cachedAt: Date.now(),
+  };
 }
 
 function buildAccountMeta(): EntityMetadata {
@@ -101,7 +107,13 @@ function buildOpportunityMeta(): EntityMetadata {
       lookupDisplayColumn: 'Name',
     },
   ];
-  return { name: 'Opportunity', collectionName: 'Opportunity', properties, lookupFields: ['StageId'], cachedAt: Date.now() };
+  return {
+    name: 'Opportunity',
+    collectionName: 'Opportunity',
+    properties,
+    lookupFields: ['StageId'],
+    cachedAt: Date.now(),
+  };
 }
 
 interface StubState {
@@ -186,7 +198,13 @@ function buildStubServices(state: StubState): ServiceContainer {
       const key = `${lookupCollection}:${column}:${value}`;
       const hit = state.resolveResponses[key];
       if (hit) {
-        return { resolved: true, id: hit.id, searchValue: value, matchCount: 1, candidates: [{ id: hit.id, displayValue: value }] };
+        return {
+          resolved: true,
+          id: hit.id,
+          searchValue: value,
+          matchCount: 1,
+          candidates: [{ id: hit.id, displayValue: value }],
+        };
       }
       return { resolved: false, searchValue: value, matchCount: 0, candidates: [] };
     },
@@ -311,9 +329,7 @@ describe('register-contact workflow logic', () => {
     );
 
     const contactMeta = await services.metadataManager.getEntityMetadata('Contact');
-    const accountLookup = contactMeta.properties.find(
-      (p) => p.isLookup && p.lookupCollection === 'Account'
-    );
+    const accountLookup = contactMeta.properties.find((p) => p.isLookup && p.lookupCollection === 'Account');
     expect(accountLookup?.name).toBe('AccountId');
 
     const data: Record<string, unknown> = { Name: 'Иванов И.И.' };

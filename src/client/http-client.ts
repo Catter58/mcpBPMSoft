@@ -14,12 +14,7 @@
  * - Optional debug logging via BPMSOFT_DEBUG=1|trace with secret masking
  */
 
-import type {
-  BpmConfig,
-  HttpRequestOptions,
-  HttpResponse,
-  AuthState,
-} from '../types/index.js';
+import type { BpmConfig, HttpRequestOptions, HttpResponse, AuthState } from '../types/index.js';
 import { BpmApiError, parseODataError, AuthRequiredError } from '../utils/errors.js';
 import { getRequestAuth, hasRequestAuth } from '../auth/request-context.js';
 
@@ -119,10 +114,7 @@ export class HttpClient {
     return this.requestWithRetry<T>(options, 0);
   }
 
-  private async requestWithRetry<T>(
-    options: HttpRequestOptions,
-    attempt: number
-  ): Promise<HttpResponse<T>> {
+  private async requestWithRetry<T>(options: HttpRequestOptions, attempt: number): Promise<HttpResponse<T>> {
     const resolved = this.resolveAuth(options.skipAuth);
     const headers = this.buildHeaders(options, resolved);
     const cookieStr = this.buildCookieString(resolved);
@@ -195,7 +187,8 @@ export class HttpClient {
 
       // 429 / 503 with Retry-After
       if ((response.status === 429 || response.status === 503) && attempt < MAX_RETRIES) {
-        const delayMs = this.parseRetryAfter(responseHeaders['retry-after']) ?? RETRY_BASE_DELAY_MS * Math.pow(2, attempt);
+        const delayMs =
+          this.parseRetryAfter(responseHeaders['retry-after']) ?? RETRY_BASE_DELAY_MS * Math.pow(2, attempt);
         console.error(
           `[HttpClient] ${response.status} on ${options.method} ${shortUrl(options.url)}, retrying in ${delayMs}ms (attempt ${attempt + 1}/${MAX_RETRIES})`
         );
@@ -220,7 +213,8 @@ export class HttpClient {
         );
       }
 
-      if (!response.ok) {
+      // 304 — штатный ответ на условный GET (If-None-Match), а не сбой.
+      if (!response.ok && response.status !== 304) {
         const odataError = parseODataError(data);
         const bodySnippet = truncate(safeStringify(data), 1000);
         throw new BpmApiError(
@@ -237,10 +231,7 @@ export class HttpClient {
       if (error instanceof Error && error.name === 'AbortError') {
         throw new BpmApiError(`Превышен таймаут запроса (${timeout}ms)`, 408);
       }
-      throw new BpmApiError(
-        `Сетевая ошибка: ${error instanceof Error ? error.message : String(error)}`,
-        0
-      );
+      throw new BpmApiError(`Сетевая ошибка: ${error instanceof Error ? error.message : String(error)}`, 0);
     } finally {
       clearTimeout(timeoutId);
     }
@@ -256,10 +247,7 @@ export class HttpClient {
    *   batch:   application/json; odata=verbose; IEEE754Compatible=true
    *   binary:  application/octet-stream; IEEE754Compatible=true
    */
-  private buildHeaders(
-    options: HttpRequestOptions,
-    resolved: ResolvedAuth | null
-  ): Record<string, string> {
+  private buildHeaders(options: HttpRequestOptions, resolved: ResolvedAuth | null): Record<string, string> {
     const v3 = this.config.odata_version === 3;
     const kind = options.contentKind ?? 'crud';
 
@@ -377,7 +365,11 @@ export class HttpClient {
       const text = await response.text();
       return (text ? JSON.parse(text) : {}) as T;
     }
-    if (contentType.includes('application/octet-stream') || contentType.includes('image/') || contentType.includes('application/pdf')) {
+    if (
+      contentType.includes('application/octet-stream') ||
+      contentType.includes('image/') ||
+      contentType.includes('application/pdf')
+    ) {
       const buf = await response.arrayBuffer();
       return Buffer.from(buf) as unknown as T;
     }
@@ -423,7 +415,9 @@ export class HttpClient {
     const setCookies =
       typeof (response.headers as unknown as { getSetCookie?: () => string[] }).getSetCookie === 'function'
         ? (response.headers as unknown as { getSetCookie: () => string[] }).getSetCookie()
-        : (response.headers.get('set-cookie') ? [response.headers.get('set-cookie') as string] : []);
+        : response.headers.get('set-cookie')
+          ? [response.headers.get('set-cookie') as string]
+          : [];
 
     for (const cookie of setCookies) {
       const [nameValue] = cookie.split(';');
@@ -439,9 +433,7 @@ export class HttpClient {
     }
   }
 
-  private buildCookieString(
-    resolved: ResolvedAuth | null
-  ): string {
+  private buildCookieString(resolved: ResolvedAuth | null): string {
     const cookies = resolved?.cookies ?? this.authState.cookies;
     const parts: string[] = [];
     for (const [name, value] of cookies) {

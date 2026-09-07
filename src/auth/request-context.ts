@@ -87,11 +87,7 @@ export function hasRequestAuth(auth: RequestAuth | undefined): auth is RequestAu
 export function getAuthCacheScope(): string {
   const auth = getRequestAuth();
   if (!auth) return '';
-  const token =
-    auth.cookies.get('BPMSESSIONID') ||
-    auth.cookies.get('.ASPXAUTH') ||
-    auth.csrfToken ||
-    '';
+  const token = auth.cookies.get('BPMSESSIONID') || auth.cookies.get('.ASPXAUTH') || auth.csrfToken || '';
   if (!token) return '';
   return createHash('sha256').update(token).digest('hex').slice(0, 16);
 }

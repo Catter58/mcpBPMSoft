@@ -8,9 +8,10 @@
 import type { BpmConfig, LookupResult, LookupCandidate } from '../types/index.js';
 import { ODataClient } from '../client/odata-client.js';
 import { MetadataManager } from '../metadata/metadata-manager.js';
-import { LookupResolutionError } from '../utils/errors.js';
+import { LookupResolutionError, UnknownFieldError, isQueryUnsupportedError } from '../utils/errors.js';
 import { assertSafeIdentifier, escapeODataString, containsExpression } from '../utils/odata.js';
 import { normalizeName, scoreCandidate, pickConfidentIndex } from '../utils/name-normalize.js';
+import { isTolowerSupported, markTolowerUnsupported } from '../utils/server-capabilities.js';
 import { getAuthCacheScope } from '../auth/request-context.js';
 
 interface CacheEntry {
@@ -38,9 +39,6 @@ export class LookupResolver {
   /** LRU is implemented via Map insertion order: re-set on hit, delete oldest on overflow. */
   private cache = new Map<string, CacheEntry>();
   private readonly maxCacheSize: number;
-  /** BPMSoft-инстанс отклонил tolower() в $filter — до конца жизни процесса работаем case-sensitive. */
-  private tolowerUnsupported = false;
-
   constructor(
     private config: BpmConfig,
     private odataClient: ODataClient,
@@ -144,7 +142,7 @@ export class LookupResolver {
 
   /**
    * Substring-этап каскада: contains/substringof по нормализованному значению.
-   * Первый 4xx на tolower() переключает резолвер в case-sensitive режим навсегда.
+   * Первый отказ на tolower() переводит весь процесс в case-sensitive режим.
    */
   private async queryContains(
     lookupCollection: string,
@@ -152,15 +150,13 @@ export class LookupResolver {
     loweredValue: string
   ): Promise<LookupCandidate[]> {
     const version = this.config.odata_version;
-    if (!this.tolowerUnsupported) {
+    if (isTolowerSupported()) {
       try {
         const filter = containsExpression(displayColumn, loweredValue, version, { caseInsensitive: true });
         return await this.queryCandidates(lookupCollection, displayColumn, filter, 50);
       } catch (error) {
-        const status = (error as { httpStatus?: number }).httpStatus;
-        if (status === undefined || status < 400 || status >= 500) throw error;
-        this.tolowerUnsupported = true;
-        console.error('[lookup-resolver] tolower() отклонён сервером, перехожу на case-sensitive contains');
+        if (!isQueryUnsupportedError(error)) throw error;
+        markTolowerUnsupported();
       }
     }
     const filter = containsExpression(displayColumn, loweredValue, version);
@@ -177,59 +173,77 @@ export class LookupResolver {
    * Detects lookup fields and resolves human-readable values to UUIDs.
    */
   async resolveDataLookups(collection: string, data: Record<string, unknown>): Promise<ResolvedData> {
-    const resolved: Record<string, unknown> = {};
-    const notes: ResolvedLookupNote[] = [];
-    // Force metadata load early so a wrong collection fails fast
+    // Схему тянем заранее: неверная коллекция должна падать сразу, а не на
+    // первом же поле, и дальше все резолвы полей идут по прогретому кэшу.
     await this.metadataManager.getEntityMetadata(collection);
 
-    for (const [rawKey, value] of Object.entries(data)) {
-      // Resolve key first — translate caption → name when possible
-      const fieldRef = await this.metadataManager.resolveFieldReference(collection, rawKey);
-      const normalizedKey = fieldRef.name ?? rawKey;
+    // Поля независимы друг от друга, поэтому резолвим их параллельно. На
+    // bpm_batch_create из сотни записей последовательный обход давал сотни
+    // запросов друг за другом; кэш спасал только со второй записи.
+    const entries = await Promise.all(
+      Object.entries(data).map(async ([rawKey, value]) => {
+        const fieldRef = await this.metadataManager.resolveFieldReference(collection, rawKey);
 
-      if (typeof value !== 'string') {
-        resolved[normalizedKey] = value;
-        continue;
-      }
-      if (this.isUuid(value)) {
-        resolved[normalizedKey] = value;
-        continue;
-      }
-
-      const lookupInfo = await this.metadataManager.getLookupInfo(collection, normalizedKey);
-
-      if (!lookupInfo) {
-        resolved[normalizedKey] = value;
-        continue;
-      }
-
-      const lookupResult = await this.resolve(lookupInfo.lookupCollection, value, lookupInfo.displayColumn, {
-        fuzzy: true,
-      });
-
-      if (lookupResult.resolved && lookupResult.id) {
-        resolved[normalizedKey] = lookupResult.id;
-        if (lookupResult.fuzzy && lookupResult.matchedValue && lookupResult.matchType !== 'exact') {
-          notes.push({
-            field: normalizedKey,
-            input: value,
-            matchedValue: lookupResult.matchedValue,
-            matchType: lookupResult.matchType ?? 'contains',
-          });
+        // Неизвестный ключ раньше молча уходил в BPMSoft и возвращался сырым
+        // 400. Сервер знает схему — пусть скажет сам, с подсказками.
+        if (fieldRef.name === null) {
+          throw new UnknownFieldError(rawKey, collection, fieldRef.suggestions);
         }
-      } else {
+        const normalizedKey = fieldRef.name;
+
+        if (typeof value !== 'string' || this.isUuid(value)) {
+          return { key: normalizedKey, value, note: null };
+        }
+
+        const lookupInfo = await this.metadataManager.getLookupInfo(collection, normalizedKey);
+        if (!lookupInfo) {
+          return { key: normalizedKey, value, note: null };
+        }
+
+        // Пустая строка в lookup-поле — это «очистить связь», а не значение для поиска.
+        if (value.trim() === '') {
+          return { key: normalizedKey, value: null, note: null };
+        }
+
+        const lookupResult = await this.resolve(
+          lookupInfo.lookupCollection,
+          value,
+          lookupInfo.displayColumn,
+          { fuzzy: true }
+        );
+
+        if (lookupResult.resolved && lookupResult.id) {
+          const note =
+            lookupResult.fuzzy && lookupResult.matchedValue && lookupResult.matchType !== 'exact'
+              ? {
+                  field: normalizedKey,
+                  input: value,
+                  matchedValue: lookupResult.matchedValue,
+                  matchType: lookupResult.matchType ?? ('contains' as const),
+                }
+              : null;
+          return { key: normalizedKey, value: lookupResult.id, note };
+        }
+
         // Значение не разрешилось — обогащаем ошибку допустимыми значениями
         // справочника, чтобы LLM-агент мог сразу выбрать корректное.
-        let validValues: string[] | undefined;
-        if (lookupResult.matchCount === 0) {
-          validValues = await this.sampleValues(lookupInfo.lookupCollection, lookupInfo.displayColumn);
-        }
+        const validValues =
+          lookupResult.matchCount === 0
+            ? await this.sampleValues(lookupInfo.lookupCollection, lookupInfo.displayColumn)
+            : undefined;
         throw new LookupResolutionError(rawKey, value, lookupResult.matchCount, lookupResult.candidates, {
           lookupCollection: lookupInfo.lookupCollection,
           displayColumn: lookupInfo.displayColumn,
           validValues,
         });
-      }
+      })
+    );
+
+    const resolved: Record<string, unknown> = {};
+    const notes: ResolvedLookupNote[] = [];
+    for (const entry of entries) {
+      resolved[entry.key] = entry.value;
+      if (entry.note) notes.push(entry.note as ResolvedLookupNote);
     }
 
     return { data: resolved, notes };

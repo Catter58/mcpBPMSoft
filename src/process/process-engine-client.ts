@@ -67,10 +67,7 @@ export class ProcessEngineClient {
       }
     }
 
-    if (
-      options?.resultParameterName !== undefined &&
-      !isSafeIdentifier(options.resultParameterName)
-    ) {
+    if (options?.resultParameterName !== undefined && !isSafeIdentifier(options.resultParameterName)) {
       throw new BpmApiError(
         `Недопустимое имя выходного параметра: "${options.resultParameterName}". Разрешены только латинские буквы, цифры и подчёркивания.`,
         0

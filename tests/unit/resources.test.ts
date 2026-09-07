@@ -57,7 +57,10 @@ function buildContactMeta(): EntityMetadata {
   };
 }
 
-function findRegistration(server: MockServer, name: string): {
+function findRegistration(
+  server: MockServer,
+  name: string
+): {
   callback: StaticReadCallback | TemplateReadCallback;
   uriOrTemplate: string | ResourceTemplate;
 } {
@@ -119,9 +122,7 @@ describe('registerResources', () => {
     registerResources(server as any, services);
     const reg = findRegistration(server, 'bpmsoft_collections');
     const cb = reg.callback as StaticReadCallback;
-    await expect(cb(new URL('bpmsoft://collections'), undefined)).rejects.toThrow(
-      /bpm_init/
-    );
+    await expect(cb(new URL('bpmsoft://collections'), undefined)).rejects.toThrow(/bpm_init/);
   });
 
   it('bpmsoft://collection/{name} returns schema card with property fields', async () => {
@@ -140,11 +141,7 @@ describe('registerResources', () => {
     expect(reg.uriOrTemplate).toBeInstanceOf(ResourceTemplate);
     const cb = reg.callback as TemplateReadCallback;
 
-    const res = await cb(
-      new URL('bpmsoft://collection/Contact'),
-      { name: 'Contact' },
-      undefined
-    );
+    const res = await cb(new URL('bpmsoft://collection/Contact'), { name: 'Contact' }, undefined);
     expect(getEntityMetadata).toHaveBeenCalledWith('Contact');
     expect(getCount).toHaveBeenCalledWith('Contact');
     expect(res.contents).toHaveLength(1);
@@ -181,11 +178,7 @@ describe('registerResources', () => {
     registerResources(server as any, services);
     const reg = findRegistration(server, 'bpmsoft_collection');
     const cb = reg.callback as TemplateReadCallback;
-    const res = await cb(
-      new URL('bpmsoft://collection/Contakt'),
-      { name: 'Contakt' },
-      undefined
-    );
+    const res = await cb(new URL('bpmsoft://collection/Contakt'), { name: 'Contakt' }, undefined);
     expect(res.contents).toHaveLength(1);
     expect(res.contents[0].mimeType).toBe('text/markdown');
     const text = (res.contents[0] as { text: string }).text;

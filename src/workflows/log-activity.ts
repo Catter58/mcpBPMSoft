@@ -17,7 +17,14 @@ import { notInitialized } from '../tools/_guards.js';
 
 const TITLE_CANDIDATES = ['Title', 'Subject', 'Caption'];
 const OWNER_CANDIDATES = ['Owner', 'OwnerId', 'Author', 'AuthorId', 'Responsible', 'ResponsibleId'];
-const TYPE_CANDIDATES = ['ActivityCategory', 'ActivityCategoryId', 'Type', 'TypeId', 'ActivityType', 'ActivityTypeId'];
+const TYPE_CANDIDATES = [
+  'ActivityCategory',
+  'ActivityCategoryId',
+  'Type',
+  'TypeId',
+  'ActivityType',
+  'ActivityTypeId',
+];
 const DUE_DATE_CANDIDATES = ['DueDate', 'StartDate', 'StartedOn', 'DueOn'];
 
 function findFieldName(meta: EntityMetadata, candidates: string[]): EntityProperty | undefined {
@@ -154,7 +161,10 @@ export function registerLogActivityTool(server: McpServer, services: ServiceCont
         for (const n of resolved.notes) {
           warnings.push(`Поле ${n.field}: "${n.input}" разрешено неточно как "${n.matchedValue}"`);
         }
-        const created = await services.odataClient.createRecord<Record<string, unknown>>('Activity', resolved.data);
+        const created = await services.odataClient.createRecord<Record<string, unknown>>(
+          'Activity',
+          resolved.data
+        );
         const activityId = String(
           (created as { Id?: unknown; id?: unknown }).Id ?? (created as { id?: unknown }).id ?? ''
         );
@@ -165,9 +175,13 @@ export function registerLogActivityTool(server: McpServer, services: ServiceCont
               type: 'text',
               text: [
                 `Активность зафиксирована: ${params.title} (${activityId})`,
-                `Использованные поля: ${Object.entries(usedFields).map(([k, v]) => `${k}=${v}`).join(', ')}`,
+                `Использованные поля: ${Object.entries(usedFields)
+                  .map(([k, v]) => `${k}=${v}`)
+                  .join(', ')}`,
                 warnings.length ? `Предупреждения: ${warnings.join('; ')}` : '',
-              ].filter(Boolean).join('\n'),
+              ]
+                .filter(Boolean)
+                .join('\n'),
             },
           ],
           structuredContent: {

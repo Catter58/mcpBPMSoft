@@ -243,6 +243,25 @@ describe('LookupResolver fuzzy cascade', () => {
     expect(res.notes).toHaveLength(0);
   });
 
+  it('resolveDataLookups: пустая строка в lookup-поле очищает связь, справочник не дёргается', async () => {
+    const od = makeStubODataClient(() => []);
+    const mm = {
+      async getEntityMetadata() {
+        return { properties: [], lookupFields: [] };
+      },
+      async resolveFieldReference(_c: string, key: string) {
+        return { name: key };
+      },
+      async getLookupInfo() {
+        return { lookupCollection: 'City', displayColumn: 'Name' };
+      },
+    };
+    const resolver = new LookupResolver(makeCfg(), od as never, mm as never);
+    const res = await resolver.resolveDataLookups('Contact', { CityId: '  ' });
+    expect(res.data.CityId).toBeNull();
+    expect(od.calls).toHaveLength(0);
+  });
+
   it('tolower-отказ: 400 на CI-фильтре → ретрай без tolower, флаг залипает', async () => {
     const calls: string[] = [];
     const od = {

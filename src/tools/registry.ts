@@ -51,7 +51,10 @@ export const TOOLS: ToolDescriptor[] = [
       'Пример: {"collection": "Contact", "filter": "Name eq \'Иванов\'", "select": "Id,Name", "top": 10}. ' +
       'Подходит, когда $filter уже известен; для человекочитаемых критериев, русских названий полей ' +
       'и нечёткого поиска лучше bpm_search_records (сам скомпилирует $filter). ' +
-      'По умолчанию автопагинация выключена и действует лимит max_records≈1000 (защита контекста LLM); ' +
+      'Без select возвращаются только Id и колонка отображения (Name/Title/...) — защита контекста LLM; ' +
+      "все колонки — по select='*', конкретные — списком через запятую. " +
+      'В lookup-колонках рядом с CityId приходит CityName (отключается resolve_lookups=false). ' +
+      'По умолчанию автопагинация выключена и действует лимит max_records≈1000; ' +
       'продолжение — по cursor из ответа. Ответ: records + count/total_count/has_more/cursor.',
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     blurb: 'получить записи коллекции (фильтр/select/expand/order/top/skip, безопасный лимит)',
@@ -63,6 +66,8 @@ export const TOOLS: ToolDescriptor[] = [
     description:
       'Возвращает одну запись коллекции по UUID с опциональными $select и $expand. ' +
       'Пример: {"collection": "Account", "id": "3fa85f64-5717-4562-b3fc-2c963f66afa6", "expand": "PrimaryContact"}. ' +
+      "Без select приходят только Id и колонка отображения (Name/Title/...); все колонки — по select='*'. " +
+      'В lookup-колонках рядом с CityId приходит CityName (отключается resolve_lookups=false). ' +
       'Когда UUID неизвестен, сначала bpm_lookup_value (имя → UUID) или bpm_search_unified.',
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     blurb: 'получить запись по UUID',
@@ -89,10 +94,29 @@ export const TOOLS: ToolDescriptor[] = [
       'Пример: {"collection": "Contact", "criteria": [{"field": "Город", "op": "равно", "value": "Москва"}, ' +
       '{"field": "Name", "op": "похоже на", "value": "АО «ЛАНИТ»"}]}. ' +
       '«содержит» регистронезависим; «похоже на»/similar_to дополнительно игнорирует кавычки и ' +
-      'орг-формы (АО/ООО/...). Сервер компилирует корректный $filter сам — предпочтительнее ' +
-      'bpm_get_records с ручным filter. Ответ: compiled_filter, records, count/total_count/has_more/cursor.',
+      'орг-формы (АО/ООО/...). Для lookup-колонки можно передавать текст значения — сервер сам ' +
+      "сравнит его с именем связанной записи (Type/Name eq 'Сотрудник'), UUID доставать не нужно. " +
+      'Сервер компилирует корректный $filter сам — предпочтительнее ' +
+      'bpm_get_records с ручным filter. Без select возвращаются только Id и колонка отображения ' +
+      "(Name/Title/...), все колонки — по select='*'; в lookup-колонках рядом с CityId приходит CityName. " +
+      'Ответ: compiled_filter, records, count/total_count/has_more/cursor.',
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     blurb: 'поиск по criteria-DSL (RU/EN, авто-резолвинг полей, similar_to)',
+    category: 'read',
+  },
+
+  {
+    name: 'bpm_whoami',
+    title: 'Кто я и сколько времени',
+    description:
+      'Возвращает текущего пользователя (SysAdminUnit + привязанный Contact) и текущее время ' +
+      'в его часовом поясе. Личность вычисляет сам BPMSoft в сессии вызывающего (макрос DataService), ' +
+      'поэтому при per-request авторизации ответ соответствует владельцу cookie/BPMCSRF. ' +
+      'Нужен всякий раз, когда в запросе есть «мне»/«мои»/«моя команда» (подставьте contact_id в ' +
+      'OwnerId/AuthorId) или относительная дата — у модели нет своих часов, а UTC-полночь не ' +
+      'совпадает с местной. Пример: {"timezone": "Europe/Moscow"}.',
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    blurb: 'текущий пользователь, его контакт и текущее время в его поясе',
     category: 'read',
   },
 
@@ -168,8 +192,9 @@ export const TOOLS: ToolDescriptor[] = [
     title: 'Список коллекций',
     description:
       'Возвращает доступные EntitySet (коллекции) BPMSoft из $metadata, опционально с фильтром-подстрокой. ' +
-      'Пример: {"pattern": "Contact"}. Первый шаг при ошибке not_found по имени коллекции; ' +
-      'обзор инстанса целиком — bpm_describe_instance.',
+      'Пример: {"pattern": "Contact"}. На типовом стенде коллекций больше тысячи, поэтому выдача ' +
+      'ограничена limit (по умолчанию 100) и сопровождается total/has_more — сужайте поиск через pattern. ' +
+      'Первый шаг при ошибке not_found по имени коллекции; обзор инстанса целиком — bpm_describe_instance.',
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     blurb: 'список доступных коллекций',
     category: 'schema',
@@ -446,7 +471,16 @@ export function getTool(name: string): ToolDescriptor {
 }
 
 export function listToolBlurbs(): string {
-  const order: ToolDescriptor['category'][] = ['init', 'read', 'write', 'schema', 'workflow', 'process', 'batch', 'stream'];
+  const order: ToolDescriptor['category'][] = [
+    'init',
+    'read',
+    'write',
+    'schema',
+    'workflow',
+    'process',
+    'batch',
+    'stream',
+  ];
   const lines: string[] = [];
   for (const cat of order) {
     const tools = TOOLS.filter((t) => t.category === cat);

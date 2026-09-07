@@ -62,9 +62,7 @@ export function buildConfig(
   }
 ): BpmConfig {
   const odataVersion = parseODataVersion(
-    typeof options?.odata_version === 'number'
-      ? String(options.odata_version)
-      : options?.odata_version
+    typeof options?.odata_version === 'number' ? String(options.odata_version) : options?.odata_version
   );
   const platform = parsePlatform(options?.platform);
 
@@ -97,9 +95,7 @@ export function getODataBaseUrl(config: BpmConfig): string {
   const { bpmsoft_url, odata_version, platform } = config;
 
   if (odata_version === 4) {
-    return platform === 'net8'
-      ? `${bpmsoft_url}/odata`
-      : `${bpmsoft_url}/0/odata`;
+    return platform === 'net8' ? `${bpmsoft_url}/odata` : `${bpmsoft_url}/0/odata`;
   }
 
   // OData 3 — only .NET Framework

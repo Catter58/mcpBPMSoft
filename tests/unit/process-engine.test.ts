@@ -34,9 +34,7 @@ function envelope(payload: string): string {
 describe('ProcessEngineClient.execute', () => {
   it('builds the correct URL with parameters and ResultParameterName', async () => {
     const http = new MockHttpClient();
-    http.setResponses([
-      () => ({ status: 200, data: envelope('42') }),
-    ]);
+    http.setResponses([() => ({ status: 200, data: envelope('42') })]);
     const client = new ProcessEngineClient(makeCfg(), http as unknown as never);
 
     await client.execute(
@@ -111,9 +109,7 @@ describe('ProcessEngineClient.execute', () => {
     const http = new MockHttpClient();
     const client = new ProcessEngineClient(makeCfg(), http as unknown as never);
 
-    await expect(
-      client.execute('UsrEcho', { 'bad key': 'x' })
-    ).rejects.toBeInstanceOf(BpmApiError);
+    await expect(client.execute('UsrEcho', { 'bad key': 'x' })).rejects.toBeInstanceOf(BpmApiError);
     expect(http.requests).toHaveLength(0);
   });
 });

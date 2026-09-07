@@ -13,6 +13,7 @@ import { ODataClient } from '../client/odata-client.js';
 import { MetadataManager } from '../metadata/metadata-manager.js';
 import { LookupResolver } from '../lookup/lookup-resolver.js';
 import { ProcessEngineClient } from '../process/process-engine-client.js';
+import { CurrentUserService } from '../user/current-user.js';
 import { getTool, listToolBlurbs } from './registry.js';
 
 export interface ServiceContainer {
@@ -23,6 +24,7 @@ export interface ServiceContainer {
   metadataManager: MetadataManager;
   lookupResolver: LookupResolver;
   processEngine: ProcessEngineClient;
+  currentUser: CurrentUserService;
   initialized: boolean;
 }
 
@@ -35,11 +37,15 @@ export function createEmptyContainer(): ServiceContainer {
     metadataManager: null!,
     lookupResolver: null!,
     processEngine: null!,
+    currentUser: null!,
     initialized: false,
   };
 }
 
-export function initializeServices(config: BpmConfig, allowEnvCreds: boolean = isEnvCredsAllowed()): ServiceContainer {
+export function initializeServices(
+  config: BpmConfig,
+  allowEnvCreds: boolean = isEnvCredsAllowed()
+): ServiceContainer {
   const httpClient = new HttpClient(config);
   httpClient.setAllowEnvCreds(allowEnvCreds);
   const authManager = new AuthManager(config, httpClient, allowEnvCreds);
@@ -47,6 +53,7 @@ export function initializeServices(config: BpmConfig, allowEnvCreds: boolean = i
   const metadataManager = new MetadataManager(config, odataClient, httpClient);
   const lookupResolver = new LookupResolver(config, odataClient, metadataManager);
   const processEngine = new ProcessEngineClient(config, httpClient);
+  const currentUser = new CurrentUserService(config, httpClient);
 
   return {
     config,
@@ -56,6 +63,7 @@ export function initializeServices(config: BpmConfig, allowEnvCreds: boolean = i
     metadataManager,
     lookupResolver,
     processEngine,
+    currentUser,
     initialized: true,
   };
 }

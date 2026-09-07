@@ -11,7 +11,14 @@ describe('tool conventions', () => {
   });
 
   it('bulk-write tools are destructive', () => {
-    for (const n of ['bpm_update_by_filter', 'bpm_batch_update', 'bpm_delete_by_filter', 'bpm_batch_delete', 'bpm_delete_record', 'bpm_update_record']) {
+    for (const n of [
+      'bpm_update_by_filter',
+      'bpm_batch_update',
+      'bpm_delete_by_filter',
+      'bpm_batch_delete',
+      'bpm_delete_record',
+      'bpm_update_record',
+    ]) {
       const t = TOOLS.find((x) => x.name === n);
       expect(t, n).toBeTruthy();
       expect(t!.annotations.destructiveHint, n).toBe(true);

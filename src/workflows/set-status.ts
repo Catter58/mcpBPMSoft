@@ -74,9 +74,7 @@ export function registerSetStatusTool(server: McpServer, services: ServiceContai
           }
           statusField = entityMeta.properties.find((p) => p.name === ref.name);
         } else {
-          const candidates = entityMeta.properties.filter(
-            (p) => p.isLookup && isStatusFieldName(p.name)
-          );
+          const candidates = entityMeta.properties.filter((p) => p.isLookup && isStatusFieldName(p.name));
           if (candidates.length === 0) {
             throw new BpmApiError(
               `В коллекции ${collection} не найдено lookup-поле статуса (имя содержит Status/Stage/State).`,

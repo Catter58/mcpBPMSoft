@@ -46,8 +46,7 @@ const SCENARIOS: WorkflowScenario[] = [
     title: 'Сменить статус записи',
     user_intent: '«Закрой эту сделку», «переведи лид в квалифицирован», «отметь задачу выполненной».',
     recommended_tools: ['bpm_set_status'],
-    notes:
-      'Передаётся имя статуса на русском; сервер сам найдёт правильное status-поле и его справочник.',
+    notes: 'Передаётся имя статуса на русском; сервер сам найдёт правильное status-поле и его справочник.',
   },
   {
     id: 'find-anything',
@@ -147,7 +146,12 @@ const ENTITY_GRAPH: { entities: string[]; relations: EntityRelation[] } = {
     { from: 'Activity', to: 'Contact', via: 'ContactId', meaning: 'активность с контактом' },
     { from: 'Activity', to: 'Account', via: 'AccountId', meaning: 'активность с контрагентом' },
     { from: 'Activity', to: 'Opportunity', via: 'OpportunityId', meaning: 'активность по сделке' },
-    { from: 'Lead', to: 'Account', via: 'QualifiedAccountId', meaning: 'лид → контрагент после квалификации' },
+    {
+      from: 'Lead',
+      to: 'Account',
+      via: 'QualifiedAccountId',
+      meaning: 'лид → контрагент после квалификации',
+    },
     { from: 'Lead', to: 'Contact', via: 'QualifiedContactId', meaning: 'лид → контакт после квалификации' },
     { from: 'Opportunity', to: 'Account', via: 'AccountId', meaning: 'сделка с контрагентом' },
     { from: 'Opportunity', to: 'Contact', via: 'ContactId', meaning: 'основной контакт сделки' },
@@ -222,12 +226,7 @@ export function registerWorkflowCatalogTool(server: McpServer, _services: Servic
         };
       }
 
-      const lines: string[] = [
-        '# Каталог сценариев работы с BPMSoft',
-        '',
-        '## Типичные сценарии',
-        '',
-      ];
+      const lines: string[] = ['# Каталог сценариев работы с BPMSoft', '', '## Типичные сценарии', ''];
       for (const sc of SCENARIOS) {
         lines.push(renderScenario(sc));
         lines.push('');

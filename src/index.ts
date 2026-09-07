@@ -20,6 +20,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 
 import { startHttpServer } from './server/http-transport.js';
+import { instrumentTools } from './server/instrumentation.js';
 import { tryLoadConfigFromEnv, isEnvCredsAllowed } from './config.js';
 import {
   registerInitTool,
@@ -32,6 +33,7 @@ import { registerWriteTools } from './tools/write-tools.js';
 import { registerSchemaTools } from './tools/schema-tools.js';
 import { registerDescribeInstanceTool } from './tools/describe-instance-tool.js';
 import { registerEnumTool } from './tools/enum-tool.js';
+import { registerWhoamiTool } from './tools/whoami-tool.js';
 import { registerWorkflowCatalogTool } from './tools/workflow-catalog-tool.js';
 import { registerBatchTools } from './tools/batch-tools.js';
 import { registerStreamTools } from './tools/stream-tools.js';
@@ -73,6 +75,9 @@ async function main(): Promise<void> {
       version: '0.3.1',
     });
 
+    // Замер должен встать до регистрации, иначе обработчики уже обёрнуты не будут.
+    instrumentTools(server);
+
     // bpm_init is only exposed when env-stored credentials are explicitly enabled.
     if (allowEnvCreds) {
       registerInitTool(server, services, (newContainer) => {
@@ -85,6 +90,7 @@ async function main(): Promise<void> {
     registerSchemaTools(server, services);
     registerDescribeInstanceTool(server, services);
     registerEnumTool(server, services);
+    registerWhoamiTool(server, services);
     registerWorkflowCatalogTool(server, services);
     registerBatchTools(server, services);
     registerStreamTools(server, services);

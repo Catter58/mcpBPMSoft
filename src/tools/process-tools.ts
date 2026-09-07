@@ -24,9 +24,7 @@ export function registerProcessTools(server: McpServer, services: ServiceContain
         title: meta.title,
         description: meta.description,
         inputSchema: {
-          process_name: z
-            .string()
-            .describe('Имя процесса (схема), например: UsrCalculateLeadScore'),
+          process_name: z.string().describe('Имя процесса (схема), например: UsrCalculateLeadScore'),
           parameters: z
             .record(z.string(), z.union([z.string(), z.number(), z.boolean()]))
             .optional()
@@ -51,15 +49,11 @@ export function registerProcessTools(server: McpServer, services: ServiceContain
         try {
           await services.authManager.ensureAuthenticated();
 
-          const outcome = await services.processEngine.execute(
-            params.process_name,
-            params.parameters ?? {},
-            { resultParameterName: params.result_parameter_name }
-          );
+          const outcome = await services.processEngine.execute(params.process_name, params.parameters ?? {}, {
+            resultParameterName: params.result_parameter_name,
+          });
 
-          const lines: string[] = [
-            `Процесс ${params.process_name} запущен (HTTP ${outcome.status}).`,
-          ];
+          const lines: string[] = [`Процесс ${params.process_name} запущен (HTTP ${outcome.status}).`];
           if (params.result_parameter_name) {
             lines.push(`Результат (${params.result_parameter_name}):`);
             lines.push(
@@ -103,9 +97,7 @@ export function registerProcessTools(server: McpServer, services: ServiceContain
         title: meta.title,
         description: meta.description,
         inputSchema: {
-          element_uid: z
-            .string()
-            .describe('UID элемента процесса (GUID 8-4-4-4-12) для возобновления.'),
+          element_uid: z.string().describe('UID элемента процесса (GUID 8-4-4-4-12) для возобновления.'),
         },
         outputSchema: {
           element_uid: z.string(),
@@ -182,9 +174,7 @@ export function registerProcessTools(server: McpServer, services: ServiceContain
         try {
           await services.authManager.ensureAuthenticated();
 
-          const collRef = await services.metadataManager.resolveCollectionReference(
-            params.collection
-          );
+          const collRef = await services.metadataManager.resolveCollectionReference(params.collection);
           if (collRef.name === null) {
             return {
               content: [
@@ -213,10 +203,7 @@ export function registerProcessTools(server: McpServer, services: ServiceContain
 
           let created: Record<string, unknown>;
           try {
-            created = await services.odataClient.createRecord<Record<string, unknown>>(
-              'SocialMessage',
-              body
-            );
+            created = await services.odataClient.createRecord<Record<string, unknown>>('SocialMessage', body);
           } catch (error) {
             if (error instanceof BpmApiError && error.httpStatus === 404) {
               return {

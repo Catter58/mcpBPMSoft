@@ -56,9 +56,7 @@ describe('ODataClient.buildRecordPath', () => {
   it('v4: {base}/Contact(<guid>)', () => {
     const http = new MockHttpClient();
     const client = new ODataClient(makeCfg(), http as unknown as never);
-    expect(client.buildRecordPath('Contact', guid)).toBe(
-      `https://bpm.test/odata/Contact(${guid})`
-    );
+    expect(client.buildRecordPath('Contact', guid)).toBe(`https://bpm.test/odata/Contact(${guid})`);
   });
 
   it("v3: {base}/ContactCollection(guid'<guid>')", () => {
@@ -88,9 +86,7 @@ describe('odata-client identifier validation', () => {
   });
   it('accepts a valid collection and GUID', () => {
     expect(() => client().buildCollectionPath('Contact')).not.toThrow();
-    expect(() =>
-      client().buildRecordPath('Contact', '77a09b42-3b7b-46d1-be1f-2cd49b8ea656')
-    ).not.toThrow();
+    expect(() => client().buildRecordPath('Contact', '77a09b42-3b7b-46d1-be1f-2cd49b8ea656')).not.toThrow();
   });
 });
 

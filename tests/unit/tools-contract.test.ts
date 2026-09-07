@@ -15,6 +15,7 @@ import { registerSchemaTools } from '../../src/tools/schema-tools.js';
 import { registerBatchTools } from '../../src/tools/batch-tools.js';
 import { registerStreamTools } from '../../src/tools/stream-tools.js';
 import { registerEnumTool } from '../../src/tools/enum-tool.js';
+import { registerWhoamiTool } from '../../src/tools/whoami-tool.js';
 import { registerDescribeInstanceTool } from '../../src/tools/describe-instance-tool.js';
 import { registerWorkflowCatalogTool } from '../../src/tools/workflow-catalog-tool.js';
 import { registerProcessTools } from '../../src/tools/process-tools.js';
@@ -33,6 +34,7 @@ async function listAllTools() {
   registerBatchTools(server, container);
   registerStreamTools(server, container);
   registerEnumTool(server, container);
+  registerWhoamiTool(server, container);
   registerDescribeInstanceTool(server, container);
   registerWorkflowCatalogTool(server, container);
   registerProcessTools(server, container);

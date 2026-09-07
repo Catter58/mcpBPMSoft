@@ -5,6 +5,7 @@
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import type { ServiceContainer } from './init-tool.js';
 import type { ResolvedLookupNote } from '../lookup/lookup-resolver.js';
+import { UnknownCollectionError } from '../utils/errors.js';
 
 export const NOT_INITIALIZED_RESULT: CallToolResult = {
   content: [
@@ -58,7 +59,11 @@ export function textResult(text: string, isError = false): CallToolResult {
  * Build a tool result that includes both text and structured content
  * (clients on MCP SDK >= 1.x can read structuredContent for richer UX).
  */
-export function structuredResult(text: string, structured: Record<string, unknown>, isError = false): CallToolResult {
+export function structuredResult(
+  text: string,
+  structured: Record<string, unknown>,
+  isError = false
+): CallToolResult {
   return {
     content: [{ type: 'text', text }],
     structuredContent: structured,
@@ -83,4 +88,24 @@ export function lookupNotesStructured(
     matched_value: n.matchedValue,
     match_type: n.matchType,
   }));
+}
+
+/**
+ * Каноническое имя EntitySet по тому, что передал клиент.
+ *
+ * Модель пишет «Контакт», «contact» или с опечаткой — сервер обязан сопоставить
+ * это со схемой сам. Без резолва кириллица падала на `assertSafeIdentifier`
+ * («допустимы только латинские буквы»), а опечатка — на 404 без подсказок,
+ * хотя `resolveCollectionReference` умеет и то, и другое.
+ */
+export async function resolveCollectionName(services: ServiceContainer, input: string): Promise<string> {
+  let ref: Awaited<ReturnType<ServiceContainer['metadataManager']['resolveCollectionReference']>>;
+  try {
+    ref = await services.metadataManager.resolveCollectionReference(input);
+  } catch {
+    // Схема недоступна — не мешаем запросу: пусть отвечает сам BPMSoft.
+    return input;
+  }
+  if (ref.name) return ref.name;
+  throw new UnknownCollectionError(input, 'suggestions' in ref ? ref.suggestions : []);
 }

@@ -6,12 +6,7 @@
  * binary field I/O, and response normalization.
  */
 
-import type {
-  BpmConfig,
-  HttpResponse,
-  ODataCollectionResponse,
-  ODataVersion,
-} from '../types/index.js';
+import type { BpmConfig, HttpResponse, ODataCollectionResponse, ODataVersion } from '../types/index.js';
 import { HttpClient } from './http-client.js';
 import { getODataBaseUrl } from '../config.js';
 import { BpmApiError } from '../utils/errors.js';
@@ -25,6 +20,13 @@ export interface QueryOptions {
   $orderby?: string;
   $expand?: string;
   $count?: boolean;
+}
+
+/** Результат загрузки $metadata: тело, ETag и признак «не изменилось». */
+export interface MetadataFetchResult {
+  xml: string;
+  etag?: string;
+  notModified: boolean;
 }
 
 /** Normalized collection response (handles both v3 __next and v4 @odata.nextLink) */
@@ -75,7 +77,9 @@ export class ODataClient {
       let nextLink = pickNextLink(result);
       while (nextLink && result.value.length < limit) {
         const nextUrl = this.resolveNextLink(nextLink);
-        const next: HttpResponse<ODataCollectionResponse<T>> = await this.httpClient.request<ODataCollectionResponse<T>>({
+        const next: HttpResponse<ODataCollectionResponse<T>> = await this.httpClient.request<
+          ODataCollectionResponse<T>
+        >({
           method: 'GET',
           url: nextUrl,
           contentKind: 'crud',
@@ -144,18 +148,32 @@ export class ODataClient {
     return response.data;
   }
 
-  async updateRecord(
+  /**
+   * PATCH записи. С `returnRepresentation` просим сервер вернуть изменённую
+   * запись (`Prefer: return=representation`) — иначе BPMSoft отвечает 204, и,
+   * чтобы показать модели результат, пришлось бы делать второй GET.
+   * Сервер вправе просьбу проигнорировать, поэтому возвращаем `null`, если
+   * тела в ответе нет.
+   */
+  async updateRecord<T = Record<string, unknown>>(
     collection: string,
     id: string,
-    data: Record<string, unknown>
-  ): Promise<void> {
+    data: Record<string, unknown>,
+    options: { returnRepresentation?: boolean } = {}
+  ): Promise<T | null> {
     const url = this.buildRecordPath(collection, id);
-    await this.httpClient.request({
+    const response = await this.httpClient.request<T>({
       method: 'PATCH',
       url,
       body: data,
       contentKind: 'crud',
+      headers: options.returnRepresentation ? { Prefer: 'return=representation' } : undefined,
     });
+
+    if (response.status === 204) return null;
+    const body = response.data as unknown;
+    if (!body || typeof body !== 'object' || Array.isArray(body)) return null;
+    return body as T;
   }
 
   async deleteRecord(collection: string, id: string): Promise<void> {
@@ -237,16 +255,31 @@ export class ODataClient {
     return { responses: allResponses };
   }
 
-  /** Fetch OData $metadata XML document */
-  async getMetadataXml(): Promise<string> {
+  /**
+   * Загрузка $metadata с поддержкой условного GET.
+   *
+   * Документ большой (на типовом стенде 2.5 МБ и несколько секунд), поэтому
+   * при наличии сохранённого ETag просим сервер ответить 304 и переиспользуем
+   * то, что уже лежит на диске.
+   */
+  async getMetadataXml(options: { etag?: string } = {}): Promise<MetadataFetchResult> {
     const url = `${this.baseUrl}/$metadata`;
     const response = await this.httpClient.request<string>({
       method: 'GET',
       url,
       contentKind: 'metadata',
       responseType: 'text',
+      headers: options.etag ? { 'If-None-Match': options.etag } : undefined,
     });
-    return String(response.data);
+
+    if (response.status === 304) {
+      return { xml: '', etag: options.etag, notModified: true };
+    }
+    return {
+      xml: String(response.data),
+      etag: response.headers?.etag ?? response.headers?.ETag,
+      notModified: false,
+    };
   }
 
   // Binary field I/O (per Postman "Поток данных")
@@ -275,11 +308,7 @@ export class ODataClient {
    * URL: {baseUrl}/{Collection}({id})/{FieldName}
    * For OData 3 the canonical $value form is also used: /FieldName/$value
    */
-  async getFieldBinary(
-    collection: string,
-    id: string,
-    field: string
-  ): Promise<Buffer> {
+  async getFieldBinary(collection: string, id: string, field: string): Promise<Buffer> {
     const fieldUrl = `${this.buildRecordPath(collection, id)}/${encodeURIComponent(field)}`;
     const url = this.odataVersion === 3 ? `${fieldUrl}/$value` : fieldUrl;
     const response = await this.httpClient.request<Buffer>({
@@ -299,6 +328,15 @@ export class ODataClient {
       url,
       contentKind: 'binary',
     });
+  }
+
+  /**
+   * URL, который ушёл бы на сервер, без выполнения запроса.
+   * Нужен для dry_run: модель видит, во что превратились её критерии, и может
+   * поправиться сама, не тратя round-trip и не задевая данные.
+   */
+  previewCollectionUrl(collection: string, query?: QueryOptions): string {
+    return this.buildCollectionUrl(collection, query);
   }
 
   private buildCollectionUrl(collection: string, query?: QueryOptions): string {
@@ -326,9 +364,7 @@ export class ODataClient {
   buildRecordPath(collection: string, id: string): string {
     assertGuid(id, 'id');
     const collectionPath = this.buildCollectionPath(collection);
-    return this.odataVersion === 3
-      ? `${collectionPath}(guid'${id}')`
-      : `${collectionPath}(${id})`;
+    return this.odataVersion === 3 ? `${collectionPath}(guid'${id}')` : `${collectionPath}(${id})`;
   }
 
   /** Origin to which all requests must stay locked. Exposed for diagnostics/tests. */

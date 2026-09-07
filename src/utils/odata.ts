@@ -7,6 +7,7 @@
  */
 
 import { BpmApiError } from './errors.js';
+import { isTolowerSupported } from './server-capabilities.js';
 
 const SAFE_IDENT_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const SAFE_PATH_RE = /^[A-Za-z_][A-Za-z0-9_/]*$/;
@@ -47,6 +48,15 @@ export function assertGuid(id: string, label = 'id'): void {
   }
 }
 
+/**
+ * GUID-литерал для $filter: v3 требует `guid'...'`, v4 — голый UUID.
+ * Валидирует значение, поэтому результат безопасно подставлять в выражение.
+ */
+export function guidLiteral(id: string, odataVersion: 3 | 4): string {
+  assertGuid(id);
+  return odataVersion === 3 ? `guid'${id}'` : id;
+}
+
 export function assertSafePath(name: string, label = 'path'): void {
   if (!isSafePath(name)) {
     throw new Error(
@@ -60,18 +70,16 @@ export function assertSafePath(name: string, label = 'path'): void {
  * control characters that cannot appear inside a string literal.
  */
 export function escapeODataString(value: string): string {
-  return value
-    .replace(/'/g, "''")
-    .replace(/\n/g, '')
-    .replace(/\r/g, '')
-    .replace(/\t/g, ' ');
+  return value.replace(/'/g, "''").replace(/\n/g, '').replace(/\r/g, '').replace(/\t/g, ' ');
 }
 
 /**
  * Builds a substring-match expression valid for the given OData version:
  * v4 — contains(field, 'v'); v3 — substringof('v', field).
- * With caseInsensitive the field is wrapped in tolower(); pass the value
- * already lower-cased (e.g. NormalizedName.normalized / .core).
+ *
+ * С caseInsensitive поле оборачивается в tolower(), а значение приводится к
+ * нижнему регистру здесь же — иначе на инстансе без tolower() (латч в
+ * server-capabilities) в фильтр уходило бы искажённое значение.
  */
 export function containsExpression(
   fieldPath: string,
@@ -79,7 +87,10 @@ export function containsExpression(
   odataVersion: 3 | 4,
   opts: { caseInsensitive?: boolean } = {}
 ): string {
-  const literal = `'${escapeODataString(value)}'`;
-  const field = opts.caseInsensitive ? `tolower(${fieldPath})` : fieldPath;
+  // Регистронезависимость запрашивается вызывающим, но последнее слово за
+  // инстансом: если tolower() уже уронил запрос, больше его не строим.
+  const caseInsensitive = opts.caseInsensitive === true && isTolowerSupported();
+  const literal = `'${escapeODataString(caseInsensitive ? value.toLowerCase() : value)}'`;
+  const field = caseInsensitive ? `tolower(${fieldPath})` : fieldPath;
   return odataVersion === 3 ? `substringof(${literal}, ${field})` : `contains(${field}, ${literal})`;
 }

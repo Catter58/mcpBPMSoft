@@ -35,7 +35,9 @@ export function registerEnumTool(server: McpServer, services: ServiceContainer):
         collection: z.string().describe('Имя коллекции (EntitySet), например: Activity, Lead, Opportunity'),
         field: z
           .string()
-          .describe('Имя или caption lookup-поля. Например: ActivityCategory, Status, «Тип активности», «Статус».'),
+          .describe(
+            'Имя или caption lookup-поля. Например: ActivityCategory, Status, «Тип активности», «Статус».'
+          ),
         top: z
           .number()
           .int()
@@ -98,11 +100,14 @@ export function registerEnumTool(server: McpServer, services: ServiceContainer):
         if (fromCache) {
           values = cached.values;
         } else {
-          const response = await services.odataClient.getRecords<Record<string, unknown>>(lookup.lookupCollection, {
-            $select: `Id,${lookup.displayColumn}`,
-            $top: top,
-            $orderby: `${lookup.displayColumn} asc`,
-          });
+          const response = await services.odataClient.getRecords<Record<string, unknown>>(
+            lookup.lookupCollection,
+            {
+              $select: `Id,${lookup.displayColumn}`,
+              $top: top,
+              $orderby: `${lookup.displayColumn} asc`,
+            }
+          );
           values = response.value.map((r) => ({
             id: String(r.Id ?? r.id ?? ''),
             name: String(r[lookup.displayColumn] ?? ''),
@@ -142,7 +147,12 @@ export function registerEnumTool(server: McpServer, services: ServiceContainer):
   );
 }
 
-function formatErr(payload: { error: string; collection?: string; suggestions?: string[]; next_steps?: string[] }): CallToolResult {
+function formatErr(payload: {
+  error: string;
+  collection?: string;
+  suggestions?: string[];
+  next_steps?: string[];
+}): CallToolResult {
   return {
     content: [{ type: 'text', text: JSON.stringify({ success: false, ...payload }, null, 2) }],
     isError: true,

@@ -16,6 +16,7 @@ import { ResourceTemplate } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { ReadResourceResult } from '@modelcontextprotocol/sdk/types.js';
 import type { ServiceContainer } from '../tools/init-tool.js';
 import type { EntityMetadata, EntityProperty } from '../types/index.js';
+import { enrichLookups } from '../utils/display.js';
 
 const NOT_INITIALIZED_MSG = 'Сервер не инициализирован, вызовите bpm_init';
 
@@ -154,8 +155,7 @@ export function registerResources(server: McpServer, services: ServiceContainer)
         };
       } catch {
         const resolved = await services.metadataManager.resolveCollectionReference(name);
-        const suggestions =
-          'suggestions' in resolved && resolved.suggestions ? resolved.suggestions : [];
+        const suggestions = 'suggestions' in resolved && resolved.suggestions ? resolved.suggestions : [];
         const lines = [
           `# Коллекция \`${name}\` не найдена`,
           '',
@@ -215,7 +215,12 @@ export function registerResources(server: McpServer, services: ServiceContainer)
       if (!collection || !id) {
         throw new Error('В URI bpmsoft://entity/{collection}/{id} не указаны collection и/или id');
       }
-      const record = await services.odataClient.getRecord<Record<string, unknown>>(collection, id);
+      const raw = await services.odataClient.getRecord<Record<string, unknown>>(collection, id);
+      const [record] = await enrichLookups([raw], collection, {
+        metadataManager: services.metadataManager,
+        odataClient: services.odataClient,
+        odataVersion: services.config.odata_version,
+      });
       return {
         contents: [
           jsonContent(uri.href, record),

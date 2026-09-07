@@ -13,8 +13,11 @@ import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import type { ServiceContainer } from './init-tool.js';
 import { formatToolError } from '../utils/errors.js';
 import { getTool } from './registry.js';
-import { notInitialized } from './_guards.js';
+import { notInitialized, resolveCollectionName } from './_guards.js';
 import { lookupCandidateShape } from './_schemas.js';
+
+/** Сколько имён коллекций отдавать без явного limit. */
+const COLLECTIONS_LIMIT = 100;
 
 export function registerSchemaTools(server: McpServer, services: ServiceContainer): void {
   // bpm_get_collections
@@ -27,9 +30,19 @@ export function registerSchemaTools(server: McpServer, services: ServiceContaine
         description: meta.description,
         inputSchema: {
           pattern: z.string().optional().describe('Фильтр по имени (поиск подстроки, регистронезависимый)'),
+          limit: z
+            .number()
+            .int()
+            .positive()
+            .optional()
+            .describe(
+              `Сколько имён вернуть (по умолчанию ${COLLECTIONS_LIMIT}). На типовом стенде коллекций больше тысячи — ` +
+                'без pattern полный список только зря съест контекст.'
+            ),
         },
         outputSchema: {
           count: z.number().int(),
+          total: z.number().int(),
           has_more: z.boolean(),
           sets: z.array(z.object({ name: z.string(), entityType: z.string() })),
         },
@@ -39,8 +52,8 @@ export function registerSchemaTools(server: McpServer, services: ServiceContaine
         if (!services.initialized) return notInitialized();
         try {
           await services.authManager.ensureAuthenticated();
-          const sets = await services.metadataManager.getEntitySets(params.pattern);
-          if (sets.length === 0) {
+          const all = await services.metadataManager.getEntitySets(params.pattern);
+          if (all.length === 0) {
             return {
               content: [
                 {
@@ -50,13 +63,21 @@ export function registerSchemaTools(server: McpServer, services: ServiceContaine
                     : 'Список коллекций пуст.',
                 },
               ],
-              structuredContent: { count: 0, has_more: false, sets: [] },
+              structuredContent: { count: 0, total: 0, has_more: false, sets: [] },
             };
           }
+
+          const limit = params.limit ?? COLLECTIONS_LIMIT;
+          const sets = all.slice(0, limit);
+          const hasMore = all.length > sets.length;
+
           const list = sets.map((s) => `  - ${s.name} (${s.entityType})`).join('\n');
+          const header = hasMore
+            ? `Коллекций всего: ${all.length}, показано ${sets.length}. Сузьте выборку параметром pattern или поднимите limit.`
+            : `Найдено коллекций: ${all.length}`;
           return {
-            content: [{ type: 'text', text: `Найдено коллекций: ${sets.length}\n\n${list}` }],
-            structuredContent: { count: sets.length, has_more: false, sets },
+            content: [{ type: 'text', text: `${header}\n\n${list}` }],
+            structuredContent: { count: sets.length, total: all.length, has_more: hasMore, sets },
           };
         } catch (error) {
           const toolError = formatToolError(error);
@@ -105,7 +126,8 @@ export function registerSchemaTools(server: McpServer, services: ServiceContaine
         if (!services.initialized) return notInitialized();
         try {
           await services.authManager.ensureAuthenticated();
-          const metadata = await services.metadataManager.getEntityMetadata(params.collection);
+          const collection = await resolveCollectionName(services, params.collection);
+          const metadata = await services.metadataManager.getEntityMetadata(collection);
 
           const lines: string[] = [
             `Схема коллекции: ${metadata.name}`,
@@ -139,7 +161,9 @@ export function registerSchemaTools(server: McpServer, services: ServiceContaine
             for (const lf of metadata.lookupFields) {
               const prop = metadata.properties.find((p) => p.name === lf);
               const captionPart = prop?.caption ? ` [${prop.caption}]` : '';
-              lines.push(`  - ${lf}${captionPart} → ${prop?.lookupCollection || '?'}.${prop?.lookupDisplayColumn || 'Name'}`);
+              lines.push(
+                `  - ${lf}${captionPart} → ${prop?.lookupCollection || '?'}.${prop?.lookupDisplayColumn || 'Name'}`
+              );
             }
           }
 
@@ -162,8 +186,7 @@ export function registerSchemaTools(server: McpServer, services: ServiceContaine
               lookup_count: metadata.lookupFields.length,
               has_captions: hasCaptions,
               properties: propertyPairs,
-              hint:
-                'В bpm_create_record/bpm_update_record/bpm_search_records можно передавать ключи как на латинице (name), так и на русском (caption).',
+              hint: 'В bpm_create_record/bpm_update_record/bpm_search_records можно передавать ключи как на латинице (name), так и на русском (caption).',
             },
           };
         } catch (error) {
@@ -211,23 +234,23 @@ export function registerSchemaTools(server: McpServer, services: ServiceContaine
         if (!services.initialized) return notInitialized();
         try {
           await services.authManager.ensureAuthenticated();
+          const collection = await resolveCollectionName(services, params.collection);
 
           const result = await services.lookupResolver.lookupValue(
-            params.collection,
+            collection,
             params.field || 'Name',
             params.value,
             { fuzzy: params.fuzzy ?? true }
           );
 
           if (result.resolved) {
-            const fuzzyNote = result.fuzzy && result.matchedValue
-              ? `\n(неточное совпадение: "${result.matchedValue}")`
-              : '';
+            const fuzzyNote =
+              result.fuzzy && result.matchedValue ? `\n(неточное совпадение: "${result.matchedValue}")` : '';
             return {
               content: [
                 {
                   type: 'text',
-                  text: `Найдено: ${params.collection}.${params.field || 'Name'} = "${params.value}"\nUUID: ${result.id}${fuzzyNote}`,
+                  text: `Найдено: ${collection}.${params.field || 'Name'} = "${params.value}"\nUUID: ${result.id}${fuzzyNote}`,
                 },
               ],
               structuredContent: {
@@ -246,7 +269,7 @@ export function registerSchemaTools(server: McpServer, services: ServiceContaine
               content: [
                 {
                   type: 'text',
-                  text: `Значение "${params.value}" не найдено в ${params.collection}.${params.field || 'Name'}${(params.fuzzy ?? true) ? ' (даже при нечётком поиске)' : ''}`,
+                  text: `Значение "${params.value}" не найдено в ${collection}.${params.field || 'Name'}${(params.fuzzy ?? true) ? ' (даже при нечётком поиске)' : ''}`,
                 },
               ],
               isError: true,
@@ -255,14 +278,17 @@ export function registerSchemaTools(server: McpServer, services: ServiceContaine
           }
 
           const candidateList = result.candidates
-            .map((c, i) => `  ${i + 1}. "${c.displayValue}"${c.score !== undefined ? ` [score ${c.score}]` : ''} (ID: ${c.id})`)
+            .map(
+              (c, i) =>
+                `  ${i + 1}. "${c.displayValue}"${c.score !== undefined ? ` [score ${c.score}]` : ''} (ID: ${c.id})`
+            )
             .join('\n');
 
           return {
             content: [
               {
                 type: 'text',
-                text: `Найдено ${result.matchCount} совпадений для "${params.value}" в ${params.collection}.${params.field || 'Name'}:\n${candidateList}\n\nУточните значение (кандидаты отранжированы по релевантности) или передайте UUID напрямую.`,
+                text: `Найдено ${result.matchCount} совпадений для "${params.value}" в ${collection}.${params.field || 'Name'}:\n${candidateList}\n\nУточните значение (кандидаты отранжированы по релевантности) или передайте UUID напрямую.`,
               },
             ],
             structuredContent: {
@@ -292,7 +318,10 @@ export function registerSchemaTools(server: McpServer, services: ServiceContaine
         description: meta.description,
         inputSchema: {
           search: z.string().describe('Текст для поиска по русскому или английскому названию'),
-          collection: z.string().optional().describe('Коллекция для поиска (если опущена — по уже загруженным схемам)'),
+          collection: z
+            .string()
+            .optional()
+            .describe('Коллекция для поиска (если опущена — по уже загруженным схемам)'),
         },
         outputSchema: {
           count: z.number().int(),
@@ -313,20 +342,24 @@ export function registerSchemaTools(server: McpServer, services: ServiceContaine
         if (!services.initialized) return notInitialized();
         try {
           await services.authManager.ensureAuthenticated();
+          // Коллекция здесь необязательна: без неё ищем по всем загруженным схемам.
+          const collection = params.collection
+            ? await resolveCollectionName(services, params.collection)
+            : undefined;
 
-          if (params.collection) {
-            await services.metadataManager.getEntityMetadata(params.collection);
+          if (collection) {
+            await services.metadataManager.getEntityMetadata(collection);
           }
 
-          const results = await services.metadataManager.findFieldByCaption(params.search, params.collection);
+          const results = await services.metadataManager.findFieldByCaption(params.search, collection);
 
           if (results.length === 0) {
             return {
               content: [
                 {
                   type: 'text',
-                  text: params.collection
-                    ? `Поле "${params.search}" не найдено в коллекции ${params.collection}.\nУбедитесь, что схема загружена (bpm_get_schema).`
+                  text: collection
+                    ? `Поле "${params.search}" не найдено в коллекции ${collection}.\nУбедитесь, что схема загружена (bpm_get_schema).`
                     : `Поле "${params.search}" не найдено.\nСначала загрузите нужные схемы через bpm_get_schema.`,
                 },
               ],

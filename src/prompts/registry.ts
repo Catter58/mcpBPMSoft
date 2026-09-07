@@ -62,10 +62,7 @@ export const PROMPTS: PromptDescriptor[] = [
     description:
       'Подготовка сводки за последние N дней: новые контакты, активные сделки, завершённые задачи. Использует criteria-DSL и операторы относительных дат.',
     argsSchema: {
-      period_days: z
-        .string()
-        .optional()
-        .describe('Период в днях (по умолчанию 7)'),
+      period_days: z.string().optional().describe('Период в днях (по умолчанию 7)'),
     },
     blurb: 'еженедельный отчёт (контакты + сделки + задачи)',
   },

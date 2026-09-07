@@ -53,27 +53,24 @@ describe('HTTP transport forwards per-request auth', () => {
     const { port } = httpServer.address() as AddressInfo;
 
     const client = new Client({ name: 'test-client', version: '0.0.0' });
-    const transport = new StreamableHTTPClientTransport(
-      new URL(`http://127.0.0.1:${port}/`),
-      {
-        requestInit: { headers: { BPMCSRF: 'caller-csrf', Cookie: 'CsrfToken=t; BPMSESSIONID=s' } },
-        // Drain-and-detach the loopback response body before handing it to the
-        // MCP client. MSW's node fetch interceptor (2.x) does not resolve
-        // `response.body.cancel()` on undrained loopback responses (notably the
-        // empty-body 202 for notifications/initialized), which would hang the
-        // client. Fully reading the body here sidesteps that interceptor quirk;
-        // the tool's outgoing request to ORIGIN is still intercepted normally.
-        fetch: async (input, init) => {
-          const resp = await fetch(input as RequestInfo, init);
-          const buf = await resp.arrayBuffer();
-          return new Response(buf.byteLength ? buf : null, {
-            status: resp.status,
-            statusText: resp.statusText,
-            headers: resp.headers,
-          });
-        },
-      }
-    );
+    const transport = new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${port}/`), {
+      requestInit: { headers: { BPMCSRF: 'caller-csrf', Cookie: 'CsrfToken=t; BPMSESSIONID=s' } },
+      // Drain-and-detach the loopback response body before handing it to the
+      // MCP client. MSW's node fetch interceptor (2.x) does not resolve
+      // `response.body.cancel()` on undrained loopback responses (notably the
+      // empty-body 202 for notifications/initialized), which would hang the
+      // client. Fully reading the body here sidesteps that interceptor quirk;
+      // the tool's outgoing request to ORIGIN is still intercepted normally.
+      fetch: async (input, init) => {
+        const resp = await fetch(input as RequestInfo, init);
+        const buf = await resp.arrayBuffer();
+        return new Response(buf.byteLength ? buf : null, {
+          status: resp.status,
+          statusText: resp.statusText,
+          headers: resp.headers,
+        });
+      },
+    });
     await client.connect(transport);
 
     const res = await client.callTool({

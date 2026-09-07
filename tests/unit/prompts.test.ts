@@ -115,10 +115,7 @@ describe('registerPrompts callbacks', () => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     registerPrompts(server as any, stubServices);
     const cb = getCallback(server, 'create_contact_flow');
-    const res = await cb(
-      { name: 'A', account: 'ACME', email: 'a@b.c', phone: '+7' },
-      undefined
-    );
+    const res = await cb({ name: 'A', account: 'ACME', email: 'a@b.c', phone: '+7' }, undefined);
     const text = extractText(res);
     expect(text).toContain('ACME');
     expect(text).toContain('a@b.c');

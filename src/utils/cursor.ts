@@ -69,7 +69,11 @@ export function decodeCursor(token: string): CursorState {
  * records were returned. Returns undefined if there's no next page (no nextLink
  * and the current chunk is smaller than top).
  */
-export function buildNextCursor(state: CursorState, returnedCount: number, hasMore: boolean): string | undefined {
+export function buildNextCursor(
+  state: CursorState,
+  returnedCount: number,
+  hasMore: boolean
+): string | undefined {
   if (!hasMore && (state.top === undefined || returnedCount < state.top)) return undefined;
   const next: CursorState = { ...state, skip: state.skip + returnedCount };
   return encodeCursor(next);

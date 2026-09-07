@@ -36,7 +36,7 @@ describe('isSafePath', () => {
 });
 
 describe('escapeODataString', () => {
-  it("doubles single quotes", () => {
+  it('doubles single quotes', () => {
     expect(escapeODataString("O'Brien")).toBe("O''Brien");
   });
 

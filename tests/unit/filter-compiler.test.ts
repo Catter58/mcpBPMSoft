@@ -68,9 +68,7 @@ function makeStubMetadata(collections: Record<string, CollectionDef>): MetadataM
       const ci = meta.properties.find((p) => p.name.toLowerCase() === query.toLowerCase());
       if (ci) return { name: ci.name };
       // caption match
-      const cap = meta.properties.find(
-        (p) => p.caption && p.caption.toLowerCase() === query.toLowerCase()
-      );
+      const cap = meta.properties.find((p) => p.caption && p.caption.toLowerCase() === query.toLowerCase());
       if (cap) return { name: cap.name };
       // v4: try query + 'Id' for lookup convenience
       if (!query.endsWith('Id')) {
@@ -146,9 +144,7 @@ describe('compileFilter — primitives', () => {
   it('equals with a string value', async () => {
     const r = await compile([{ field: 'Name', op: 'равно', value: 'Иванов' }]);
     expect(r.filter).toBe("Name eq 'Иванов'");
-    expect(r.used_fields).toEqual([
-      { input: 'Name', resolved: 'Name', caption: 'ФИО' },
-    ]);
+    expect(r.used_fields).toEqual([{ input: 'Name', resolved: 'Name', caption: 'ФИО' }]);
     expect(r.warnings).toEqual([]);
   });
 
@@ -190,9 +186,7 @@ describe('compileFilter — primitives', () => {
 
 describe('compileFilter — collections of values', () => {
   it('in produces a parenthesized chain of "or eq"', async () => {
-    const r = await compile([
-      { field: 'Name', op: 'в списке', value: ['Иванов', 'Петров', 'Сидоров'] },
-    ]);
+    const r = await compile([{ field: 'Name', op: 'в списке', value: ['Иванов', 'Петров', 'Сидоров'] }]);
     expect(r.filter).toBe("(Name eq 'Иванов' or Name eq 'Петров' or Name eq 'Сидоров')");
   });
 
@@ -205,9 +199,7 @@ describe('compileFilter — collections of values', () => {
         value_to: '2026-04-30T23:59:59Z',
       },
     ]);
-    expect(r.filter).toBe(
-      'CreatedOn ge 2026-01-01T00:00:00Z and CreatedOn le 2026-04-30T23:59:59Z'
-    );
+    expect(r.filter).toBe('CreatedOn ge 2026-01-01T00:00:00Z and CreatedOn le 2026-04-30T23:59:59Z');
   });
 });
 
@@ -248,9 +240,7 @@ describe('compileFilter — navigation and captions', () => {
     // Navigation property name in v4 is "Account" (the FK is AccountId, but
     // the metadata stub exposes "Account" directly as a lookup field). The
     // last segment is the resolved CityId.
-    expect(r.filter).toBe(
-      "Account/CityId eq 11111111-1111-1111-1111-111111111111"
-    );
+    expect(r.filter).toBe('Account/CityId eq 11111111-1111-1111-1111-111111111111');
   });
 
   it('resolves a Russian caption to the OData field name', async () => {
@@ -262,18 +252,17 @@ describe('compileFilter — navigation and captions', () => {
 
 describe('compileFilter — error handling', () => {
   it('throws UnknownFieldError with suggestions for unknown field', async () => {
-    await expect(
-      compile([{ field: 'Несуществующее', op: 'eq', value: 'x' }])
-    ).rejects.toBeInstanceOf(UnknownFieldError);
+    await expect(compile([{ field: 'Несуществующее', op: 'eq', value: 'x' }])).rejects.toBeInstanceOf(
+      UnknownFieldError
+    );
   });
 });
 
 describe('compileFilter — lookup values', () => {
   it('GUID for a lookup field on OData v3 wraps in guid"..."', async () => {
-    const r = await compile(
-      [{ field: 'CityId', op: 'eq', value: '22222222-2222-2222-2222-222222222222' }],
-      { v: 3 }
-    );
+    const r = await compile([{ field: 'CityId', op: 'eq', value: '22222222-2222-2222-2222-222222222222' }], {
+      v: 3,
+    });
     expect(r.filter).toBe("CityId eq guid'22222222-2222-2222-2222-222222222222'");
     expect(r.warnings.length).toBe(1);
     expect(r.warnings[0]).toContain('lookup');

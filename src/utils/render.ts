@@ -28,7 +28,10 @@ export interface RenderRecordsOptions {
   preview?: number;
 }
 
-export function renderRecordsText(records: Array<Record<string, unknown>>, options: RenderRecordsOptions): string {
+export function renderRecordsText(
+  records: Array<Record<string, unknown>>,
+  options: RenderRecordsOptions
+): string {
   const format: RenderFormat = options.format ?? 'compact';
   const summary = buildSummary(records, options);
 

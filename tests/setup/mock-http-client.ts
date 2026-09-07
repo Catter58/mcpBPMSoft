@@ -48,9 +48,7 @@ export class MockHttpClient {
     this.requests.push(options);
     const handler = this.handlers.shift() ?? this.fallback;
     if (!handler) {
-      throw new Error(
-        `MockHttpClient: no response queued for ${options.method} ${options.url}`
-      );
+      throw new Error(`MockHttpClient: no response queued for ${options.method} ${options.url}`);
     }
     const partial = await handler(options, this.callCount++);
     return {

@@ -9,10 +9,11 @@ import * as z from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import type { ServiceContainer } from '../tools/init-tool.js';
-import { formatToolError } from '../utils/errors.js';
+import { formatToolError, isQueryUnsupportedError } from '../utils/errors.js';
 import { getTool } from '../tools/registry.js';
 import { notInitialized } from '../tools/_guards.js';
 import { containsExpression } from '../utils/odata.js';
+import { isTolowerSupported, markTolowerUnsupported } from '../utils/server-capabilities.js';
 import { normalizeName } from '../utils/name-normalize.js';
 import type { ODataVersion } from '../types/index.js';
 
@@ -31,13 +32,6 @@ interface CollectionFetcher {
 }
 
 /**
- * Поддержка tolower() — свойство инстанса, а не вызова: сервер пришпилен к одному
- * BPMSOFT_URL, поэтому запоминаем отказ на весь процесс и не тратим лишний 4xx
- * round-trip на каждый поиск.
- */
-const tolowerState = { tolowerUnsupported: false };
-
-/**
  * contains по значению с tolower(); при 4xx повторяет case-sensitive.
  */
 async function fetchContains(
@@ -45,14 +39,12 @@ async function fetchContains(
   value: string,
   version: ODataVersion
 ): Promise<Array<Record<string, unknown>>> {
-  if (!tolowerState.tolowerUnsupported) {
+  if (isTolowerSupported()) {
     try {
       return await fetcher(containsExpression('Name', value, version, { caseInsensitive: true }));
     } catch (error) {
-      const status = (error as { httpStatus?: number }).httpStatus;
-      if (status === undefined || status < 400 || status >= 500) throw error;
-      tolowerState.tolowerUnsupported = true;
-      console.error('[bpm_search_unified] tolower() отклонён сервером, перехожу на case-sensitive contains');
+      if (!isQueryUnsupportedError(error)) throw error;
+      markTolowerUnsupported();
     }
   }
   return fetcher(containsExpression('Name', value, version));
@@ -103,9 +95,8 @@ export function registerSearchUnifiedTool(server: McpServer, services: ServiceCo
       try {
         await services.authManager.ensureAuthenticated();
 
-        const requested = params.collections && params.collections.length > 0
-          ? params.collections
-          : DEFAULT_COLLECTIONS;
+        const requested =
+          params.collections && params.collections.length > 0 ? params.collections : DEFAULT_COLLECTIONS;
         const top = params.top ?? 5;
         const query = normalizeName(params.query);
         const version = services.config.odata_version;
@@ -163,9 +154,14 @@ export function registerSearchUnifiedTool(server: McpServer, services: ServiceCo
               type: 'text',
               text: [
                 `Поиск "${params.query}" завершён. Совпадений: ${capped.length}${hasMore ? ` (показано ${RESULTS_CAP} из ${results.length})` : ''}.`,
-                ...capped.map((h) => `  • [${h.collection}] ${h.name} — ${h.id}${h.match_type === 'core' ? ' (по ядру имени)' : ''}`),
+                ...capped.map(
+                  (h) =>
+                    `  • [${h.collection}] ${h.name} — ${h.id}${h.match_type === 'core' ? ' (по ядру имени)' : ''}`
+                ),
                 skipped.length ? `\nПропущено: ${skipped.join(', ')}` : '',
-              ].filter(Boolean).join('\n'),
+              ]
+                .filter(Boolean)
+                .join('\n'),
             },
           ],
           structuredContent: {

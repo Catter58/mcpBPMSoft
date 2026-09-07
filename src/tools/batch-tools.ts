@@ -12,7 +12,7 @@ import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import type { ServiceContainer } from './init-tool.js';
 import { formatToolError } from '../utils/errors.js';
 import { getTool } from './registry.js';
-import { notInitialized, lookupNotesText, lookupNotesStructured } from './_guards.js';
+import { notInitialized, lookupNotesText, lookupNotesStructured, resolveCollectionName } from './_guards.js';
 import type { ResolvedLookupNote } from '../lookup/lookup-resolver.js';
 import { confirmParam, confirmationRequired, confirmationResponse, previewIdList } from '../utils/confirm.js';
 import { confirmShape, resolvedLookupNoteShape } from './_schemas.js';
@@ -31,7 +31,10 @@ export function registerBatchTools(server: McpServer, services: ServiceContainer
           records: z
             .array(z.record(z.string(), z.unknown()))
             .describe('Массив записей для создания (lookup-поля резолвятся)'),
-          continue_on_error: z.boolean().optional().describe('Не прерывать batch на первой ошибке (Prefer: continue-on-error)'),
+          continue_on_error: z
+            .boolean()
+            .optional()
+            .describe('Не прерывать batch на первой ошибке (Prefer: continue-on-error)'),
         },
         outputSchema: {
           collection: z.string(),
@@ -48,16 +51,23 @@ export function registerBatchTools(server: McpServer, services: ServiceContainer
         if (!services.initialized) return notInitialized();
         try {
           await services.authManager.ensureAuthenticated();
+          const collection = await resolveCollectionName(services, params.collection);
 
           if (params.records.length === 0) {
-            return { content: [{ type: 'text', text: 'Массив записей пуст. Нечего создавать.' }], isError: true };
+            return {
+              content: [{ type: 'text', text: 'Массив записей пуст. Нечего создавать.' }],
+              isError: true,
+            };
           }
 
           const resolvedRecords: Record<string, unknown>[] = [];
           const allNotes: ResolvedLookupNote[] = [];
           for (let i = 0; i < params.records.length; i++) {
             try {
-              const resolved = await services.lookupResolver.resolveDataLookups(params.collection, params.records[i]);
+              const resolved = await services.lookupResolver.resolveDataLookups(
+                collection,
+                params.records[i]
+              );
               resolvedRecords.push(resolved.data);
               allNotes.push(...resolved.notes);
             } catch (error) {
@@ -73,24 +83,25 @@ export function registerBatchTools(server: McpServer, services: ServiceContainer
             }
           }
 
-          const collectionPath = services.odataClient.buildCollectionPath(params.collection);
+          const collectionPath = services.odataClient.buildCollectionPath(collection);
           const batchRequests = resolvedRecords.map((record) => ({
             method: 'POST' as const,
             url: collectionPath,
             body: record,
           }));
 
-          const result = await services.odataClient.executeBatch(batchRequests, params.continue_on_error ?? false);
+          const result = await services.odataClient.executeBatch(
+            batchRequests,
+            params.continue_on_error ?? false
+          );
 
           const succeeded = result.responses
             .map((r, i) => ({ index: i, ...r }))
             .filter((r) => r.status >= 200 && r.status < 300);
-          const failed = result.responses
-            .map((r, i) => ({ index: i, ...r }))
-            .filter((r) => r.status >= 300);
+          const failed = result.responses.map((r, i) => ({ index: i, ...r })).filter((r) => r.status >= 300);
 
           const lines = [
-            `Пакетное создание в ${params.collection}:`,
+            `Пакетное создание в ${collection}:`,
             `  Всего запросов: ${params.records.length}`,
             `  Успешно создано: ${succeeded.length}`,
             `  Ошибок: ${failed.length}`,
@@ -99,14 +110,16 @@ export function registerBatchTools(server: McpServer, services: ServiceContainer
           if (notesLine) lines.push(notesLine);
           if (failed.length > 0) {
             lines.push('', 'Ошибки:');
-            failed.forEach((f) => lines.push(`  #${f.index + 1}: HTTP ${f.status} — ${JSON.stringify(f.body).slice(0, 300)}`));
+            failed.forEach((f) =>
+              lines.push(`  #${f.index + 1}: HTTP ${f.status} — ${JSON.stringify(f.body).slice(0, 300)}`)
+            );
           }
 
           return {
             content: [{ type: 'text', text: lines.join('\n') }],
             isError: failed.length > 0 && succeeded.length === 0,
             structuredContent: {
-              collection: params.collection,
+              collection: collection,
               total: params.records.length,
               succeeded: succeeded.length,
               failed: failed.length,
@@ -157,6 +170,7 @@ export function registerBatchTools(server: McpServer, services: ServiceContainer
         if (!services.initialized) return notInitialized();
         try {
           await services.authManager.ensureAuthenticated();
+          const collection = await resolveCollectionName(services, params.collection);
 
           if (params.updates.length === 0) {
             return { content: [{ type: 'text', text: 'Массив обновлений пуст.' }], isError: true };
@@ -167,11 +181,11 @@ export function registerBatchTools(server: McpServer, services: ServiceContainer
           for (let i = 0; i < params.updates.length; i++) {
             const update = params.updates[i];
             try {
-              const resolved = await services.lookupResolver.resolveDataLookups(params.collection, update.data);
+              const resolved = await services.lookupResolver.resolveDataLookups(collection, update.data);
               allNotes.push(...resolved.notes);
               batchRequests.push({
                 method: 'PATCH',
-                url: services.odataClient.buildRecordPath(params.collection, update.id),
+                url: services.odataClient.buildRecordPath(collection, update.id),
                 body: resolved.data,
               });
             } catch (error) {
@@ -187,17 +201,18 @@ export function registerBatchTools(server: McpServer, services: ServiceContainer
             }
           }
 
-          const result = await services.odataClient.executeBatch(batchRequests, params.continue_on_error ?? false);
+          const result = await services.odataClient.executeBatch(
+            batchRequests,
+            params.continue_on_error ?? false
+          );
 
           const succeeded = result.responses
             .map((r, i) => ({ index: i, ...r }))
             .filter((r) => r.status >= 200 && r.status < 300);
-          const failed = result.responses
-            .map((r, i) => ({ index: i, ...r }))
-            .filter((r) => r.status >= 300);
+          const failed = result.responses.map((r, i) => ({ index: i, ...r })).filter((r) => r.status >= 300);
 
           const lines = [
-            `Пакетное обновление в ${params.collection}:`,
+            `Пакетное обновление в ${collection}:`,
             `  Всего запросов: ${params.updates.length}`,
             `  Успешно обновлено: ${succeeded.length}`,
             `  Ошибок: ${failed.length}`,
@@ -207,7 +222,9 @@ export function registerBatchTools(server: McpServer, services: ServiceContainer
           if (failed.length > 0) {
             lines.push('', 'Ошибки:');
             failed.forEach((f) =>
-              lines.push(`  #${f.index + 1} (id=${params.updates[f.index]?.id}): HTTP ${f.status} — ${JSON.stringify(f.body).slice(0, 300)}`)
+              lines.push(
+                `  #${f.index + 1} (id=${params.updates[f.index]?.id}): HTTP ${f.status} — ${JSON.stringify(f.body).slice(0, 300)}`
+              )
             );
           }
 
@@ -215,7 +232,7 @@ export function registerBatchTools(server: McpServer, services: ServiceContainer
             content: [{ type: 'text', text: lines.join('\n') }],
             isError: failed.length > 0 && succeeded.length === 0,
             structuredContent: {
-              collection: params.collection,
+              collection: collection,
               total: params.updates.length,
               succeeded: succeeded.length,
               failed: failed.length,
@@ -261,6 +278,7 @@ export function registerBatchTools(server: McpServer, services: ServiceContainer
         if (!services.initialized) return notInitialized();
         try {
           await services.authManager.ensureAuthenticated();
+          const collection = await resolveCollectionName(services, params.collection);
           if (params.ids.length === 0) {
             return { content: [{ type: 'text', text: 'Массив ID пуст. Нечего удалять.' }], isError: true };
           }
@@ -268,30 +286,28 @@ export function registerBatchTools(server: McpServer, services: ServiceContainer
           if (confirmationRequired(params)) {
             return confirmationResponse(
               meta.name,
-              [
-                `Будет удалено ${params.ids.length} записей из ${params.collection}:`,
-                previewIdList(params.ids),
-              ],
-              { collection: params.collection, ids: params.ids, count: params.ids.length }
+              [`Будет удалено ${params.ids.length} записей из ${collection}:`, previewIdList(params.ids)],
+              { collection: collection, ids: params.ids, count: params.ids.length }
             );
           }
 
           const batchRequests = params.ids.map((id) => ({
             method: 'DELETE' as const,
-            url: services.odataClient.buildRecordPath(params.collection, id),
+            url: services.odataClient.buildRecordPath(collection, id),
           }));
 
-          const result = await services.odataClient.executeBatch(batchRequests, params.continue_on_error ?? false);
+          const result = await services.odataClient.executeBatch(
+            batchRequests,
+            params.continue_on_error ?? false
+          );
 
           const succeeded = result.responses
             .map((r, i) => ({ index: i, ...r }))
             .filter((r) => r.status >= 200 && r.status < 300);
-          const failed = result.responses
-            .map((r, i) => ({ index: i, ...r }))
-            .filter((r) => r.status >= 300);
+          const failed = result.responses.map((r, i) => ({ index: i, ...r })).filter((r) => r.status >= 300);
 
           const lines = [
-            `Пакетное удаление из ${params.collection}:`,
+            `Пакетное удаление из ${collection}:`,
             `  Всего запросов: ${params.ids.length}`,
             `  Успешно удалено: ${succeeded.length}`,
             `  Ошибок: ${failed.length}`,
@@ -299,7 +315,9 @@ export function registerBatchTools(server: McpServer, services: ServiceContainer
           if (failed.length > 0) {
             lines.push('', 'Ошибки:');
             failed.forEach((f) =>
-              lines.push(`  #${f.index + 1} (id=${params.ids[f.index]}): HTTP ${f.status} — ${JSON.stringify(f.body).slice(0, 300)}`)
+              lines.push(
+                `  #${f.index + 1} (id=${params.ids[f.index]}): HTTP ${f.status} — ${JSON.stringify(f.body).slice(0, 300)}`
+              )
             );
           }
 
@@ -307,7 +325,7 @@ export function registerBatchTools(server: McpServer, services: ServiceContainer
             content: [{ type: 'text', text: lines.join('\n') }],
             isError: failed.length > 0 && succeeded.length === 0,
             structuredContent: {
-              collection: params.collection,
+              collection: collection,
               total: params.ids.length,
               succeeded: succeeded.length,
               failed: failed.length,

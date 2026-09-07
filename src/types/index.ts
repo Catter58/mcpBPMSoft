@@ -78,6 +78,8 @@ export interface EntityProperty {
   lookupCollection?: string;
   /** For lookup fields: display column in target collection */
   lookupDisplayColumn?: string;
+  /** For lookup fields: navigation property name for $expand (v4: FK without 'Id') */
+  lookupNavProperty?: string;
   /** Localized display caption (e.g. Russian name from SysEntitySchemaColumn) */
   caption?: string;
 }

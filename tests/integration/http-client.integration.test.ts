@@ -76,15 +76,13 @@ describe('HttpClient (integration with MSW)', () => {
     const client = new HttpClient(makeCfg());
     client.setAllowedOrigin(ORIGIN);
 
-    const res = await runWithAuth(
-      extractAuthFromHeaders({ BPMCSRF: 't', Cookie: 'CsrfToken=t' }),
-      () =>
-        client.request({
-          method: 'PUT',
-          url: `${ORIGIN}/odata/Contact(1)/Photo`,
-          body: payload,
-          contentKind: 'binary',
-        })
+    const res = await runWithAuth(extractAuthFromHeaders({ BPMCSRF: 't', Cookie: 'CsrfToken=t' }), () =>
+      client.request({
+        method: 'PUT',
+        url: `${ORIGIN}/odata/Contact(1)/Photo`,
+        body: payload,
+        contentKind: 'binary',
+      })
     );
 
     expect(res.status).toBe(204);
@@ -106,15 +104,13 @@ describe('HttpClient (integration with MSW)', () => {
     const client = new HttpClient(makeCfg());
     client.setAllowedOrigin(ORIGIN);
 
-    const res = await runWithAuth(
-      extractAuthFromHeaders({ BPMCSRF: 't', Cookie: 'CsrfToken=t' }),
-      () =>
-        client.request<Buffer>({
-          method: 'GET',
-          url: `${ORIGIN}/odata/Contact(1)/Photo`,
-          contentKind: 'binary',
-          responseType: 'binary',
-        })
+    const res = await runWithAuth(extractAuthFromHeaders({ BPMCSRF: 't', Cookie: 'CsrfToken=t' }), () =>
+      client.request<Buffer>({
+        method: 'GET',
+        url: `${ORIGIN}/odata/Contact(1)/Photo`,
+        contentKind: 'binary',
+        responseType: 'binary',
+      })
     );
 
     expect(Buffer.isBuffer(res.data)).toBe(true);
@@ -170,13 +166,11 @@ describe('HttpClient (integration with MSW)', () => {
     const client = new HttpClient(makeCfg());
     client.setAllowedOrigin(ORIGIN);
 
-    const res = await runWithAuth(
-      extractAuthFromHeaders({ BPMCSRF: 't', Cookie: 'CsrfToken=t' }),
-      () =>
-        client.request<{ value: unknown[] }>({
-          method: 'GET',
-          url: `${ORIGIN}/odata/Contact`,
-        })
+    const res = await runWithAuth(extractAuthFromHeaders({ BPMCSRF: 't', Cookie: 'CsrfToken=t' }), () =>
+      client.request<{ value: unknown[] }>({
+        method: 'GET',
+        url: `${ORIGIN}/odata/Contact`,
+      })
     );
 
     expect(count).toBe(2);
@@ -248,9 +242,9 @@ describe('HttpClient auth resolution', () => {
     const client = new HttpClient(makeCfg());
     client.setAllowedOrigin(ORIGIN);
 
-    await expect(
-      client.request({ method: 'GET', url: `${ORIGIN}/odata/Contact` })
-    ).rejects.toBeInstanceOf(AuthRequiredError);
+    await expect(client.request({ method: 'GET', url: `${ORIGIN}/odata/Contact` })).rejects.toBeInstanceOf(
+      AuthRequiredError
+    );
     expect(called).toBe(false);
   });
 });
@@ -259,8 +253,9 @@ describe('HttpClient redirect SSRF guard', () => {
   it('refuses to follow a cross-origin redirect (no creds leak to other host)', async () => {
     let evilHit = false;
     server.use(
-      http.get(`${ORIGIN}/odata/Contact`, () =>
-        new HttpResponse(null, { status: 302, headers: { Location: 'https://evil.example/steal' } })
+      http.get(
+        `${ORIGIN}/odata/Contact`,
+        () => new HttpResponse(null, { status: 302, headers: { Location: 'https://evil.example/steal' } })
       ),
       http.get('https://evil.example/steal', () => {
         evilHit = true;
@@ -279,16 +274,16 @@ describe('HttpClient redirect SSRF guard', () => {
 
   it('follows a same-origin redirect', async () => {
     server.use(
-      http.get(`${ORIGIN}/odata/Old`, () =>
-        new HttpResponse(null, { status: 302, headers: { Location: `${ORIGIN}/odata/New` } })
+      http.get(
+        `${ORIGIN}/odata/Old`,
+        () => new HttpResponse(null, { status: 302, headers: { Location: `${ORIGIN}/odata/New` } })
       ),
       http.get(`${ORIGIN}/odata/New`, () => HttpResponse.json({ value: [{ Id: 'x' }] }))
     );
     const client = new HttpClient(makeCfg());
     client.setAllowedOrigin(ORIGIN);
-    const res = await runWithAuth(
-      extractAuthFromHeaders({ BPMCSRF: 't', Cookie: 'CsrfToken=t' }),
-      () => client.request<{ value: unknown[] }>({ method: 'GET', url: `${ORIGIN}/odata/Old` })
+    const res = await runWithAuth(extractAuthFromHeaders({ BPMCSRF: 't', Cookie: 'CsrfToken=t' }), () =>
+      client.request<{ value: unknown[] }>({ method: 'GET', url: `${ORIGIN}/odata/Old` })
     );
     expect(res.status).toBe(200);
     expect(res.data).toEqual({ value: [{ Id: 'x' }] });

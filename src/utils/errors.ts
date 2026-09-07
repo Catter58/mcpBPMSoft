@@ -203,7 +203,11 @@ export function parseODataError(body: unknown): string | undefined {
     const message = errorBody.error?.message as unknown;
     if (typeof message === 'string') return message;
     // v3-форма: { message: { lang, value } }
-    if (message && typeof message === 'object' && typeof (message as { value?: unknown }).value === 'string') {
+    if (
+      message &&
+      typeof message === 'object' &&
+      typeof (message as { value?: unknown }).value === 'string'
+    ) {
       return (message as { value: string }).value;
     }
   }
@@ -285,4 +289,28 @@ function defaultNextSteps(httpStatus?: number, collection?: string): string[] {
     'Проверьте параметры вызова и повторите.',
     `При повторении ошибки сверьте имена через bpm_get_schema${collection ? `(${collection})` : ''} или bpm_get_collections.`,
   ];
+}
+
+/** Коды, которыми BPMSoft отвергает саму конструкцию запроса. */
+const QUERY_REJECTED_STATUSES = new Set([400, 405, 501]);
+
+/**
+ * Отличает «сервер не умеет такую конструкцию запроса» от настоящего сбоя.
+ *
+ * Обычный случай — 4xx. Но BPMSoft на некоторых стендах отвечает 200 и рвёт
+ * поток посреди тела (проверено на bpm9: `tolower()`, `in (...)`,
+ * `$apply=groupby` — заголовки 200, затем `other side closed`). Для клиента это
+ * сетевая ошибка со status=0, и без этой проверки каскадные фолбэки (contains
+ * без tolower и т. п.) не срабатывают, а пользователь видит «Сетевая ошибка».
+ */
+export function isQueryUnsupportedError(error: unknown): boolean {
+  const status = (error as { httpStatus?: number } | null)?.httpStatus;
+  // Только те коды, которыми сервер говорит «такой запрос я разобрать не могу».
+  // 401/403 — права, 404 — нет коллекции, 408/429 — время и нагрузка: всё это
+  // не повод переключать режим построения фильтров.
+  if (typeof status === 'number' && QUERY_REJECTED_STATUSES.has(status)) return true;
+  if (typeof status === 'number' && status !== 0) return false;
+
+  const message = error instanceof Error ? error.message : String(error ?? '');
+  return /terminated|other side closed|socket hang up|ECONNRESET|EPIPE/i.test(message);
 }

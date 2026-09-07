@@ -13,17 +13,20 @@
  *   - Generated filters are safe by construction — every identifier is
  *     validated, every value is escaped through escapeODataString.
  *
- * Out of scope:
- *   - Resolving lookup TEXT into UUID. We surface a warning instead and
- *     ask the caller to use bpm_lookup_value first. Doing it here would
- *     pull LookupResolver into the compile path; the criteria-DSL
- *     contract keeps that dependency optional.
+ * Lookup-колонки со строковым значением компилируются через навигацию:
+ * {field: 'Тип', op: 'равно', value: 'Сотрудник'} → `Type/Name eq 'Сотрудник'`.
+ * Это снимает с модели обязанность сначала доставать UUID и убирает целый класс
+ * ошибок lookup_ambiguous. Проверено на стенде: фильтр и сортировка по
+ * навигационному пути работают. UUID в значении по-прежнему сравнивается с
+ * самой FK-колонкой — так дешевле для сервера.
  */
 
 import type { MetadataManager } from '../metadata/metadata-manager.js';
 import { UnknownFieldError } from './errors.js';
 import { containsExpression, escapeODataString, isSafeIdentifier } from './odata.js';
 import { normalizeName } from './name-normalize.js';
+import { getDisplayColumn } from './display.js';
+import { calendarRange, resolveTimeZone, type CalendarPeriod } from './datetime.js';
 
 export interface Criterion {
   /** Field name, caption ("Город") or navigation path ("Account.City"). */
@@ -42,6 +45,8 @@ export interface CompileOptions {
   odataVersion: 3 | 4;
   /** How to combine multiple criteria. Default 'and'. */
   join?: 'and' | 'or';
+  /** Часовой пояс пользователя для «сегодня»/«вчера» (IANA). */
+  timeZone?: string;
 }
 
 export interface UsedField {
@@ -74,61 +79,96 @@ type CanonicalOp =
   | 'in_last_hours'
   | 'between'
   | 'not_contains'
-  | 'similar_to';
+  | 'similar_to'
+  | CalendarPeriod;
 
 const OP_ALIASES: Record<string, CanonicalOp> = {
   // eq
-  'равно': 'eq',
-  'eq': 'eq',
+  равно: 'eq',
+  eq: 'eq',
   // ne
   'не равно': 'ne',
-  'ne': 'ne',
+  ne: 'ne',
   // gt / ge / lt / le
-  'больше': 'gt',
-  'gt': 'gt',
+  больше: 'gt',
+  gt: 'gt',
   'больше или равно': 'ge',
-  'ge': 'ge',
-  'меньше': 'lt',
-  'lt': 'lt',
+  ge: 'ge',
+  меньше: 'lt',
+  lt: 'lt',
   'меньше или равно': 'le',
-  'le': 'le',
+  le: 'le',
   // contains / startswith / endswith
-  'содержит': 'contains',
-  'contains': 'contains',
+  содержит: 'contains',
+  contains: 'contains',
   'начинается с': 'startswith',
-  'startswith': 'startswith',
+  startswith: 'startswith',
   'заканчивается на': 'endswith',
-  'endswith': 'endswith',
+  endswith: 'endswith',
   // in
   'в списке': 'in',
-  'in': 'in',
+  in: 'in',
   // null
-  'пусто': 'is_null',
-  'is_null': 'is_null',
+  пусто: 'is_null',
+  is_null: 'is_null',
   'не пусто': 'is_not_null',
-  'is_not_null': 'is_not_null',
+  is_not_null: 'is_not_null',
   // date windows
   'за последние n дней': 'in_last_days',
-  'in_last_days': 'in_last_days',
+  in_last_days: 'in_last_days',
   'за последние n часов': 'in_last_hours',
-  'in_last_hours': 'in_last_hours',
+  in_last_hours: 'in_last_hours',
   // range
-  'между': 'between',
-  'between': 'between',
+  между: 'between',
+  between: 'between',
   // not contains
   'не содержит': 'not_contains',
-  'not_contains': 'not_contains',
+  not_contains: 'not_contains',
   // fuzzy similarity (кавычки/орг-формы/регистр игнорируются)
   'похоже на': 'similar_to',
-  'similar_to': 'similar_to',
+  similar_to: 'similar_to',
+  // календарные периоды в часовом поясе пользователя, а не в UTC
+  сегодня: 'today',
+  today: 'today',
+  вчера: 'yesterday',
+  yesterday: 'yesterday',
+  завтра: 'tomorrow',
+  tomorrow: 'tomorrow',
+  'на этой неделе': 'this_week',
+  'эта неделя': 'this_week',
+  this_week: 'this_week',
+  'на прошлой неделе': 'last_week',
+  'прошлая неделя': 'last_week',
+  last_week: 'last_week',
+  'в этом месяце': 'this_month',
+  'этот месяц': 'this_month',
+  this_month: 'this_month',
+  'в прошлом месяце': 'last_month',
+  'прошлый месяц': 'last_month',
+  last_month: 'last_month',
+  'в этом квартале': 'this_quarter',
+  'этот квартал': 'this_quarter',
+  this_quarter: 'this_quarter',
+  'в этом году': 'this_year',
+  'этот год': 'this_year',
+  this_year: 'this_year',
 };
+
+const CALENDAR_PERIODS: CalendarPeriod[] = [
+  'today',
+  'yesterday',
+  'tomorrow',
+  'this_week',
+  'last_week',
+  'this_month',
+  'last_month',
+  'this_quarter',
+  'this_year',
+];
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-export async function compileFilter(
-  criteria: Criterion[],
-  options: CompileOptions
-): Promise<CompileResult> {
+export async function compileFilter(criteria: Criterion[], options: CompileOptions): Promise<CompileResult> {
   if (!Array.isArray(criteria) || criteria.length === 0) {
     return { filter: '', used_fields: [], warnings: [] };
   }
@@ -139,28 +179,63 @@ export async function compileFilter(
 
   for (const criterion of criteria) {
     if (!criterion || typeof criterion.field !== 'string' || typeof criterion.op !== 'string') {
-      throw new Error(
-        'Каждый critera должен быть объектом вида {field: string, op: string, value?: any}.'
-      );
+      throw new Error('Каждый critera должен быть объектом вида {field: string, op: string, value?: any}.');
     }
 
     const op = canonicalOp(criterion.op);
     const resolved = await resolveFieldPath(criterion.field, options);
 
-    used.push({ input: criterion.field, resolved: resolved.path, caption: resolved.caption });
-    if (resolved.lookupWarning) warnings.push(resolved.lookupWarning);
+    // Lookup + текстовое значение → сравниваем с отображаемой колонкой справочника
+    // (Type/Name), а не с FK-колонкой, куда текст всё равно не подставить.
+    const byDisplayName = Boolean(resolved.displayPath) && isTextComparison(op, criterion);
+    const path = byDisplayName ? (resolved.displayPath as string) : resolved.path;
 
-    const expr = buildExpression(resolved.path, op, criterion, options.odataVersion, resolved.isLookup);
+    used.push({ input: criterion.field, resolved: path, caption: resolved.caption });
+    if (resolved.lookupWarning && !byDisplayName) warnings.push(resolved.lookupWarning);
+
+    const expr = buildExpression(
+      path,
+      op,
+      criterion,
+      options.odataVersion,
+      resolved.isLookup && !byDisplayName,
+      options.timeZone
+    );
     expressions.push(expr);
   }
 
   const join = options.join === 'or' ? ' or ' : ' and ';
   // Wrap individual expressions in parens only when there's more than one,
   // to keep simple cases readable while preserving precedence.
-  const filter =
-    expressions.length === 1 ? expressions[0] : expressions.map((e) => `(${e})`).join(join);
+  const filter = expressions.length === 1 ? expressions[0] : expressions.map((e) => `(${e})`).join(join);
 
   return { filter, used_fields: used, warnings };
+}
+
+/**
+ * Стоит ли сравнивать lookup с отображаемой колонкой справочника: значение —
+ * текст, а не UUID, и оператор строковый. UUID и is_null остаются на FK-колонке.
+ */
+function isTextComparison(op: CanonicalOp, criterion: Criterion): boolean {
+  if (CALENDAR_PERIODS.includes(op as CalendarPeriod)) return false;
+  const textOps: CanonicalOp[] = [
+    'eq',
+    'ne',
+    'contains',
+    'not_contains',
+    'startswith',
+    'endswith',
+    'similar_to',
+    'in',
+  ];
+  if (!textOps.includes(op)) return false;
+
+  const isText = (v: unknown) => typeof v === 'string' && v.length > 0 && !UUID_RE.test(v);
+
+  if (op === 'in') {
+    return Array.isArray(criterion.value) && criterion.value.length > 0 && criterion.value.every(isText);
+  }
+  return isText(criterion.value);
 }
 
 function canonicalOp(input: string): CanonicalOp {
@@ -195,6 +270,8 @@ interface ResolvedField {
   isLookup: boolean;
   /** Optional warning about lookup-by-text. */
   lookupWarning?: string;
+  /** Путь к отображаемой колонке справочника ('City/Name') — для сравнения по тексту. */
+  displayPath?: string;
 }
 
 async function resolveFieldPath(query: string, options: CompileOptions): Promise<ResolvedField> {
@@ -213,6 +290,7 @@ async function resolveFieldPath(query: string, options: CompileOptions): Promise
   let firstCaption: string | undefined;
   let isLookup = false;
   let lookupWarning: string | undefined;
+  let displayPath: string | undefined;
 
   for (let i = 0; i < segments.length; i++) {
     const seg = segments[i];
@@ -284,6 +362,18 @@ async function resolveFieldPath(query: string, options: CompileOptions): Promise
         lookupWarning =
           `Поле "${query}" является lookup; передайте UUID или используйте bpm_lookup_value для ` +
           `получения UUID по тексту.`;
+
+        const meta = await options.metadataManager.getEntityMetadata(currentCollection);
+        const prop = meta.properties.find((p) => p.name === fieldName);
+        const nav =
+          prop?.lookupNavProperty ??
+          (options.odataVersion === 4 && fieldName.endsWith('Id') ? fieldName.slice(0, -2) : fieldName);
+        const display =
+          (await getDisplayColumn(options.metadataManager, lookupInfo.lookupCollection)) ??
+          lookupInfo.displayColumn;
+        if (isSafeIdentifier(nav) && isSafeIdentifier(display)) {
+          displayPath = [...resolvedSegments.slice(0, -1), nav, display].join('/');
+        }
       }
     }
   }
@@ -293,6 +383,7 @@ async function resolveFieldPath(query: string, options: CompileOptions): Promise
     caption: firstCaption,
     isLookup,
     lookupWarning,
+    displayPath,
   };
 }
 
@@ -301,8 +392,18 @@ function buildExpression(
   op: CanonicalOp,
   criterion: Criterion,
   odataVersion: 3 | 4,
-  isLookup: boolean
+  isLookup: boolean,
+  timeZone?: string
 ): string {
+  if (CALENDAR_PERIODS.includes(op as CalendarPeriod)) {
+    // Полуинтервал [from, to): так последняя секунда суток не теряется.
+    const range = calendarRange(op as CalendarPeriod, resolveTimeZone(timeZone));
+    return (
+      `${fieldPath} ge ${dateTimeLiteral(range.from, odataVersion)} and ` +
+      `${fieldPath} lt ${dateTimeLiteral(range.to, odataVersion)}`
+    );
+  }
+
   switch (op) {
     case 'eq':
     case 'ne':
@@ -313,18 +414,17 @@ function buildExpression(
       return `${fieldPath} ${op} ${literalize(criterion.value, odataVersion, isLookup)}`;
 
     case 'contains':
-      return containsExpression(fieldPath, lowerValue(criterion.value), odataVersion, { caseInsensitive: true });
+      return containsExpression(fieldPath, String(criterion.value ?? ''), odataVersion, {
+        caseInsensitive: true,
+      });
 
     case 'not_contains':
-      return `not ${containsExpression(fieldPath, lowerValue(criterion.value), odataVersion, { caseInsensitive: true })}`;
+      return `not ${containsExpression(fieldPath, String(criterion.value ?? ''), odataVersion, { caseInsensitive: true })}`;
 
     case 'similar_to':
-      return containsExpression(
-        fieldPath,
-        normalizeName(String(criterion.value ?? '')).core,
-        odataVersion,
-        { caseInsensitive: true }
-      );
+      return containsExpression(fieldPath, normalizeName(String(criterion.value ?? '')).core, odataVersion, {
+        caseInsensitive: true,
+      });
 
     case 'startswith':
       return `startswith(${fieldPath}, ${stringLiteral(criterion.value)})`;
@@ -336,9 +436,7 @@ function buildExpression(
       if (!Array.isArray(criterion.value) || criterion.value.length === 0) {
         throw new Error(`Оператор "in" требует value=массив с минимум одним элементом.`);
       }
-      const parts = criterion.value.map(
-        (v) => `${fieldPath} eq ${literalize(v, odataVersion, isLookup)}`
-      );
+      const parts = criterion.value.map((v) => `${fieldPath} eq ${literalize(v, odataVersion, isLookup)}`);
       return parts.length === 1 ? parts[0] : `(${parts.join(' or ')})`;
     }
 
@@ -368,6 +466,9 @@ function buildExpression(
       const hi = literalize(criterion.value_to, odataVersion, isLookup);
       return `${fieldPath} ge ${lo} and ${fieldPath} le ${hi}`;
     }
+
+    default:
+      throw new Error(`Оператор "${op}" не поддерживается.`);
   }
 }
 
@@ -400,10 +501,6 @@ function literalize(value: unknown, odataVersion: 3 | 4, isLookup: boolean): str
 
   // Fallback — toString, escaped as string. Better than crashing.
   return stringLiteral(String(value));
-}
-
-function lowerValue(value: unknown): string {
-  return String(value ?? '').toLowerCase();
 }
 
 function stringLiteral(value: unknown): string {
