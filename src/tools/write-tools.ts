@@ -14,10 +14,19 @@ import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import type { ServiceContainer } from './init-tool.js';
 import { formatToolError, LookupResolutionError } from '../utils/errors.js';
 import { getTool } from './registry.js';
-import { notInitialized, lookupNotesText, lookupNotesStructured, resolveCollectionName } from './_guards.js';
+import {
+  notInitialized,
+  lookupNotesText,
+  lookupNotesStructured,
+  resolveCollectionName,
+  resolveRecordId,
+  compileCriteria,
+  combineFilters,
+} from './_guards.js';
 import type { ResolvedLookupNote } from '../lookup/lookup-resolver.js';
 import { confirmParam, confirmationRequired, confirmationResponse, previewIdList } from '../utils/confirm.js';
-import { confirmShape, recordShape, resolvedLookupNoteShape } from './_schemas.js';
+import { confirmShape, recordShape, resolvedLookupNoteShape, criterionSchema } from './_schemas.js';
+import type { Criterion } from '../utils/filter-compiler.js';
 
 function formatLookupAmbiguity(error: LookupResolutionError): CallToolResult {
   return {
@@ -140,7 +149,9 @@ export function registerWriteTools(server: McpServer, services: ServiceContainer
         description: meta.description,
         inputSchema: {
           collection: z.string().describe('Имя коллекции (EntitySet)'),
-          id: z.string().describe('UUID записи для обновления'),
+          id: z
+            .string()
+            .describe('UUID записи для обновления или её название (Name/Title) — Id сервер найдёт сам'),
           data: z
             .record(z.string(), z.unknown())
             .describe('Поля для обновления. Lookup-поля с текстовыми значениями разрешаются автоматически.'),
@@ -159,6 +170,7 @@ export function registerWriteTools(server: McpServer, services: ServiceContainer
         try {
           await services.authManager.ensureAuthenticated();
           const collection = await resolveCollectionName(services, params.collection);
+          const { id } = await resolveRecordId(services, collection, params.id);
 
           let resolvedData: Record<string, unknown>;
           let notes: ResolvedLookupNote[];
@@ -173,7 +185,7 @@ export function registerWriteTools(server: McpServer, services: ServiceContainer
             throw error;
           }
 
-          const updated = await services.odataClient.updateRecord(collection, params.id, resolvedData, {
+          const updated = await services.odataClient.updateRecord(collection, id, resolvedData, {
             returnRepresentation: true,
           });
 
@@ -183,7 +195,7 @@ export function registerWriteTools(server: McpServer, services: ServiceContainer
               {
                 type: 'text',
                 text: [
-                  `Запись ${collection}(${params.id}) успешно обновлена.`,
+                  `Запись ${collection}(${id}) успешно обновлена.`,
                   `Обновлённые поля: ${Object.keys(resolvedData).join(', ')}`,
                   updated ? `Состояние записи после обновления:\n${JSON.stringify(updated, null, 2)}` : '',
                   notesLine ?? '',
@@ -194,7 +206,7 @@ export function registerWriteTools(server: McpServer, services: ServiceContainer
             ],
             structuredContent: {
               collection: collection,
-              id: params.id,
+              id,
               updated_fields: Object.keys(resolvedData),
               ...(updated ? { record: updated as Record<string, unknown> } : {}),
               ...(notes.length ? { resolved_lookups: lookupNotesStructured(notes) } : {}),
@@ -221,7 +233,9 @@ export function registerWriteTools(server: McpServer, services: ServiceContainer
         description: meta.description,
         inputSchema: {
           collection: z.string().describe('Имя коллекции (EntitySet)'),
-          id: z.string().describe('UUID записи для удаления'),
+          id: z
+            .string()
+            .describe('UUID записи для удаления или её название (Name/Title) — Id сервер найдёт сам'),
           confirm: confirmParam,
         },
         outputSchema: {
@@ -237,20 +251,21 @@ export function registerWriteTools(server: McpServer, services: ServiceContainer
         try {
           await services.authManager.ensureAuthenticated();
           const collection = await resolveCollectionName(services, params.collection);
+          const { id } = await resolveRecordId(services, collection, params.id);
 
           if (confirmationRequired(params)) {
-            const record = await services.odataClient.getRecord(collection, params.id);
+            const record = await services.odataClient.getRecord(collection, id);
             return confirmationResponse(
               meta.name,
-              [`Будет удалена запись ${collection}(${params.id}):`, JSON.stringify(record, null, 2)],
-              { collection: collection, id: params.id }
+              [`Будет удалена запись ${collection}(${id}):`, JSON.stringify(record, null, 2)],
+              { collection: collection, id }
             );
           }
 
-          await services.odataClient.deleteRecord(collection, params.id);
+          await services.odataClient.deleteRecord(collection, id);
           return {
-            content: [{ type: 'text', text: `Запись ${collection}(${params.id}) успешно удалена.` }],
-            structuredContent: { collection: collection, id: params.id, deleted: true },
+            content: [{ type: 'text', text: `Запись ${collection}(${id}) успешно удалена.` }],
+            structuredContent: { collection: collection, id, deleted: true },
           };
         } catch (error) {
           const toolError = formatToolError(error, params.collection);
@@ -273,13 +288,26 @@ export function registerWriteTools(server: McpServer, services: ServiceContainer
         description: meta.description,
         inputSchema: {
           collection: z.string().describe('Имя коллекции (EntitySet)'),
-          filter: z.string().describe('OData $filter — обязателен, не должен быть пустым'),
+          filter: z.string().optional().describe('OData $filter (или criteria)'),
+          criteria: z
+            .array(criterionSchema)
+            .optional()
+            .describe(
+              'Условие как в bpm_search_records — сервер сам соберёт $filter (объединяется с filter через and)'
+            ),
+          join: z
+            .enum(['and', 'or'])
+            .optional()
+            .describe('Как соединять criteria: and (по умолчанию) или or'),
           data: z.record(z.string(), z.unknown()).describe('Поля для обновления (lookup резолвятся)'),
           expected_count: z
             .number()
             .int()
             .positive()
-            .describe('Сколько записей должен вернуть фильтр; иначе откат'),
+            .optional()
+            .describe(
+              'Сколько записей должно совпасть; при несовпадении операция отменяется. Без него — только превью с числом найденных'
+            ),
         },
         outputSchema: {
           code: z.string().optional(),
@@ -287,6 +315,8 @@ export function registerWriteTools(server: McpServer, services: ServiceContainer
           succeeded: z.array(z.string()).optional(),
           failed: z.array(z.object({ id: z.string(), error: z.string() })).optional(),
           found: z.number().int().optional(),
+          filter: z.string().optional(),
+          ids: z.array(z.string()).optional(),
           expected: z.number().int().optional(),
           resolved_lookups: z.array(resolvedLookupNoteShape).optional(),
         },
@@ -297,12 +327,52 @@ export function registerWriteTools(server: McpServer, services: ServiceContainer
         try {
           await services.authManager.ensureAuthenticated();
           const collection = await resolveCollectionName(services, params.collection);
-          if (!params.filter.trim()) {
-            return { content: [{ type: 'text', text: 'filter не может быть пустым' }], isError: true };
+          const compiled = params.criteria?.length
+            ? await compileCriteria(services, collection, params.criteria as Criterion[], params.join)
+            : undefined;
+          const filter = combineFilters(params.filter, compiled?.filter);
+          if (!filter) {
+            return {
+              content: [
+                {
+                  type: 'text',
+                  text: 'Передайте filter или criteria: без условия массовая операция запрещена.',
+                },
+              ],
+              isError: true,
+            };
+          }
+
+          // Без expected_count ничего не меняем: показываем, что найдено, и число для повтора.
+          if (params.expected_count === undefined) {
+            const found = await services.odataClient.getRecords<Record<string, unknown>>(collection, {
+              $filter: filter,
+              $select: 'Id',
+              $top: 1000,
+            });
+            const ids = found.value.map((rec) => String(rec.Id ?? rec.id));
+            return {
+              content: [
+                {
+                  type: 'text',
+                  text: [
+                    `По условию найдено ${ids.length}${ids.length === 1000 ? '+' : ''} записей в ${collection}: ${previewIdList(ids)}`,
+                    `Ничего не изменено. Чтобы выполнить, повторите вызов с expected_count=${ids.length}.`,
+                  ].join('\n'),
+                },
+              ],
+              structuredContent: {
+                code: 'expected_count_required',
+                collection,
+                filter,
+                found: ids.length,
+                ids,
+              },
+            };
           }
 
           const records = await services.odataClient.getRecords<Record<string, unknown>>(collection, {
-            $filter: params.filter,
+            $filter: filter,
             $select: 'Id',
             $top: Math.max(params.expected_count + 1, 100),
           });
@@ -391,12 +461,25 @@ export function registerWriteTools(server: McpServer, services: ServiceContainer
         description: meta.description,
         inputSchema: {
           collection: z.string().describe('Имя коллекции (EntitySet)'),
-          filter: z.string().describe('OData $filter — обязателен'),
+          filter: z.string().optional().describe('OData $filter (или criteria)'),
+          criteria: z
+            .array(criterionSchema)
+            .optional()
+            .describe(
+              'Условие как в bpm_search_records — сервер сам соберёт $filter (объединяется с filter через and)'
+            ),
+          join: z
+            .enum(['and', 'or'])
+            .optional()
+            .describe('Как соединять criteria: and (по умолчанию) или or'),
           expected_count: z
             .number()
             .int()
             .positive()
-            .describe('Сколько записей должно совпадать; иначе откат'),
+            .optional()
+            .describe(
+              'Сколько записей должно совпасть; при несовпадении операция отменяется. Без него — только превью с числом найденных'
+            ),
           confirm: confirmParam,
         },
         outputSchema: {
@@ -417,12 +500,52 @@ export function registerWriteTools(server: McpServer, services: ServiceContainer
         try {
           await services.authManager.ensureAuthenticated();
           const collection = await resolveCollectionName(services, params.collection);
-          if (!params.filter.trim()) {
-            return { content: [{ type: 'text', text: 'filter не может быть пустым' }], isError: true };
+          const compiled = params.criteria?.length
+            ? await compileCriteria(services, collection, params.criteria as Criterion[], params.join)
+            : undefined;
+          const filter = combineFilters(params.filter, compiled?.filter);
+          if (!filter) {
+            return {
+              content: [
+                {
+                  type: 'text',
+                  text: 'Передайте filter или criteria: без условия массовая операция запрещена.',
+                },
+              ],
+              isError: true,
+            };
+          }
+
+          // Без expected_count ничего не меняем: показываем, что найдено, и число для повтора.
+          if (params.expected_count === undefined) {
+            const found = await services.odataClient.getRecords<Record<string, unknown>>(collection, {
+              $filter: filter,
+              $select: 'Id',
+              $top: 1000,
+            });
+            const ids = found.value.map((rec) => String(rec.Id ?? rec.id));
+            return {
+              content: [
+                {
+                  type: 'text',
+                  text: [
+                    `По условию найдено ${ids.length}${ids.length === 1000 ? '+' : ''} записей в ${collection}: ${previewIdList(ids)}`,
+                    `Ничего не изменено. Чтобы выполнить, повторите вызов с expected_count=${ids.length}.`,
+                  ].join('\n'),
+                },
+              ],
+              structuredContent: {
+                code: 'expected_count_required',
+                collection,
+                filter,
+                found: ids.length,
+                ids,
+              },
+            };
           }
 
           const records = await services.odataClient.getRecords<Record<string, unknown>>(collection, {
-            $filter: params.filter,
+            $filter: filter,
             $select: 'Id',
             $top: Math.max(params.expected_count + 1, 100),
           });
@@ -453,7 +576,7 @@ export function registerWriteTools(server: McpServer, services: ServiceContainer
                 `По фильтру найдено ${ids.length} записей в ${collection}, которые будут удалены:`,
                 previewIdList(ids),
               ],
-              { collection: collection, filter: params.filter, count: ids.length, ids }
+              { collection: collection, filter, count: ids.length, ids }
             );
           }
 

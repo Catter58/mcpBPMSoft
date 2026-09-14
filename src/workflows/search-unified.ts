@@ -13,6 +13,7 @@ import { formatToolError, isQueryUnsupportedError } from '../utils/errors.js';
 import { getTool } from '../tools/registry.js';
 import { notInitialized } from '../tools/_guards.js';
 import { containsExpression } from '../utils/odata.js';
+import { getDisplayColumn } from '../utils/display.js';
 import { isTolowerSupported, markTolowerUnsupported } from '../utils/server-capabilities.js';
 import { normalizeName } from '../utils/name-normalize.js';
 import type { ODataVersion } from '../types/index.js';
@@ -36,18 +37,19 @@ interface CollectionFetcher {
  */
 async function fetchContains(
   fetcher: CollectionFetcher,
+  column: string,
   value: string,
   version: ODataVersion
 ): Promise<Array<Record<string, unknown>>> {
   if (isTolowerSupported()) {
     try {
-      return await fetcher(containsExpression('Name', value, version, { caseInsensitive: true }));
+      return await fetcher(containsExpression(column, value, version, { caseInsensitive: true }));
     } catch (error) {
       if (!isQueryUnsupportedError(error)) throw error;
       markTolowerUnsupported();
     }
   }
-  return fetcher(containsExpression('Name', value, version));
+  return fetcher(containsExpression(column, value, version));
 }
 
 export function registerSearchUnifiedTool(server: McpServer, services: ServiceContainer): void {
@@ -113,27 +115,29 @@ export function registerSearchUnifiedTool(server: McpServer, services: ServiceCo
             skipped.push(coll);
             continue;
           }
+          // Не у всех объектов колонка называется Name: у Lead это LeadName, у Opportunity — Title.
+          const column = (await getDisplayColumn(services.metadataManager, coll)) ?? 'Name';
           try {
             const fetcher: CollectionFetcher = async (filter) => {
               const response = await services.odataClient.getRecords<Record<string, unknown>>(coll, {
                 $filter: filter,
                 $top: top,
-                $select: 'Id,Name',
+                $select: `Id,${column}`,
               });
               return response.value;
             };
 
             let matchType: 'contains' | 'core' = 'contains';
-            let records = await fetchContains(fetcher, query.normalized, version);
+            let records = await fetchContains(fetcher, column, query.normalized, version);
             if (records.length === 0 && query.core !== query.normalized) {
               matchType = 'core';
-              records = await fetchContains(fetcher, query.core, version);
+              records = await fetchContains(fetcher, column, query.core, version);
             }
 
             const hits = records.map((rec) => ({
               collection: coll,
               id: String(rec.Id ?? rec.id ?? ''),
-              name: String(rec.Name ?? ''),
+              name: String(rec[column] ?? ''),
               match_type: matchType,
             }));
             results.push(...hits);

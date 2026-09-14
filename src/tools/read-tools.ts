@@ -13,20 +13,21 @@ import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import type { ServiceContainer } from './init-tool.js';
 import { formatToolError } from '../utils/errors.js';
 import { getTool } from './registry.js';
-import { notInitialized } from './_guards.js';
+import { notInitialized, resolveRecordId, compileCriteria, combineFilters } from './_guards.js';
 import { resolveCollectionName } from './_guards.js';
 import { compileFilter, type Criterion } from '../utils/filter-compiler.js';
 import { isQueryUnsupportedError } from '../utils/errors.js';
 import { markTolowerUnsupported } from '../utils/server-capabilities.js';
 import { renderRecordsText, type RenderFormat } from '../utils/render.js';
 import { decodeCursor, buildNextCursor, type CursorState } from '../utils/cursor.js';
-import { paginationShape, recordShape } from './_schemas.js';
+import { paginationShape, recordShape, criterionSchema } from './_schemas.js';
 import {
   resolveSelect,
   getRecordsWithLookupNames,
   getRecordWithLookupNames,
   planLookupExpand,
   ALL_COLUMNS,
+  resolveOrderBy,
 } from '../utils/display.js';
 
 const DEFAULT_TOP = 100;
@@ -160,13 +161,14 @@ export function registerReadTools(server: McpServer, services: ServiceContainer)
           const maxRecords = params.max_records ?? DEFAULT_MAX_RECORDS;
           const autoPaginate = params.auto_paginate ?? false;
           const effectiveSelect = await resolveSelect(services.metadataManager, collection, select);
+          const effectiveOrderBy = await resolveOrderBy(services.metadataManager, collection, orderby);
 
           const query = {
             $filter: filter,
             $select: effectiveSelect,
             $top: top,
             $skip: skip,
-            $orderby: orderby,
+            $orderby: effectiveOrderBy,
             $expand: expand,
             $count: count,
           };
@@ -220,6 +222,15 @@ export function registerReadTools(server: McpServer, services: ServiceContainer)
           };
         } catch (error) {
           const toolError = formatToolError(error, params.collection);
+          // Стенд оборвал ответ на ручном $filter (на bpm9 так ведут себя `XxxId eq null`, `tolower()`,
+          // `in`): criteria-путь собирает совместимые конструкции сам.
+          if (params.filter && isQueryUnsupportedError(error)) {
+            toolError.next_steps = [
+              'Сервер не разобрал такой $filter и оборвал ответ. Передайте условие через bpm_search_records ' +
+                '(criteria) — сервер соберёт совместимый фильтр сам.',
+              ...(toolError.next_steps ?? []),
+            ];
+          }
           return {
             content: [{ type: 'text', text: JSON.stringify(toolError, null, 2) }],
             isError: true,
@@ -239,7 +250,7 @@ export function registerReadTools(server: McpServer, services: ServiceContainer)
         description: meta.description,
         inputSchema: {
           collection: z.string().describe('Имя коллекции (EntitySet)'),
-          id: z.string().describe('UUID записи'),
+          id: z.string().describe('UUID записи или её название (Name/Title) — Id сервер найдёт сам'),
           select: z.string().optional().describe(SELECT_DESCRIPTION),
           resolve_lookups: z.boolean().optional().describe(RESOLVE_LOOKUPS_DESCRIPTION),
           expand: z.string().optional().describe('Развернуть связанные сущности'),
@@ -258,11 +269,12 @@ export function registerReadTools(server: McpServer, services: ServiceContainer)
 
           const collection = await resolveCollectionName(services, params.collection);
           const effectiveSelect = await resolveSelect(services.metadataManager, collection, params.select);
+          const { id } = await resolveRecordId(services, collection, params.id);
 
           const record = await getRecordWithLookupNames(
             lookupDeps(services),
             collection,
-            params.id,
+            id,
             { $select: effectiveSelect, $expand: params.expand },
             { resolveLookups: params.resolve_lookups }
           );
@@ -271,10 +283,10 @@ export function registerReadTools(server: McpServer, services: ServiceContainer)
             content: [
               {
                 type: 'text',
-                text: `Запись ${collection}(${params.id}):\n${JSON.stringify(record, null, 2)}`,
+                text: `Запись ${collection}(${id}):\n${JSON.stringify(record, null, 2)}`,
               },
             ],
-            structuredContent: { collection, id: params.id, record },
+            structuredContent: { collection, id, record },
           };
         } catch (error) {
           const toolError = formatToolError(error, params.collection);
@@ -298,6 +310,16 @@ export function registerReadTools(server: McpServer, services: ServiceContainer)
         inputSchema: {
           collection: z.string().describe('Имя коллекции (EntitySet)'),
           filter: z.string().optional().describe('OData $filter выражение'),
+          criteria: z
+            .array(criterionSchema)
+            .optional()
+            .describe(
+              'Критерии как в bpm_search_records — сервер сам соберёт $filter (объединяется с filter через and)'
+            ),
+          join: z
+            .enum(['and', 'or'])
+            .optional()
+            .describe('Как соединять criteria: and (по умолчанию) или or'),
         },
         outputSchema: {
           collection: z.string(),
@@ -312,16 +334,20 @@ export function registerReadTools(server: McpServer, services: ServiceContainer)
           await services.authManager.ensureAuthenticated();
 
           const collection = await resolveCollectionName(services, params.collection);
-          const count = await services.odataClient.getCount(collection, params.filter);
+          const compiled = params.criteria?.length
+            ? await compileCriteria(services, collection, params.criteria as Criterion[], params.join)
+            : undefined;
+          const filter = combineFilters(params.filter, compiled?.filter);
+          const count = await services.odataClient.getCount(collection, filter);
 
           return {
             content: [
               {
                 type: 'text',
-                text: `Количество записей в ${collection}${params.filter ? ` (фильтр: ${params.filter})` : ''}: ${count}`,
+                text: `Количество записей в ${collection}${filter ? ` (фильтр: ${filter})` : ''}: ${count}`,
               },
             ],
-            structuredContent: { collection, filter: params.filter, count },
+            structuredContent: { collection, filter, count },
           };
         } catch (error) {
           const toolError = formatToolError(error, params.collection);
@@ -337,17 +363,6 @@ export function registerReadTools(server: McpServer, services: ServiceContainer)
   // bpm_search_records
   {
     const meta = getTool('bpm_search_records');
-    const criterionSchema = z.object({
-      field: z.string().describe('Имя поля, caption или путь навигации (например "Account.City")'),
-      op: z
-        .string()
-        .describe(
-          'Оператор: равно/eq, не равно/ne, больше/gt, больше или равно/ge, меньше/lt, меньше или равно/le, содержит/contains (регистронезависимо), не содержит/not_contains, начинается с/startswith, заканчивается на/endswith, в списке/in, пусто/is_null, не пусто/is_not_null, за последние N дней/in_last_days, за последние N часов/in_last_hours, между/between, похоже на/similar_to (нечёткий: кавычки, орг-формы АО/ООО/... и регистр игнорируются)'
-        ),
-      value: z.unknown().optional().describe('Значение (отсутствует для is_null/is_not_null)'),
-      value_to: z.unknown().optional().describe('Верхняя граница для оператора between'),
-    });
-
     server.registerTool(
       meta.name,
       {
@@ -424,6 +439,7 @@ export function registerReadTools(server: McpServer, services: ServiceContainer)
             join: params.join,
             // «сегодня» считается в поясе пользователя, а не сервера
             timeZone: await userTimeZone(services),
+            currentUser: services.currentUser,
           };
           let compiled = await compileFilter(params.criteria as Criterion[], compileOptions);
 
@@ -437,7 +453,7 @@ export function registerReadTools(server: McpServer, services: ServiceContainer)
             $select: effectiveSelect,
             $top: top,
             $skip: params.skip,
-            $orderby: params.orderby,
+            $orderby: await resolveOrderBy(services.metadataManager, collection, params.orderby),
             $expand: params.expand,
             $count: params.count,
           };
@@ -451,12 +467,18 @@ export function registerReadTools(server: McpServer, services: ServiceContainer)
             return preview;
           }
 
+          // $filter берём из текущего compiled: после отказа tolower() он пересобран.
           const runSearch = () =>
-            getRecordsWithLookupNames(lookupDeps(services), collection, searchQuery, {
-              autoPaginate,
-              maxRecords,
-              resolveLookups: params.resolve_lookups,
-            });
+            getRecordsWithLookupNames(
+              lookupDeps(services),
+              collection,
+              { ...searchQuery, $filter: compiled.filter || undefined },
+              {
+                autoPaginate,
+                maxRecords,
+                resolveLookups: params.resolve_lookups,
+              }
+            );
 
           let fetched;
           try {

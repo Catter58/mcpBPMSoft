@@ -64,11 +64,12 @@ export const TOOLS: ToolDescriptor[] = [
     name: 'bpm_get_record',
     title: 'Запись по ID',
     description:
-      'Возвращает одну запись коллекции по UUID с опциональными $select и $expand. ' +
+      'Возвращает одну запись коллекции по UUID или названию с опциональными $select и $expand. ' +
       'Пример: {"collection": "Account", "id": "3fa85f64-5717-4562-b3fc-2c963f66afa6", "expand": "PrimaryContact"}. ' +
       "Без select приходят только Id и колонка отображения (Name/Title/...); все колонки — по select='*'. " +
       'В lookup-колонках рядом с CityId приходит CityName (отключается resolve_lookups=false). ' +
-      'Когда UUID неизвестен, сначала bpm_lookup_value (имя → UUID) или bpm_search_unified.',
+      'Вместо UUID можно передать название записи (Name/Title) — сервер найдёт Id сам; при нескольких ' +
+      'совпадениях вернёт кандидатов.',
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     blurb: 'получить запись по UUID',
     category: 'read',
@@ -77,10 +78,10 @@ export const TOOLS: ToolDescriptor[] = [
     name: 'bpm_count_records',
     title: 'Количество записей',
     description:
-      'Возвращает число записей коллекции через /$count, опционально с $filter. ' +
-      'Пример: {"collection": "Lead", "filter": "CreatedOn ge 2026-01-01T00:00:00Z"}. ' +
-      'Дешевле выборки записей; полезен перед bpm_update_by_filter/bpm_delete_by_filter ' +
-      'для определения expected_count.',
+      'Возвращает число записей коллекции через /$count. Условие — criteria как в bpm_search_records ' +
+      '(русские подписи, «сегодня», «я») и/или сырой filter. ' +
+      'Пример: {"collection": "Activity", "criteria": [{"field": "Ответственный", "op": "равно", "value": "я"}, ' +
+      '{"field": "CreatedOn", "op": "на этой неделе"}]}. Для группировки и сумм — bpm_aggregate.',
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     blurb: 'подсчёт записей с опциональным фильтром',
     category: 'read',
@@ -99,10 +100,86 @@ export const TOOLS: ToolDescriptor[] = [
       'Сервер компилирует корректный $filter сам — предпочтительнее ' +
       'bpm_get_records с ручным filter. Без select возвращаются только Id и колонка отображения ' +
       "(Name/Title/...), все колонки — по select='*'; в lookup-колонках рядом с CityId приходит CityName. " +
+      'Дата без времени («2026-09-14») означает сутки в поясе пользователя; value="я" в lookup на ' +
+      'контакт подставляет текущего пользователя; orderby принимает подписи («Контрагент desc»). ' +
       'Ответ: compiled_filter, records, count/total_count/has_more/cursor.',
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     blurb: 'поиск по criteria-DSL (RU/EN, авто-резолвинг полей, similar_to)',
     category: 'read',
+  },
+  {
+    name: 'bpm_aggregate',
+    title: 'Группировка и итоги',
+    description:
+      'Считает количество, сумму, среднее, минимум и максимум с группировкой — на стороне сервера, ' +
+      'без выгрузки записей в контекст. Условие — criteria как в bpm_search_records (или filter). ' +
+      'Пример: {"collection": "Opportunity", "criteria": [{"field": "Ответственный", "op": "равно", "value": "я"}], ' +
+      '"group_by": "Стадия", "metrics": [{"op": "sum", "field": "Amount"}]}. ' +
+      'По времени: date_field + bucket (day/week/month/quarter/year, в поясе пользователя, неделя с понедельника) ' +
+      'группирует по интервалам (вместе с group_by); period («на этой неделе», «в прошлом месяце», this_quarter...) ' +
+      'ограничивает записи по date_field; compare_previous=true добавляет предыдущий период: ' +
+      '{"collection": "Activity", "date_field": "StartDate", "period": "на этой неделе", "bucket": "day", ' +
+      '"group_by": "Ответственный", "compare_previous": true}. ' +
+      'Lookup-группы подписаны именами (не uuid). Просматривает до max_records записей на период (по умолчанию 10000); ' +
+      'при достижении лимита truncated=true. Ответ: groups [{label, bucket, count, metrics, previous_count, delta}], ' +
+      'period, previous_period, scanned.',
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    blurb: 'группировка и итоги (count/sum/avg/min/max) на сервере',
+    category: 'read',
+  },
+  {
+    name: 'bpm_record_card',
+    title: 'Карточка записи 360°',
+    description:
+      'Всё о записи одним вызовом: основные заполненные поля с именами связанных записей, последние ' +
+      'активности, сделки и обращения, файлы, сообщения ленты и счётчики по связанным объектам. ' +
+      'Запись — UUID или название. Пример: {"collection": "Контрагент", "id": "Ромашка"}. ' +
+      'Заменяет цепочку bpm_get_record + несколько bpm_search_records; для точечных выборок — bpm_search_records.',
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    blurb: 'карточка 360°: запись + связанные активности, сделки, файлы, лента',
+    category: 'read',
+  },
+  {
+    name: 'bpm_find_duplicates',
+    title: 'Поиск дублей',
+    description:
+      'Ищет дубли по всей коллекции или по условию: контакты, контрагенты, лиды и любые объекты с колонкой ' +
+      'названия. Сравнивает нормализованные ФИО и названия (порядок слов, ё/е, инициалы, кавычки, ' +
+      'орг-формы ООО/АО/LLC, транслит), email (регистр, точки gmail), телефоны (+7/8, скобки, дефисы, ' +
+      'дополнительные номера из средств связи), ИНН и домен сайта; конфликты (разные ИНН или даты рождения) ' +
+      'снижают оценку. Возвращает группы дублей с уровнем exact/likely/possible, причинами совпадения, ' +
+      'предложенной основной записью и числом связанных записей у каждой. ' +
+      'Пример: {"collection": "Контакт", "min_level": "likely"}. Слияние — bpm_merge_duplicates.',
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    blurb: 'поиск дублей: ФИО/названия, email, телефоны, ИНН, сайт — группы с причинами',
+    category: 'read',
+  },
+  {
+    name: 'bpm_check_duplicates',
+    title: 'Проверка на дубль до создания',
+    description:
+      'Проверяет до создания, нет ли уже такой записи: принимает те же data, что bpm_create_record ' +
+      '(Name, Email, Phone, ИНН, сайт...), и возвращает похожие существующие записи с оценкой и причинами. ' +
+      'Пример: {"collection": "Account", "data": {"Name": "Ромашка", "Phone": "+7 916 123-45-67"}}. ' +
+      'Вызывайте перед созданием контакта, контрагента или лида.',
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    blurb: 'есть ли уже такая запись — до создания',
+    category: 'read',
+  },
+  {
+    name: 'bpm_merge_duplicates',
+    title: 'Слияние дублей',
+    description:
+      'Сливает дубли в основную запись. Двухшаговый протокол: без confirm=true возвращает план — какие пустые ' +
+      'поля основной записи заполнятся из дублей, сколько связанных записей (активности, сделки, файлы, теги, ' +
+      'лента и любые другие ссылки по схеме) будет перепривязано и какие записи удалятся; ничего не меняет. ' +
+      'С confirm=true и expected_references из плана заполняет поля, перепривязывает ссылки и удаляет дубль, ' +
+      'только если все перепривязки прошли; снимок удалённой записи возвращается в ответе. ' +
+      'Пример: {"collection": "Contact", "master_id": "<uuid>", "duplicate_ids": ["<uuid>"], "confirm": true, ' +
+      '"expected_references": 7}. Группы дублей и предложенную основную запись даёт bpm_find_duplicates.',
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+    blurb: 'слияние дублей: план → подтверждение, перепривязка всех ссылок',
+    category: 'write',
   },
 
   {
@@ -112,9 +189,10 @@ export const TOOLS: ToolDescriptor[] = [
       'Возвращает текущего пользователя (SysAdminUnit + привязанный Contact) и текущее время ' +
       'в его часовом поясе. Личность вычисляет сам BPMSoft в сессии вызывающего (макрос DataService), ' +
       'поэтому при per-request авторизации ответ соответствует владельцу cookie/BPMCSRF. ' +
-      'Нужен всякий раз, когда в запросе есть «мне»/«мои»/«моя команда» (подставьте contact_id в ' +
-      'OwnerId/AuthorId) или относительная дата — у модели нет своих часов, а UTC-полночь не ' +
-      'совпадает с местной. Пример: {"timezone": "Europe/Moscow"}.',
+      'Для «мои»/«я» звать его не нужно: в criteria и data значение "я" сервер сам заменяет на ' +
+      'текущего пользователя, а «сегодня»/«на этой неделе» считает в его поясе. Полезен, чтобы ' +
+      'узнать текущие дату и время или показать пользователю, под кем идёт работа. ' +
+      'Пример: {"timezone": "Europe/Moscow"}.',
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     blurb: 'текущий пользователь, его контакт и текущее время в его поясе',
     category: 'read',
@@ -138,7 +216,7 @@ export const TOOLS: ToolDescriptor[] = [
     name: 'bpm_update_record',
     title: 'Обновить запись',
     description:
-      'Обновляет поля записи по UUID (PATCH). Lookup-поля с текстом разрешаются каскадно, как в ' +
+      'Обновляет поля записи по UUID или названию (PATCH). Lookup-поля с текстом разрешаются каскадно, как в ' +
       'bpm_create_record; неточные резолвы видны в resolved_lookups. ' +
       'Пример: {"collection": "Contact", "id": "<uuid>", "data": {"Должность": "Директор"}}. ' +
       'Для смены статуса по имени удобнее bpm_set_status; для массового обновления — bpm_update_by_filter. ' +
@@ -151,7 +229,7 @@ export const TOOLS: ToolDescriptor[] = [
     name: 'bpm_delete_record',
     title: 'Удалить запись',
     description:
-      'Удаляет запись по UUID (DELETE). Действие необратимо, протокол двухшаговый: вызов без ' +
+      'Удаляет запись по UUID или названию (DELETE). Действие необратимо, протокол двухшаговый: вызов без ' +
       'confirm=true возвращает превью удаляемой записи, ничего не удаляя; повторный вызов с ' +
       'confirm=true после явного согласия пользователя выполняет удаление. ' +
       'Пример: {"collection": "Contact", "id": "<uuid>", "confirm": true}. ' +
@@ -164,10 +242,11 @@ export const TOOLS: ToolDescriptor[] = [
     name: 'bpm_update_by_filter',
     title: 'Обновить по фильтру',
     description:
-      'Находит записи по $filter и обновляет каждую (PATCH). Защита: обязательный expected_count — ' +
-      'при несовпадении с фактическим числом найденных операция отменяется (код expected_count_mismatch). ' +
-      'Пример: {"collection": "Case", "filter": "StatusId eq <uuid>", "data": {"OwnerId": "Петров"}, "expected_count": 12}. ' +
-      'Число для expected_count даёт предварительный bpm_count_records/bpm_search_records с тем же условием.',
+      'Находит записи по criteria (как в bpm_search_records) или $filter и обновляет каждую (PATCH). ' +
+      'Двухшаговый протокол: вызов без expected_count ничего не меняет и возвращает число найденных и их Id; ' +
+      'повторный вызов с этим expected_count выполняет обновление, при несовпадении — отмена (expected_count_mismatch). ' +
+      'Пример: {"collection": "Case", "criteria": [{"field": "Статус", "op": "равно", "value": "Новое"}], ' +
+      '"data": {"OwnerId": "Петров"}, "expected_count": 12}.',
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
     blurb: 'массовое обновление по фильтру (с защитным expected_count)',
     category: 'write',
@@ -176,11 +255,12 @@ export const TOOLS: ToolDescriptor[] = [
     name: 'bpm_delete_by_filter',
     title: 'Удалить по фильтру',
     description:
-      'Находит записи по $filter и удаляет каждую. Необратимо; двойная защита: (1) обязательный ' +
-      'expected_count — отмена при несовпадении; (2) без confirm=true возвращается только список ID ' +
-      'на удаление, само удаление — повторным вызовом с confirm=true после согласия пользователя. ' +
-      'Пример: {"collection": "Activity", "filter": "CreatedOn lt 2020-01-01T00:00:00Z", "expected_count": 5, "confirm": true}. ' +
-      'Число заранее даёт bpm_count_records с тем же фильтром.',
+      'Находит записи по criteria (как в bpm_search_records) или $filter и удаляет каждую. Необратимо; ' +
+      'двойная защита: (1) без expected_count возвращается только число найденных и их Id, при несовпадении — ' +
+      'отмена; (2) без confirm=true — список ID на удаление, само удаление — повторным вызовом с confirm=true ' +
+      'после согласия пользователя. ' +
+      'Пример: {"collection": "Activity", "criteria": [{"field": "CreatedOn", "op": "меньше", "value": "2020-01-01"}], ' +
+      '"expected_count": 5, "confirm": true}.',
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
     blurb: 'массовое удаление по фильтру (expected_count + confirm=true)',
     category: 'write',
@@ -259,6 +339,21 @@ export const TOOLS: ToolDescriptor[] = [
       '(схема подтянется автоматически). Полный список полей коллекции — bpm_get_schema.',
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     blurb: 'поиск поля по подписи (RU/EN)',
+    category: 'schema',
+  },
+  {
+    name: 'bpm_get_relations',
+    title: 'Связи между объектами',
+    description:
+      'Показывает, как объект связан с другими: исходящие lookup-поля (Contact.Account → Account) и ' +
+      'входящие ссылки (Activity.Contact → Contact), без системных CreatedBy/ModifiedBy. С target ищет ' +
+      'кратчайшие пути между объектами и отдаёт их в виде, готовом для criteria (field "Account.Owner") ' +
+      'и для OData ($filter Account/Owner/Id). Пример: {"collection": "Контакт", "target": "Сделка"}. ' +
+      'criteria_field и odata_path строятся от query_collection (объекта, в котором искать); путь через ' +
+      'промежуточную запись возвращается подсказкой в два шага. ' +
+      'Нужен, чтобы спланировать запрос через несколько объектов без чтения схемы целиком. Только OData v4.',
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    blurb: 'связи объекта и пути между объектами для построения запросов',
     category: 'schema',
   },
   {
@@ -343,7 +438,8 @@ export const TOOLS: ToolDescriptor[] = [
       'PUT бинарных данных напрямую в поле сущности ({Collection}({id})/{Field}) — для произвольных ' +
       'бинарных полей, не только SysImage. ' +
       'Пример: {"collection": "Contact", "id": "<uuid>", "field": "Photo", "file_path": "/tmp/photo.jpg"}. ' +
-      'Файл с привязкой через общее хранилище — bpm_upload_file.',
+      'Файл с привязкой через общее хранилище — bpm_upload_file. ' +
+      'Параметр id принимает UUID или название записи.',
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     blurb: 'PUT бинарь в поле сущности',
     category: 'stream',
@@ -354,7 +450,8 @@ export const TOOLS: ToolDescriptor[] = [
     description:
       'GET бинарных данных из поля сущности ({Collection}({id})/{Field}); с save_path сохраняет файл, ' +
       'без — возвращает размер. Пример: {"collection": "Contact", "id": "<uuid>", "field": "Photo", ' +
-      '"save_path": "/tmp/photo.jpg"}.',
+      '"save_path": "/tmp/photo.jpg"}. ' +
+      'Параметр id принимает UUID или название записи.',
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     blurb: 'GET бинарь из поля сущности',
     category: 'stream',
@@ -365,7 +462,8 @@ export const TOOLS: ToolDescriptor[] = [
     description:
       'DELETE бинарных данных в поле сущности. Без confirm=true возвращает превью того, что будет ' +
       'очищено; очистка — повторным вызовом с confirm=true после согласия пользователя. ' +
-      'Пример: {"collection": "Contact", "id": "<uuid>", "field": "Photo", "confirm": true}.',
+      'Пример: {"collection": "Contact", "id": "<uuid>", "field": "Photo", "confirm": true}. ' +
+      'Параметр id принимает UUID или название записи.',
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
     blurb: 'DELETE бинарь в поле сущности (требует confirm=true)',
     category: 'stream',
@@ -380,7 +478,8 @@ export const TOOLS: ToolDescriptor[] = [
       'имени и привязывает контакт к нему — вместо цепочки create/update. ' +
       'Пример: {"name": "Иванов Иван", "email": "i@example.ru", "account_name": "Ланит", ' +
       '"extra": {"Город": "Москва"}}. Имена полей в extra — на русском или латинице. ' +
-      'Точечный контроль над полями — обычный bpm_create_record.',
+      'Точечный контроль над полями — обычный bpm_create_record. ' +
+      'Перед созданием проверяет дубль (по Email, иначе по ФИО и контрагенту) и при совпадении возвращает already_exists=true без создания; force=true создаёт всё равно. Контрагент ищется нечётко. Должность, которой нет в справочнике Job, сохраняется в JobTitle.',
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     blurb: 'регистрация контакта (+ привязка к контрагенту по имени)',
     category: 'workflow',
@@ -393,7 +492,8 @@ export const TOOLS: ToolDescriptor[] = [
       'тексту через справочники, имена полей автоопределяются по метаданным инстанса. ' +
       'Пример: {"title": "Позвонить клиенту", "type": "Звонок", "owner_name": "Петров", ' +
       '"related_collection": "Account", "related_id": "<uuid>", "due_date": "2026-08-10T12:00:00Z"}. ' +
-      'Комментарий в ленту записи (без задачи) — bpm_post_feed.',
+      'Комментарий в ленту записи (без задачи) — bpm_post_feed. ' +
+      'owner_name принимает "я"/"@me"; related_id — UUID или название записи.',
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     blurb: 'создать активность (тип/владелец/связь резолвятся по тексту)',
     category: 'workflow',
@@ -405,9 +505,22 @@ export const TOOLS: ToolDescriptor[] = [
       'Ставит статус записи по человекочитаемому имени: поле-статус (StatusId/StageId/...) находится в ' +
       'метаданных автоматически, UUID значения резолвится в его справочнике. ' +
       'Пример: {"collection": "Opportunity", "id": "<uuid>", "status": "Завершена успешно"}. ' +
-      'При нескольких статусных полях нужен явный status_field. Прочие поля — bpm_update_record.',
+      'Параметр id принимает UUID или название записи. При нескольких статусных полях по умолчанию ' +
+      'берётся StatusId, иначе нужен status_field. Прочие поля — bpm_update_record.',
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     blurb: 'установить статус по имени (Status/Stage авто-детект)',
+    category: 'workflow',
+  },
+  {
+    name: 'bpm_my_agenda',
+    title: 'Моя повестка',
+    description:
+      'Задачи пользователя одним вызовом: просроченные, на сегодня и на ближайшие дни (по умолчанию 7) — ' +
+      'незавершённые активности, где он ответственный; границы дней в его часовом поясе. Опционально — ' +
+      'сделки без движения дольше stale_days дней. По умолчанию — текущий пользователь, другого сотрудника ' +
+      'задаёт owner (ФИО). Пример: {"days": 7, "stale_days": 14}. Ответ: overdue / today / upcoming / stale.',
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    blurb: 'мои задачи: просроченные, сегодня, ближайшие дни; зависшие сделки',
     category: 'workflow',
   },
   {
@@ -457,7 +570,8 @@ export const TOOLS: ToolDescriptor[] = [
       'Публикует сообщение в ленту записи (коллекция SocialMessage) — основной канал комментариев ' +
       'BPMSoft; сообщение видно всем, у кого есть доступ к записи. ' +
       'Пример: {"collection": "Opportunity", "id": "<uuid>", "message": "Клиент согласовал договор", ' +
-      '"parent_id": "<uuid ответа>"}. Задача/звонок с исполнителем и сроком — bpm_log_activity.',
+      '"parent_id": "<uuid ответа>"}. Задача/звонок с исполнителем и сроком — bpm_log_activity. ' +
+      'Параметр id принимает UUID или название записи.',
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     blurb: 'опубликовать сообщение в ленту записи',
     category: 'process',

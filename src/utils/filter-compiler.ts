@@ -26,7 +26,9 @@ import { UnknownFieldError } from './errors.js';
 import { containsExpression, escapeODataString, isSafeIdentifier } from './odata.js';
 import { normalizeName } from './name-normalize.js';
 import { getDisplayColumn } from './display.js';
-import { calendarRange, resolveTimeZone, type CalendarPeriod } from './datetime.js';
+import { calendarRange, resolveTimeZone, zonedMidnightUtc, type CalendarPeriod } from './datetime.js';
+import { isMeMacro, meIdFor } from './me-macro.js';
+import type { CurrentUser } from '../user/current-user.js';
 
 export interface Criterion {
   /** Field name, caption ("Город") or navigation path ("Account.City"). */
@@ -47,6 +49,8 @@ export interface CompileOptions {
   join?: 'and' | 'or';
   /** Часовой пояс пользователя для «сегодня»/«вчера» (IANA). */
   timeZone?: string;
+  /** Текущий пользователь — для «я»/@me в lookup на Contact/SysAdminUnit. */
+  currentUser?: { get(): Promise<CurrentUser> };
 }
 
 export interface UsedField {
@@ -177,21 +181,49 @@ export async function compileFilter(criteria: Criterion[], options: CompileOptio
   const warnings: string[] = [];
   const expressions: string[] = [];
 
-  for (const criterion of criteria) {
+  for (let criterion of criteria) {
     if (!criterion || typeof criterion.field !== 'string' || typeof criterion.op !== 'string') {
       throw new Error('Каждый critera должен быть объектом вида {field: string, op: string, value?: any}.');
     }
 
     const op = canonicalOp(criterion.op);
     const resolved = await resolveFieldPath(criterion.field, options);
+    criterion = await substituteMe(criterion, resolved, options);
 
     // Lookup + текстовое значение → сравниваем с отображаемой колонкой справочника
     // (Type/Name), а не с FK-колонкой, куда текст всё равно не подставить.
     const byDisplayName = Boolean(resolved.displayPath) && isTextComparison(op, criterion);
-    const path = byDisplayName ? (resolved.displayPath as string) : resolved.path;
+    // uuid в lookup сравниваем через навигацию (Owner/Id): на bpm9 /$count и $count=true
+    // падают на `OwnerId eq <uuid>`, а с навигацией работают. ne и пусто остаются на FK —
+    // навигация отбросила бы записи с пустой связью.
+    const byNavId = !byDisplayName && Boolean(resolved.idPath) && isUuidEquality(op, criterion);
+    let path = resolved.path;
+    if (byDisplayName) path = resolved.displayPath as string;
+    else if (byNavId) path = resolved.idPath as string;
+    // Пустота на FK (`AccountId eq null`, `OwnerId ne null`) на bpm9 рвёт поток даже без $count;
+    // через навигацию работает и в выборке, и в /$count: `Account eq null`, `Owner/Id ne null`.
+    else if (op === 'is_null' && resolved.idPath) path = resolved.idPath.replace(/\/Id$/, '');
+    else if (op === 'is_not_null' && resolved.idPath) path = resolved.idPath;
 
     used.push({ input: criterion.field, resolved: path, caption: resolved.caption });
-    if (resolved.lookupWarning && !byDisplayName) warnings.push(resolved.lookupWarning);
+    // Текст и uuid сервер уже обработал сам — предупреждать не о чем.
+    const uuidValue = typeof criterion.value === 'string' && UUID_RE.test(criterion.value);
+    if (resolved.lookupWarning && !byDisplayName && !byNavId && !uuidValue && criterion.value !== undefined)
+      warnings.push(resolved.lookupWarning);
+
+    // `OwnerId ne <uuid>` на bpm9 рвёт поток, а `Owner/Id ne <uuid>` теряет записи без связи
+    // (inner join). `not (Owner/Id eq <uuid>)` даёт верный результат и в выборке, и в /$count.
+    if (
+      op === 'ne' &&
+      resolved.idPath &&
+      typeof criterion.value === 'string' &&
+      UUID_RE.test(criterion.value)
+    ) {
+      expressions.push(
+        `not (${resolved.idPath} eq ${literalize(criterion.value, options.odataVersion, true)})`
+      );
+      continue;
+    }
 
     const expr = buildExpression(
       path,
@@ -210,6 +242,33 @@ export async function compileFilter(criteria: Criterion[], options: CompileOptio
   const filter = expressions.length === 1 ? expressions[0] : expressions.map((e) => `(${e})`).join(join);
 
   return { filter, used_fields: used, warnings };
+}
+
+/** «я»/@me в lookup на Contact или SysAdminUnit → Id текущего пользователя (и в списке для in). */
+async function substituteMe(
+  criterion: Criterion,
+  resolved: ResolvedField,
+  options: CompileOptions
+): Promise<Criterion> {
+  const values = Array.isArray(criterion.value) ? criterion.value : [criterion.value];
+  if (!resolved.lookupCollection || !options.currentUser || !values.some(isMeMacro)) return criterion;
+
+  const meId = meIdFor(resolved.lookupCollection, await options.currentUser.get());
+  if (!meId) return criterion;
+  const swap = (v: unknown) => (isMeMacro(v) ? meId : v);
+  return {
+    ...criterion,
+    value: Array.isArray(criterion.value) ? criterion.value.map(swap) : swap(criterion.value),
+  };
+}
+
+function isUuidEquality(op: CanonicalOp, criterion: Criterion): boolean {
+  const isUuid = (v: unknown) => typeof v === 'string' && UUID_RE.test(v);
+  if (op === 'eq') return isUuid(criterion.value);
+  if (op === 'in') {
+    return Array.isArray(criterion.value) && criterion.value.length > 0 && criterion.value.every(isUuid);
+  }
+  return false;
 }
 
 /**
@@ -272,6 +331,10 @@ interface ResolvedField {
   lookupWarning?: string;
   /** Путь к отображаемой колонке справочника ('City/Name') — для сравнения по тексту. */
   displayPath?: string;
+  /** Справочник, на который ссылается последнее поле пути. */
+  lookupCollection?: string;
+  /** Путь к Id связанной записи через навигацию ('Owner/Id', только v4). */
+  idPath?: string;
 }
 
 async function resolveFieldPath(query: string, options: CompileOptions): Promise<ResolvedField> {
@@ -291,6 +354,8 @@ async function resolveFieldPath(query: string, options: CompileOptions): Promise
   let isLookup = false;
   let lookupWarning: string | undefined;
   let displayPath: string | undefined;
+  let lookupCollection: string | undefined;
+  let idPath: string | undefined;
 
   for (let i = 0; i < segments.length; i++) {
     const seg = segments[i];
@@ -359,6 +424,7 @@ async function resolveFieldPath(query: string, options: CompileOptions): Promise
       const lookupInfo = await options.metadataManager.getLookupInfo(currentCollection, fieldName);
       if (lookupInfo) {
         isLookup = true;
+        lookupCollection = lookupInfo.lookupCollection;
         lookupWarning =
           `Поле "${query}" является lookup; передайте UUID или используйте bpm_lookup_value для ` +
           `получения UUID по тексту.`;
@@ -374,6 +440,9 @@ async function resolveFieldPath(query: string, options: CompileOptions): Promise
         if (isSafeIdentifier(nav) && isSafeIdentifier(display)) {
           displayPath = [...resolvedSegments.slice(0, -1), nav, display].join('/');
         }
+        if (options.odataVersion === 4 && isSafeIdentifier(nav) && nav !== fieldName) {
+          idPath = [...resolvedSegments.slice(0, -1), nav, 'Id'].join('/');
+        }
       }
     }
   }
@@ -384,6 +453,8 @@ async function resolveFieldPath(query: string, options: CompileOptions): Promise
     isLookup,
     lookupWarning,
     displayPath,
+    lookupCollection,
+    idPath,
   };
 }
 
@@ -410,8 +481,19 @@ function buildExpression(
     case 'gt':
     case 'ge':
     case 'lt':
-    case 'le':
-      return `${fieldPath} ${op} ${literalize(criterion.value, odataVersion, isLookup)}`;
+    case 'le': {
+      // Дата без времени — это сутки в поясе пользователя, а не миг полуночи UTC.
+      if (isDateOnly(criterion.value)) {
+        const from = dateTimeLiteral(zonedInstant(criterion.value, timeZone), odataVersion);
+        const to = dateTimeLiteral(nextDayStart(criterion.value, timeZone), odataVersion);
+        if (op === 'eq') return `${fieldPath} ge ${from} and ${fieldPath} lt ${to}`;
+        if (op === 'ne') return `(${fieldPath} lt ${from} or ${fieldPath} ge ${to})`;
+        if (op === 'gt') return `${fieldPath} ge ${to}`;
+        if (op === 'le') return `${fieldPath} lt ${to}`;
+        return `${fieldPath} ${op} ${from}`;
+      }
+      return `${fieldPath} ${op} ${literalize(criterion.value, odataVersion, isLookup, timeZone)}`;
+    }
 
     case 'contains':
       return containsExpression(fieldPath, String(criterion.value ?? ''), odataVersion, {
@@ -436,7 +518,9 @@ function buildExpression(
       if (!Array.isArray(criterion.value) || criterion.value.length === 0) {
         throw new Error(`Оператор "in" требует value=массив с минимум одним элементом.`);
       }
-      const parts = criterion.value.map((v) => `${fieldPath} eq ${literalize(v, odataVersion, isLookup)}`);
+      const parts = criterion.value.map(
+        (v) => `${fieldPath} eq ${literalize(v, odataVersion, isLookup, timeZone)}`
+      );
       return parts.length === 1 ? parts[0] : `(${parts.join(' or ')})`;
     }
 
@@ -462,8 +546,13 @@ function buildExpression(
       if (criterion.value === undefined || criterion.value_to === undefined) {
         throw new Error(`Оператор "between" требует value (нижняя граница) и value_to (верхняя граница).`);
       }
-      const lo = literalize(criterion.value, odataVersion, isLookup);
-      const hi = literalize(criterion.value_to, odataVersion, isLookup);
+      const lo = literalize(criterion.value, odataVersion, isLookup, timeZone);
+      // «между 01.09 и 14.09» включает весь последний день.
+      if (isDateOnly(criterion.value_to)) {
+        const to = dateTimeLiteral(nextDayStart(criterion.value_to, timeZone), odataVersion);
+        return `${fieldPath} ge ${lo} and ${fieldPath} lt ${to}`;
+      }
+      const hi = literalize(criterion.value_to, odataVersion, isLookup, timeZone);
       return `${fieldPath} ge ${lo} and ${fieldPath} le ${hi}`;
     }
 
@@ -472,7 +561,7 @@ function buildExpression(
   }
 }
 
-function literalize(value: unknown, odataVersion: 3 | 4, isLookup: boolean): string {
+function literalize(value: unknown, odataVersion: 3 | 4, isLookup: boolean, timeZone?: string): string {
   if (value === null || value === undefined) return 'null';
   if (typeof value === 'boolean') return value ? 'true' : 'false';
   if (typeof value === 'number' && Number.isFinite(value)) return String(value);
@@ -486,7 +575,7 @@ function literalize(value: unknown, odataVersion: 3 | 4, isLookup: boolean): str
       return odataVersion === 3 ? `guid'${value}'` : value;
     }
     if (isIsoDateLike(value)) {
-      const d = new Date(value);
+      const d = zonedInstant(value, timeZone);
       if (!Number.isNaN(d.getTime())) {
         return dateTimeLiteral(d, odataVersion);
       }
@@ -523,6 +612,31 @@ function numericValue(value: unknown, op: CanonicalOp): number {
     if (n > 0) return n;
   }
   throw new Error(`Оператор "${op}" требует value=положительное число.`);
+}
+
+const DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+function isDateOnly(value: unknown): value is string {
+  return typeof value === 'string' && DATE_ONLY_RE.test(value);
+}
+
+/**
+ * Дата/время без Z и смещения — местное время пользователя. `new Date()` взял бы
+ * пояс процесса MCP (в Docker это UTC), и «15:00» уехало бы на три часа.
+ */
+function zonedInstant(value: string, timeZone?: string): Date {
+  if (/(Z|[+-]\d{2}:?\d{2})$/.test(value)) return new Date(value);
+  const m = value.match(/^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2}))?(?:\.\d+)?)?$/);
+  if (!m) return new Date(value);
+  const midnight = zonedMidnightUtc(Number(m[1]), Number(m[2]), Number(m[3]), resolveTimeZone(timeZone));
+  // ponytail: смещение берётся на полночь; в день перевода часов время после перевода уедет на час.
+  const offsetMs = ((Number(m[4] ?? 0) * 60 + Number(m[5] ?? 0)) * 60 + Number(m[6] ?? 0)) * 1000;
+  return new Date(midnight.getTime() + offsetMs);
+}
+
+function nextDayStart(value: string, timeZone?: string): Date {
+  const [year, month, day] = value.split('-').map(Number);
+  return zonedMidnightUtc(year, month, day + 1, resolveTimeZone(timeZone));
 }
 
 function isIsoDateLike(value: string): boolean {

@@ -229,7 +229,7 @@ describe('compileFilter — relative time windows', () => {
 });
 
 describe('compileFilter — navigation and captions', () => {
-  it('Account.City navigation becomes Account/CityId in the path', async () => {
+  it('Account.City navigation: uuid compared via Account/City/Id', async () => {
     const r = await compile([
       {
         field: 'Account.City',
@@ -237,10 +237,9 @@ describe('compileFilter — navigation and captions', () => {
         value: '11111111-1111-1111-1111-111111111111',
       },
     ]);
-    // Navigation property name in v4 is "Account" (the FK is AccountId, but
-    // the metadata stub exposes "Account" directly as a lookup field). The
-    // last segment is the resolved CityId.
-    expect(r.filter).toBe('Account/CityId eq 11111111-1111-1111-1111-111111111111');
+    // Navigation property name in v4 is "Account"; uuid equality on the final lookup
+    // goes through its navigation (City/Id) — bpm9 /$count rejects `CityId eq <uuid>`.
+    expect(r.filter).toBe('Account/City/Id eq 11111111-1111-1111-1111-111111111111');
   });
 
   it('resolves a Russian caption to the OData field name', async () => {
@@ -264,8 +263,8 @@ describe('compileFilter — lookup values', () => {
       v: 3,
     });
     expect(r.filter).toBe("CityId eq guid'22222222-2222-2222-2222-222222222222'");
-    expect(r.warnings.length).toBe(1);
-    expect(r.warnings[0]).toContain('lookup');
+    // uuid уже передан — предупреждать «передайте UUID» незачем.
+    expect(r.warnings).toEqual([]);
   });
 });
 

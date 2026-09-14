@@ -19,15 +19,15 @@
 
 import type { MetadataManager } from '../metadata/metadata-manager.js';
 import type { ODataClient, QueryOptions } from '../client/odata-client.js';
-import type { ODataCollectionResponse, ODataVersion } from '../types/index.js';
-import { isGuid, guidLiteral } from './odata.js';
+import type { ODataCollectionResponse, ODataVersion, EntityMetadata } from '../types/index.js';
+import { isGuid, guidLiteral, isSafeIdentifier } from './odata.js';
 import { isQueryUnsupportedError, UnknownFieldError } from './errors.js';
 
 /** Значение `select`, означающее «вернуть все колонки». */
 export const ALL_COLUMNS = '*';
 
 /** Колонка отображения — берём первую существующую из списка. */
-const DISPLAY_CANDIDATES = ['Name', 'Title', 'Subject', 'Caption', 'FullName', 'Code'];
+const DISPLAY_CANDIDATES = ['Name', 'Title', 'LeadName', 'Subject', 'Caption', 'FullName', 'Code', 'Number'];
 
 /** Сколько Id за один запрос к справочнику ($filter=Id eq .. or Id eq ..). */
 const ID_CHUNK = 50;
@@ -137,6 +137,54 @@ export async function resolveSelect(
   // Id почти всегда нужен дальше по цепочке (карточки, обновления, подстановки).
   if (!resolved.includes('Id')) resolved.unshift('Id');
   return resolved.join(',');
+}
+
+/**
+ * `$orderby` по тому, что написала модель: «Дата создания desc» → `CreatedOn desc`,
+ * «Контрагент» → `Account/Name` (сортировать по uuid связи бессмысленно).
+ * Неизвестная колонка — ошибка с подсказками, а не 400 от BPMSoft.
+ * Метаданные недоступны → строка уходит как есть.
+ */
+export async function resolveOrderBy(
+  metadataManager: MetadataManager,
+  collection: string,
+  orderby?: string
+): Promise<string | undefined> {
+  const trimmed = orderby?.trim();
+  if (!trimmed) return undefined;
+
+  const parts: string[] = [];
+  for (const rawPart of trimmed.split(',')) {
+    const match = rawPart.trim().match(/^(.*?)(?:\s+(asc|desc))?$/i);
+    const field = match?.[1]?.trim() ?? '';
+    const direction = match?.[2]?.toLowerCase();
+    if (!field) continue;
+    // Навигационные пути отдаём как есть — их проверяет сервер.
+    if (field.includes('/')) {
+      parts.push(direction ? `${field} ${direction}` : field);
+      continue;
+    }
+    let ref: Awaited<ReturnType<MetadataManager['resolveFieldReference']>>;
+    let meta: EntityMetadata;
+    try {
+      ref = await metadataManager.resolveFieldReference(collection, field);
+      meta = await metadataManager.getEntityMetadata(collection);
+    } catch {
+      return orderby;
+    }
+    if (ref.name === null) throw new UnknownFieldError(field, collection, ref.suggestions);
+
+    let path = ref.name;
+    const prop = meta.properties.find((p) => p.name === ref.name);
+    if (prop?.isLookup && prop.lookupCollection) {
+      const nav = prop.lookupNavProperty ?? stripIdSuffix(prop.name);
+      const display =
+        (await getDisplayColumn(metadataManager, prop.lookupCollection)) ?? prop.lookupDisplayColumn;
+      if (nav && display && isSafeIdentifier(nav) && isSafeIdentifier(display)) path = `${nav}/${display}`;
+    }
+    parts.push(direction ? `${path} ${direction}` : path);
+  }
+  return parts.length > 0 ? parts.join(',') : undefined;
 }
 
 /**

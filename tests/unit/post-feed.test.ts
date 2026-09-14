@@ -51,6 +51,9 @@ function buildStubServices(state: StubState): ServiceContainer {
     async resolveCollectionReference(query: string) {
       return { name: query };
     },
+    async getEntitySchemaUId(name: string) {
+      return name === 'Contact' ? '16be3651-8fe2-4159-8dd0-a803d4683dd3' : null;
+    },
   };
 
   const authManager = { ensureAuthenticated: vi.fn(async () => undefined) };
@@ -74,7 +77,7 @@ function getPostFeedHandler(server: FakeServer): (args: Record<string, unknown>)
 }
 
 describe('bpm_post_feed', () => {
-  it('sends Message/EntitySchemaName/EntityId to SocialMessage', async () => {
+  it('sends Message/EntitySchemaUId/EntityId to SocialMessage', async () => {
     const state: StubState = { createCalls: [] };
     const services = buildStubServices(state);
     const server = buildFakeServer();
@@ -92,7 +95,7 @@ describe('bpm_post_feed', () => {
     expect(call.collection).toBe('SocialMessage');
     expect(call.data).toEqual({
       Message: 'Hello feed',
-      EntitySchemaName: 'Contact',
+      EntitySchemaUId: '16be3651-8fe2-4159-8dd0-a803d4683dd3',
       EntityId: '11111111-2222-3333-4444-555555555555',
     });
     expect(call.data.ParentId).toBeUndefined();
@@ -117,7 +120,7 @@ describe('bpm_post_feed', () => {
     expect(call.collection).toBe('SocialMessage');
     expect(call.data).toEqual({
       Message: 'Reply text',
-      EntitySchemaName: 'Contact',
+      EntitySchemaUId: '16be3651-8fe2-4159-8dd0-a803d4683dd3',
       EntityId: '11111111-2222-3333-4444-555555555555',
       ParentId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
     });

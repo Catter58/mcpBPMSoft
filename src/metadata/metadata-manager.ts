@@ -31,7 +31,23 @@ interface EdmxProperty {
 
 interface EdmxNavigationProperty {
   '@_Name'?: string;
+  /** Только v4. */
   '@_Type'?: string;
+  /** v3: `NS.AssociationName` + роли концов связи. */
+  '@_Relationship'?: string;
+  '@_ToRole'?: string;
+}
+
+/** v3 CSDL: `<Association><End Type Role Multiplicity/></Association>`. */
+interface EdmxAssociation {
+  '@_Name'?: string;
+  End?: EdmxAssociationEnd | EdmxAssociationEnd[];
+}
+
+interface EdmxAssociationEnd {
+  '@_Type'?: string;
+  '@_Role'?: string;
+  '@_Multiplicity'?: string;
 }
 
 interface EdmxEntityType {
@@ -48,6 +64,7 @@ interface EdmxEntitySet {
 interface EdmxSchema {
   '@_Namespace'?: string;
   EntityType?: EdmxEntityType | EdmxEntityType[];
+  Association?: EdmxAssociation | EdmxAssociation[];
   EntityContainer?: {
     EntitySet?: EdmxEntitySet | EdmxEntitySet[];
   };
@@ -66,6 +83,8 @@ interface ParsedMetadata {
   entitySets: Map<string, string>;
   /** short entity type name -> entity type definition */
   entityTypes: Map<string, EdmxEntityType>;
+  /** v3: qualified association name ("NS.Contact_Account") -> Association */
+  associations: Map<string, EdmxAssociation>;
 }
 
 export class MetadataManager {
@@ -79,6 +98,7 @@ export class MetadataManager {
   /** Русская подпись объекта → имя EntitySet (null — не нашли). */
   private captionByCollection = new Map<string, string | null>();
   private captionSupported: boolean | null = null;
+  private lookupGraph: { source: ParsedMetadata; graph: LookupGraph } | null = null;
 
   private readonly xmlParser: XMLParser;
 
@@ -112,6 +132,19 @@ export class MetadataManager {
       return sets.filter((s) => s.name.toLowerCase().includes(lower));
     }
     return sets;
+  }
+
+  /**
+   * Граф lookup-связей всех коллекций. Строится один раз на загруженный EDMX
+   * и живёт, пока не перезагрузится $metadata (тот же TTL).
+   */
+  async getLookupGraph(): Promise<LookupGraph> {
+    await this.ensureMetadataLoaded();
+    const meta = this.parsedMetadata!;
+    if (this.lookupGraph?.source !== meta) {
+      this.lookupGraph = { source: meta, graph: buildLookupGraph(meta, this.odataVersion) };
+    }
+    return this.lookupGraph.graph;
   }
 
   /** Get metadata for a specific entity (collection) */
@@ -299,6 +332,22 @@ export class MetadataManager {
   }
 
   /**
+   * UId базовой схемы объекта (SysSchema с ExtendParent = false). BPMSoft ссылается
+   * на объект по нему, а не по имени — например, SocialMessage.EntitySchemaUId.
+   */
+  async getEntitySchemaUId(entityName: string): Promise<string | null> {
+    if (!this.httpClient) return null;
+    const escaped = escapeODataString(entityName);
+    const url = `${getODataBaseUrl(this.config)}/SysSchema?$filter=Name eq '${escaped}' and ExtendParent eq false&$select=UId&$top=1`;
+    const response = await this.httpClient.request<ODataCollectionResponse<{ UId: string }>>({
+      method: 'GET',
+      url,
+      contentKind: 'crud',
+    });
+    return response.data?.value?.[0]?.UId ?? null;
+  }
+
+  /**
    * Загружает $metadata не чаще TTL и ровно один раз на «пачку» параллельных
    * вызовов: HTTP-транспорт поднимает McpServer на каждый запрос, поэтому без
    * дедупликации in-flight десятки одновременных tool-вызовов тянут и парсят
@@ -398,15 +447,21 @@ export class MetadataManager {
 
     const entitySets = new Map<string, string>();
     const entityTypes = new Map<string, EdmxEntityType>();
+    const associations = new Map<string, EdmxAssociation>();
 
     const dataServices = parsed['edmx:Edmx']?.['edmx:DataServices'];
-    if (!dataServices) return { entitySets, entityTypes };
+    if (!dataServices) return { entitySets, entityTypes, associations };
 
     const schemas = toArray(dataServices.Schema);
     for (const schema of schemas) {
       // EntityTypes
       for (const et of toArray(schema.EntityType)) {
         if (et['@_Name']) entityTypes.set(et['@_Name'], et);
+      }
+      // Associations (v3): NavigationProperty.Relationship ссылается на них по qualified-имени
+      const ns = schema['@_Namespace'];
+      for (const assoc of toArray(schema.Association)) {
+        if (assoc['@_Name']) associations.set(ns ? `${ns}.${assoc['@_Name']}` : assoc['@_Name'], assoc);
       }
       // EntitySets
       const sets = toArray(schema.EntityContainer?.EntitySet);
@@ -417,7 +472,7 @@ export class MetadataManager {
       }
     }
 
-    return { entitySets, entityTypes };
+    return { entitySets, entityTypes, associations };
   }
 
   private async parseEntityMetadata(collection: string): Promise<EntityMetadata> {
@@ -623,11 +678,17 @@ export class MetadataManager {
       isLookup: boolean;
     }> = [];
     const lowerSearch = searchText.toLowerCase();
+    // Стенды без подписей колонок: «Город» находим по встроенному словарю (City/CityId).
+    const aliasNames = new Set(aliasCandidates(searchText).flatMap((name) => [name, `${name}Id`]));
 
     const collectFromMetadata = (metadata: EntityMetadata) => {
       for (const prop of metadata.properties) {
         const caption = prop.caption || '';
-        if (caption.toLowerCase().includes(lowerSearch) || prop.name.toLowerCase().includes(lowerSearch)) {
+        if (
+          caption.toLowerCase().includes(lowerSearch) ||
+          prop.name.toLowerCase().includes(lowerSearch) ||
+          aliasNames.has(prop.name)
+        ) {
           results.push({
             collection: metadata.collectionName,
             fieldName: prop.name,
@@ -648,6 +709,100 @@ export class MetadataManager {
 
     return results;
   }
+}
+
+/** Одна lookup-связь: у `from` есть FK-колонка `field` (навигация `nav`) на `to`. */
+export interface LookupEdge {
+  from: string;
+  field: string;
+  nav: string;
+  to: string;
+}
+
+/** Все lookup-связи схемы, ключи — имена EntitySet. */
+export interface LookupGraph {
+  outgoing: Map<string, LookupEdge[]>;
+  incoming: Map<string, LookupEdge[]>;
+  /** Колонка отображения коллекции (Name/Title/...), null — не нашлась. */
+  displayColumns: Map<string, string | null>;
+  edgeCount: number;
+  /** Версия OData, по которой построен граф: v3-коллекции называются `XxxCollection`. */
+  odataVersion: ODataVersion;
+}
+
+/** Навигации аудита — есть почти у каждой сущности и связывают всё со всем через Contact. */
+const SYSTEM_NAVS = new Set(['CreatedBy', 'ModifiedBy', 'LockedBy']);
+
+/** Тот же порядок, что у getDisplayColumn в utils/display.ts. */
+const DISPLAY_COLUMN_CANDIDATES = [
+  'Name',
+  'Title',
+  'LeadName',
+  'Subject',
+  'Caption',
+  'FullName',
+  'Code',
+  'Number',
+];
+
+/**
+ * Строит граф lookup-связей за один проход по разобранному EDMX (без запросов
+ * подписей). Берутся только одиночные навигации с FK-колонкой `CityId`; коллекционные
+ * `XxxCollectionByYyy` — обратные стороны тех же связей.
+ * v4: цель — `Type="NS.City"`, `Collection(...)` — коллекционная навигация.
+ * v3 (CSDL 2.0): у навигации нет Type — цель и кратность берутся из конца Association
+ * с `Role = ToRole`; одиночная, если Multiplicity `0..1` или `1`.
+ * ponytail: коллекция по типу цели берётся из EntitySet, а не из AssociationSet — если
+ * один тип выставлен в нескольких EntitySet, связь уйдёт в первый.
+ */
+function buildLookupGraph(meta: ParsedMetadata, odataVersion: ODataVersion): LookupGraph {
+  const setByType = new Map<string, string>();
+  for (const [setName, qualifiedType] of meta.entitySets) {
+    const short = qualifiedType.split('.').pop();
+    if (short && !setByType.has(short)) setByType.set(short, setName);
+  }
+
+  const outgoing = new Map<string, LookupEdge[]>();
+  const incoming = new Map<string, LookupEdge[]>();
+  const displayColumns = new Map<string, string | null>();
+  let edgeCount = 0;
+
+  for (const [setName, qualifiedType] of meta.entitySets) {
+    const entityType = meta.entityTypes.get(qualifiedType.split('.').pop() || setName);
+    if (!entityType || !isSafeIdentifier(setName)) continue;
+
+    const propNames = new Set(toArray(entityType.Property).map((p) => p['@_Name']));
+    displayColumns.set(setName, DISPLAY_COLUMN_CANDIDATES.find((c) => propNames.has(c)) ?? null);
+
+    for (const np of toArray(entityType.NavigationProperty)) {
+      const nav = np['@_Name'];
+      const type = singleNavTarget(meta, np);
+      if (!nav || !type || SYSTEM_NAVS.has(nav)) continue;
+      const field = `${nav}Id`;
+      const to = setByType.get(type.split('.').pop() || '');
+      if (!to || !propNames.has(field) || !isSafeIdentifier(field) || !isSafeIdentifier(to)) continue;
+
+      const edge: LookupEdge = { from: setName, field, nav, to };
+      (outgoing.get(setName) ?? outgoing.set(setName, []).get(setName)!).push(edge);
+      (incoming.get(to) ?? incoming.set(to, []).get(to)!).push(edge);
+      edgeCount++;
+    }
+  }
+
+  return { outgoing, incoming, displayColumns, edgeCount, odataVersion };
+}
+
+/** Qualified-тип цели одиночной навигации; null — коллекционная или неразрешимая. */
+function singleNavTarget(meta: ParsedMetadata, np: EdmxNavigationProperty): string | null {
+  const type = np['@_Type'];
+  if (type) return type.startsWith('Collection(') ? null : type;
+
+  const relationship = np['@_Relationship'];
+  const toRole = np['@_ToRole'];
+  if (!relationship || !toRole) return null;
+  const end = toArray(meta.associations.get(relationship)?.End).find((e) => e['@_Role'] === toRole);
+  const multiplicity = end?.['@_Multiplicity'];
+  return multiplicity === '0..1' || multiplicity === '1' ? (end?.['@_Type'] ?? null) : null;
 }
 
 function toArray<T>(value: T | T[] | undefined | null): T[] {

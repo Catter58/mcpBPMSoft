@@ -152,6 +152,65 @@ export function calendarRange(period: CalendarPeriod, timeZone: string, now: Dat
   }
 }
 
+/**
+ * Предыдущий календарный период той же единицы: сегодня → вчера, эта неделя →
+ * прошлая, прошлый месяц → позапрошлый, этот квартал → предыдущий квартал.
+ * Конец предыдущего периода — ровно начало текущего.
+ */
+export function previousPeriodRange(
+  period: CalendarPeriod,
+  timeZone: string,
+  now: Date = new Date()
+): DateRange {
+  const { from } = calendarRange(period, timeZone, now);
+  const start = zonedParts(from, timeZone);
+  const months = { this_month: 1, last_month: 1, this_quarter: 3, this_year: 12 } as Record<string, number>;
+  if (months[period]) {
+    const index = start.year * 12 + (start.month - 1) - months[period];
+    return { from: zonedMidnightUtc(Math.floor(index / 12), (index % 12) + 1, 1, timeZone), to: from };
+  }
+  const days = period === 'this_week' || period === 'last_week' ? 7 : 1;
+  // От полудня, а не от полуночи: сутки с переводом часов короче или длиннее 24 часов.
+  const back = zonedParts(new Date(from.getTime() + (12 - days * 24) * 3600000), timeZone);
+  return { from: zonedMidnightUtc(back.year, back.month, back.day, timeZone), to: from };
+}
+
+/** Шаг временной группировки. */
+export type DateBucket = 'day' | 'week' | 'month' | 'quarter' | 'year';
+
+/**
+ * Подпись временного интервала в поясе пользователя; подписи одного шага
+ * сортируются как строки: '2026-09-14', 'неделя с 2026-09-14', '2026-09', '2026-Q3', '2026'.
+ */
+export function bucketLabel(instant: Date, bucket: DateBucket, timeZone: string): string {
+  const p = zonedParts(instant, timeZone);
+  const pad = (n: number) => String(n).padStart(2, '0');
+  switch (bucket) {
+    case 'day':
+      return `${p.year}-${pad(p.month)}-${pad(p.day)}`;
+    case 'week': {
+      // Неделя с понедельника; календарная арифметика в UTC не зависит от пояса.
+      const monday = new Date(Date.UTC(p.year, p.month - 1, p.day - ((p.weekday + 6) % 7)));
+      return `неделя с ${monday.toISOString().slice(0, 10)}`;
+    }
+    case 'month':
+      return `${p.year}-${pad(p.month)}`;
+    case 'quarter':
+      return `${p.year}-Q${Math.floor((p.month - 1) / 3) + 1}`;
+    case 'year':
+      return String(p.year);
+  }
+}
+
+/** Подписи всех интервалов периода по порядку — чтобы сопоставить «понедельник с понедельником». */
+export function bucketLabelsInRange(range: DateRange, bucket: DateBucket, timeZone: string): string[] {
+  const labels = new Set<string>();
+  for (let t = range.from.getTime() + 12 * 3600000; t < range.to.getTime(); t += 86400000) {
+    labels.add(bucketLabel(new Date(t), bucket, timeZone));
+  }
+  return [...labels];
+}
+
 /** Человекочитаемая сводка «который сейчас час» для ответа модели. */
 export function describeNow(
   timeZone: string,

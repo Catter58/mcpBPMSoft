@@ -5,7 +5,9 @@
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import type { ServiceContainer } from './init-tool.js';
 import type { ResolvedLookupNote } from '../lookup/lookup-resolver.js';
-import { UnknownCollectionError } from '../utils/errors.js';
+import { LookupResolutionError, UnknownCollectionError } from '../utils/errors.js';
+import { getDisplayColumn } from '../utils/display.js';
+import { compileFilter, type CompileResult, type Criterion } from '../utils/filter-compiler.js';
 
 export const NOT_INITIALIZED_RESULT: CallToolResult = {
   content: [
@@ -108,4 +110,62 @@ export async function resolveCollectionName(services: ServiceContainer, input: s
   }
   if (ref.name) return ref.name;
   throw new UnknownCollectionError(input, 'suggestions' in ref ? ref.suggestions : []);
+}
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * UUID записи по тому, что передал клиент: UUID — как есть, иначе поиск по колонке
+ * отображения (Name/Title/LeadName...). Модель пишет «Ромашка» и не должна сама
+ * искать Id отдельным вызовом. Промах или неоднозначность — LookupResolutionError
+ * с кандидатами, запись наугад не выбирается.
+ */
+export async function resolveRecordId(
+  services: ServiceContainer,
+  collection: string,
+  idOrName: string
+): Promise<{ id: string; matched?: string }> {
+  const value = idOrName.trim();
+  if (UUID_RE.test(value)) return { id: value };
+
+  const column = (await getDisplayColumn(services.metadataManager, collection)) ?? 'Name';
+  const result = await services.lookupResolver.resolve(collection, value, column, { fuzzy: true });
+  if (result.resolved && result.id) return { id: result.id, matched: result.matchedValue ?? value };
+  throw new LookupResolutionError(column, value, result.matchCount, result.candidates, {
+    lookupCollection: collection,
+    displayColumn: column,
+  });
+}
+
+/**
+ * criteria-DSL → $filter с поясом и «я» текущего пользователя. Общий путь для
+ * поиска, подсчёта и массовых операций, чтобы модель нигде не собирала $filter руками.
+ */
+export async function compileCriteria(
+  services: ServiceContainer,
+  collection: string,
+  criteria: Criterion[],
+  join?: 'and' | 'or'
+): Promise<CompileResult> {
+  let timeZone: string | undefined;
+  try {
+    timeZone = (await services.currentUser.get()).timeZoneId || undefined;
+  } catch {
+    // DataService недоступен — считаем в поясе сервера.
+  }
+  return compileFilter(criteria, {
+    collection,
+    metadataManager: services.metadataManager,
+    odataVersion: services.config.odata_version,
+    join,
+    timeZone,
+    currentUser: services.currentUser,
+  });
+}
+
+/** Сырой $filter и скомпилированные criteria через and; пустые части отбрасываются. */
+export function combineFilters(...filters: Array<string | undefined>): string | undefined {
+  const parts = filters.map((f) => f?.trim()).filter((f): f is string => Boolean(f));
+  if (parts.length === 0) return undefined;
+  return parts.length === 1 ? parts[0] : parts.map((f) => `(${f})`).join(' and ');
 }

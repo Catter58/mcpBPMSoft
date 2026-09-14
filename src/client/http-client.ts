@@ -196,11 +196,16 @@ export class HttpClient {
         return this.requestWithRetry<T>(options, attempt + 1);
       }
 
+      const mayHaveApplied = NON_REPLAYABLE_METHODS.has(options.method) && !options.skipAuth;
+
       // 5xx (other than 503): exponential backoff, except for non-replayable methods
+      // and deterministic application errors (повтор даст тот же ответ).
       if (response.status >= 500 && response.status !== 503) {
-        const body = truncate(safeStringify(data), 500);
+        const errorBody = jsonFromBinary(data);
+        const body = truncate(safeStringify(errorBody), 500);
         const nonReplayable = NON_REPLAYABLE_METHODS.has(options.method);
-        if (attempt < MAX_RETRIES && !nonReplayable) {
+        const deterministic = isDeterministicAppError(errorBody);
+        if (attempt < MAX_RETRIES && !nonReplayable && !deterministic) {
           const delayMs = RETRY_BASE_DELAY_MS * Math.pow(2, attempt);
           console.error(
             `[HttpClient] 5xx (${response.status}) on ${options.method} ${shortUrl(options.url)}: ${body}, retrying in ${delayMs}ms (attempt ${attempt + 1}/${MAX_RETRIES})`
@@ -208,30 +213,63 @@ export class HttpClient {
           await sleep(delayMs);
           return this.requestWithRetry<T>(options, attempt + 1);
         }
+        const reason = nonReplayable
+          ? 'неидемпотентный метод, запись могла пройти'
+          : deterministic
+            ? 'прикладная ошибка сервера, повтор не поможет'
+            : 'исчерпаны попытки';
         console.error(
-          `[HttpClient] 5xx (${response.status}) on ${options.method} ${shortUrl(options.url)}: ${body} — не повторяю (${nonReplayable ? 'неидемпотентный метод, запись могла пройти' : 'исчерпаны попытки'})`
+          `[HttpClient] 5xx (${response.status}) on ${options.method} ${shortUrl(options.url)}: ${body} — не повторяю (${reason})`
         );
       }
 
       // 304 — штатный ответ на условный GET (If-None-Match), а не сбой.
       if (!response.ok && response.status !== 304) {
-        const odataError = parseODataError(data);
-        const bodySnippet = truncate(safeStringify(data), 1000);
+        const errorBody = jsonFromBinary(data);
+        const odataError = parseODataError(errorBody);
+        const bodySnippet = truncate(safeStringify(errorBody), 1000);
+        let details =
+          odataError ?? (bodySnippet && bodySnippet !== '{}' ? `Тело ответа: ${bodySnippet}` : undefined);
+        let nextSteps: string[] | undefined;
+        if (mayHaveApplied && response.status >= 500 && response.status !== 503) {
+          details = [details, replayNote(options.method)].filter(Boolean).join('\n');
+          nextSteps = REPLAY_NEXT_STEPS;
+        }
         throw new BpmApiError(
           odataError || `HTTP ${response.status}: ${response.statusText}`,
           response.status,
           undefined,
-          odataError ?? (bodySnippet && bodySnippet !== '{}' ? `Тело ответа: ${bodySnippet}` : undefined)
+          details,
+          undefined,
+          nextSteps
         );
       }
 
       return httpResponse;
     } catch (error) {
       if (error instanceof BpmApiError) throw error;
+      // Таймаут или обрыв соединения после отправки POST не означает, что запись не создана.
+      const mayHaveApplied = NON_REPLAYABLE_METHODS.has(options.method) && !options.skipAuth;
+      const note = mayHaveApplied ? `. ${replayNote(options.method)}` : '';
+      const nextSteps = mayHaveApplied ? REPLAY_NEXT_STEPS : undefined;
       if (error instanceof Error && error.name === 'AbortError') {
-        throw new BpmApiError(`Превышен таймаут запроса (${timeout}ms)`, 408);
+        throw new BpmApiError(
+          `Превышен таймаут запроса (${timeout}ms)${note}`,
+          408,
+          undefined,
+          undefined,
+          undefined,
+          nextSteps
+        );
       }
-      throw new BpmApiError(`Сетевая ошибка: ${error instanceof Error ? error.message : String(error)}`, 0);
+      throw new BpmApiError(
+        `Сетевая ошибка: ${error instanceof Error ? error.message : String(error)}${note}`,
+        0,
+        undefined,
+        undefined,
+        undefined,
+        nextSteps
+      );
     } finally {
       clearTimeout(timeoutId);
     }
@@ -494,6 +532,53 @@ export class HttpClient {
       console.error(`[HttpClient][res] body=${truncate(safeStringify(response.data), 1000)}`);
     }
   }
+}
+
+function replayNote(method: string): string {
+  return `Запрос ${method} мог выполниться на сервере: перед повтором проверьте, не создана ли запись (bpm_get_records/bpm_count_records по уникальному полю).`;
+}
+
+const REPLAY_NEXT_STEPS = [
+  'Не повторяйте запрос вслепую: сервер мог успеть сохранить запись, и повтор создаст дубликат.',
+  'Найдите запись через bpm_get_records или bpm_count_records по уникальному полю (например, Title/Name и CreatedOn за последние минуты).',
+  'Повторяйте создание, только если запись не найдена.',
+];
+
+/** Признаки временного сбоя в тексте/типе исключения: такие 5xx повторять имеет смысл. */
+// Тип исключения СУБД (Npgsql/SqlException) сам по себе не значит «временно»: на bpm9 битая таблица
+// отвечает PostgresException на каждый запрос. Повторяем только по признакам временного сбоя.
+const TRANSIENT_ERROR_RE =
+  /timeout|timed out|deadlock|could not serialize|too many clients|connection|transport|temporar|reading from stream|end of stream|broken pipe/i;
+
+/** BPMSoft отдаёт JSON-ошибку и на binary-запросы (contentKind 'binary') — достаём её из Buffer. */
+function jsonFromBinary(data: unknown): unknown {
+  if (!(data instanceof Uint8Array)) return data;
+  try {
+    return JSON.parse(Buffer.from(data).toString('utf8').trim());
+  } catch {
+    return data;
+  }
+}
+
+/**
+ * 5xx с телом OData-ошибки и нетранзиентным исключением (валидация, бизнес-правило,
+ * FormatException) — детерминирован: повтор вернёт то же самое. HTML шлюза, пустое
+ * тело и timeout/deadlock/обрыв БД — не детерминированы.
+ */
+function isDeterministicAppError(body: unknown): boolean {
+  let parsed = body;
+  if (typeof parsed === 'string') {
+    try {
+      parsed = JSON.parse(parsed.trim());
+    } catch {
+      return false;
+    }
+  }
+  const message = parseODataError(parsed);
+  if (!message) return false;
+  const inner = (parsed as { error?: { innererror?: { type?: unknown; message?: unknown } } }).error
+    ?.innererror;
+  return !TRANSIENT_ERROR_RE.test([message, inner?.type, inner?.message].join(' '));
 }
 
 function sleep(ms: number): Promise<void> {

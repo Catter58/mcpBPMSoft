@@ -106,6 +106,11 @@ export function registerBatchTools(server: McpServer, services: ServiceContainer
             `  Успешно создано: ${succeeded.length}`,
             `  Ошибок: ${failed.length}`,
           ];
+          // Id созданных записей нужны модели для следующего шага, а structuredContent читают не все клиенты.
+          const createdIds = succeeded
+            .map((r) => (r.body as Record<string, unknown> | null)?.Id)
+            .filter(Boolean);
+          if (createdIds.length > 0) lines.push(`  Id: ${createdIds.join(', ')}`);
           const notesLine = lookupNotesText(allNotes);
           if (notesLine) lines.push(notesLine);
           if (failed.length > 0) {

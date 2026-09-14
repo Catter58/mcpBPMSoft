@@ -9,7 +9,7 @@
 import type { BpmConfig, HttpResponse, ODataCollectionResponse, ODataVersion } from '../types/index.js';
 import { HttpClient } from './http-client.js';
 import { getODataBaseUrl } from '../config.js';
-import { BpmApiError } from '../utils/errors.js';
+import { BpmApiError, isQueryUnsupportedError } from '../utils/errors.js';
 import { assertSafeIdentifier, assertGuid } from '../utils/odata.js';
 
 export interface QueryOptions {
@@ -63,12 +63,34 @@ export class ODataClient {
     autoPaginate: boolean = false,
     maxRecords?: number
   ): Promise<ODataCollectionResponse<T>> {
-    const url = this.buildCollectionUrl(collection, query);
-    const response = await this.httpClient.request<ODataCollectionResponse<T>>({
-      method: 'GET',
-      url,
-      contentKind: 'crud',
-    });
+    let response: HttpResponse<ODataCollectionResponse<T>>;
+    try {
+      response = await this.httpClient.request<ODataCollectionResponse<T>>({
+        method: 'GET',
+        url: this.buildCollectionUrl(collection, query),
+        contentKind: 'crud',
+      });
+    } catch (error) {
+      if (query?.$count !== true || !isQueryUnsupportedError(error)) throw error;
+      // bpm9: $count=true вместе с $filter по guid-колонке рвёт поток (200, 0 байт).
+      // Берём страницу без $count, а итог — отдельным /$count, если сервер его осилит.
+      response = await this.httpClient.request<ODataCollectionResponse<T>>({
+        method: 'GET',
+        url: this.buildCollectionUrl(collection, { ...query, $count: undefined }),
+        contentKind: 'crud',
+      });
+      let countNote: string;
+      try {
+        const total = await this.getCount(collection, query.$filter);
+        response.data['@odata.count'] = total;
+        countNote = `итог получен через /$count: ${total}`;
+      } catch (countError) {
+        countNote = `/$count тоже не сработал (${countError instanceof Error ? countError.message : String(countError)}), итог не указан`;
+      }
+      console.error(
+        `[ODataClient] ${collection}: $count=true отвергнут (${error instanceof Error ? error.message : String(error)}), страница получена без $count; ${countNote}`
+      );
+    }
 
     const result = response.data;
     const limit = maxRecords ?? Infinity;

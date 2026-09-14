@@ -12,7 +12,7 @@ import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import type { ServiceContainer } from './init-tool.js';
 import { BpmApiError, formatToolError } from '../utils/errors.js';
 import { getTool } from './registry.js';
-import { notInitialized } from './_guards.js';
+import { notInitialized, resolveRecordId } from './_guards.js';
 
 export function registerProcessTools(server: McpServer, services: ServiceContainer): void {
   // bpm_run_process
@@ -154,7 +154,7 @@ export function registerProcessTools(server: McpServer, services: ServiceContain
           collection: z
             .string()
             .describe('Имя коллекции записи, к которой публикуется сообщение (например: Contact).'),
-          id: z.string().describe('UUID записи, в ленте которой публикуется сообщение.'),
+          id: z.string().describe('UUID или название записи, в ленте которой публикуется сообщение.'),
           message: z.string().describe('Текст сообщения.'),
           parent_id: z
             .string()
@@ -192,10 +192,23 @@ export function registerProcessTools(server: McpServer, services: ServiceContain
             };
           }
 
+          const { id } = await resolveRecordId(services, collRef.name, params.id);
+
+          // Лента привязывается к объекту по UId схемы: колонки EntitySchemaName у SocialMessage нет.
+          const schemaUId = await services.metadataManager.getEntitySchemaUId(collRef.name);
+          if (!schemaUId) {
+            return {
+              content: [
+                { type: 'text', text: `Не удалось определить UId схемы ${collRef.name} через SysSchema.` },
+              ],
+              isError: true,
+            };
+          }
+
           const body: Record<string, unknown> = {
             Message: params.message,
-            EntitySchemaName: collRef.name,
-            EntityId: params.id,
+            EntitySchemaUId: schemaUId,
+            EntityId: id,
           };
           if (params.parent_id) {
             body.ParentId = params.parent_id;
@@ -223,12 +236,12 @@ export function registerProcessTools(server: McpServer, services: ServiceContain
             content: [
               {
                 type: 'text',
-                text: `Сообщение опубликовано в ленту ${collRef.name}(${params.id}).`,
+                text: `Сообщение опубликовано в ленту ${collRef.name}(${id}).`,
               },
             ],
             structuredContent: {
               collection: collRef.name,
-              entity_id: params.id,
+              entity_id: id,
               parent_id: params.parent_id,
               social_message: created,
             },

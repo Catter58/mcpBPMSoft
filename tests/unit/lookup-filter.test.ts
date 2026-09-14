@@ -72,13 +72,14 @@ describe('lookup в criteria-DSL', () => {
     expect(await compile('Город', 'содержит', 'Моск')).toBe("contains(tolower(City/Name), 'моск')");
   });
 
-  it('UUID сравнивается с самой FK-колонкой — так дешевле для сервера', async () => {
-    expect(await compile('Город', 'равно', MOSCOW_ID)).toBe(`CityId eq ${MOSCOW_ID}`);
+  it('равенство UUID идёт через навигацию City/Id: /$count на bpm9 падает на CityId eq <uuid>', async () => {
+    expect(await compile('Город', 'равно', MOSCOW_ID)).toBe(`City/Id eq ${MOSCOW_ID}`);
+    expect(await compile('Город', 'не равно', MOSCOW_ID)).toBe(`not (City/Id eq ${MOSCOW_ID})`);
   });
 
-  it('пустота проверяется на FK-колонке, а не на навигации', async () => {
-    expect(await compile('Город', 'пусто')).toBe('CityId eq null');
-    expect(await compile('Город', 'не пусто')).toBe('CityId ne null');
+  it('пустота проверяется через навигацию: на bpm9 FK eq/ne null рвёт поток', async () => {
+    expect(await compile('Город', 'пусто')).toBe('City eq null');
+    expect(await compile('Город', 'не пусто')).toBe('City/Id ne null');
   });
 
   it('список текстовых значений разворачивается по имени', async () => {

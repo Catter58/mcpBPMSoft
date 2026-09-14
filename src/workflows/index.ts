@@ -13,6 +13,7 @@ import { registerRegisterContactTool } from './register-contact.js';
 import { registerLogActivityTool } from './log-activity.js';
 import { registerSetStatusTool } from './set-status.js';
 import { registerSearchUnifiedTool } from './search-unified.js';
+import { registerMyAgendaTool } from './my-agenda.js';
 
 export { findOrCreate } from './find-or-create.js';
 export type { FindOrCreateResult } from './find-or-create.js';
@@ -22,4 +23,5 @@ export function registerWorkflowTools(server: McpServer, services: ServiceContai
   registerLogActivityTool(server, services);
   registerSetStatusTool(server, services);
   registerSearchUnifiedTool(server, services);
+  registerMyAgendaTool(server, services);
 }

@@ -12,7 +12,45 @@ import type { ServiceContainer } from '../tools/init-tool.js';
 import { formatToolError } from '../utils/errors.js';
 import { getTool } from '../tools/registry.js';
 import { notInitialized } from '../tools/_guards.js';
+import { escapeODataString, guidLiteral } from '../utils/odata.js';
 import { findOrCreate } from './find-or-create.js';
+
+async function findExistingContact(
+  services: ServiceContainer,
+  filter: string
+): Promise<{ id: string; name: string } | null> {
+  const res = await services.odataClient.getRecords<Record<string, unknown>>('Contact', {
+    $filter: filter,
+    $select: 'Id,Name',
+    $top: 1,
+  });
+  const rec = res.value[0];
+  return rec ? { id: String(rec.Id ?? ''), name: String(rec.Name ?? '') } : null;
+}
+
+function alreadyExists(
+  existing: { id: string; name: string },
+  by: string,
+  accountId: string | null = null
+): CallToolResult {
+  return {
+    content: [
+      {
+        type: 'text',
+        text: `Контакт уже существует: ${existing.name} (${existing.id}), совпадение по ${by}. Новый не создан; чтобы создать всё равно, передайте force=true.`,
+      },
+    ],
+    structuredContent: {
+      contact_id: existing.id,
+      contact_name: existing.name,
+      account_id: accountId,
+      account_created: false,
+      contact_created: false,
+      already_exists: true,
+      warnings: [],
+    },
+  };
+}
 
 export function registerRegisterContactTool(server: McpServer, services: ServiceContainer): void {
   const meta = getTool('bpm_register_contact');
@@ -31,7 +69,18 @@ export function registerRegisterContactTool(server: McpServer, services: Service
           .describe(
             'Название контрагента. Если указано — будет найден или создан Account и привязан к контакту.'
           ),
-        position: z.string().optional().describe('Должность контакта (Job)'),
+        position: z
+          .string()
+          .optional()
+          .describe(
+            'Должность контакта. Ищется в справочнике Job; если такой должности нет — сохраняется текстом в JobTitle.'
+          ),
+        force: z
+          .boolean()
+          .optional()
+          .describe(
+            'Создать контакт, даже если уже есть контакт с тем же Email (или, без email, с тем же ФИО и контрагентом).'
+          ),
         extra: z
           .record(z.string(), z.unknown())
           .optional()
@@ -44,6 +93,8 @@ export function registerRegisterContactTool(server: McpServer, services: Service
         account_id: z.string().nullable(),
         account_created: z.boolean(),
         contact_created: z.boolean(),
+        already_exists: z.boolean().optional(),
+        contact_name: z.string().optional(),
         warnings: z.array(z.string()),
       },
       annotations: meta.annotations,
@@ -53,6 +104,16 @@ export function registerRegisterContactTool(server: McpServer, services: Service
       try {
         await services.authManager.ensureAuthenticated();
         const warnings: string[] = [];
+
+        // Дубль по Email (сортировка БД регистронезависима) проверяем до find-or-create
+        // контрагента, чтобы не создать лишний Account под уже существующий контакт.
+        if (params.email && !params.force) {
+          const existing = await findExistingContact(
+            services,
+            `Email eq '${escapeODataString(params.email)}'`
+          );
+          if (existing) return alreadyExists(existing, `Email "${params.email}"`);
+        }
 
         let accountId: string | null = null;
         let accountCreated = false;
@@ -82,10 +143,47 @@ export function registerRegisterContactTool(server: McpServer, services: Service
           }
         }
 
+        // Без email дубль ищем по ФИО (+ контрагент). Только что созданный контрагент
+        // контактов иметь не может — проверку пропускаем.
+        if (!params.email && !params.force && !accountCreated) {
+          let filter = `Name eq '${escapeODataString(params.name)}'`;
+          if (accountField && accountId) {
+            filter += ` and ${accountField} eq ${guidLiteral(accountId, services.config.odata_version)}`;
+          }
+          const existing = await findExistingContact(services, filter);
+          if (existing) {
+            return alreadyExists(existing, accountField ? 'ФИО и контрагенту' : 'ФИО', accountId);
+          }
+        }
+
         const contactData: Record<string, unknown> = { Name: params.name };
         if (params.email !== undefined) contactData.Email = params.email;
         if (params.phone !== undefined) contactData.Phone = params.phone;
-        if (params.position !== undefined) contactData.Job = params.position;
+        if (params.position !== undefined) {
+          contactData.Job = params.position;
+          const jobRef = await services.metadataManager.resolveFieldReference('Contact', 'Job');
+          const jobLookup = jobRef.name
+            ? await services.metadataManager.getLookupInfo('Contact', jobRef.name)
+            : null;
+          const contactMeta = await services.metadataManager.getEntityMetadata('Contact');
+          if (jobLookup && contactMeta.properties.some((p) => p.name === 'JobTitle')) {
+            const job = await services.lookupResolver.resolve(
+              jobLookup.lookupCollection,
+              params.position,
+              jobLookup.displayColumn,
+              { fuzzy: true }
+            );
+            // Должности нет в справочнике — сохраняем текстом, а не падаем.
+            // Неоднозначность (несколько кандидатов) остаётся ошибкой в resolveDataLookups.
+            if (job.matchCount === 0) {
+              delete contactData.Job;
+              contactData.JobTitle = params.position;
+              warnings.push(
+                `Должность "${params.position}" не найдена в справочнике ${jobLookup.lookupCollection} — сохранена текстом в JobTitle.`
+              );
+            }
+          }
+        }
         if (accountField && accountId) contactData[accountField] = accountId;
         if (params.extra) {
           for (const [k, v] of Object.entries(params.extra)) {

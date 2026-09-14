@@ -51,9 +51,9 @@ export function initializeServices(
   const authManager = new AuthManager(config, httpClient, allowEnvCreds);
   const odataClient = new ODataClient(config, httpClient);
   const metadataManager = new MetadataManager(config, odataClient, httpClient);
-  const lookupResolver = new LookupResolver(config, odataClient, metadataManager);
-  const processEngine = new ProcessEngineClient(config, httpClient);
   const currentUser = new CurrentUserService(config, httpClient);
+  const lookupResolver = new LookupResolver(config, odataClient, metadataManager, { currentUser });
+  const processEngine = new ProcessEngineClient(config, httpClient);
 
   return {
     config,

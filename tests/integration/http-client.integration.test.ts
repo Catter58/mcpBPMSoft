@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, afterEach, vi, onTestFinished } from 'vitest';
 import { setupServer } from 'msw/node';
 import { http, HttpResponse } from 'msw';
 import { HttpClient } from '../../src/client/http-client.js';
@@ -314,12 +314,20 @@ describe('HttpClient 5xx replay safety', () => {
     expect(count).toBe(1);
   });
 
-  it('GET is still retried on 500 and the server message reaches the caller', async () => {
+  it('GET is still retried on a transient 500 and the server message reaches the caller', async () => {
     let count = 0;
     server.use(
       http.get(`${ORIGIN}/odata/Contact`, () => {
         count += 1;
-        return HttpResponse.json({ error: { message: { lang: 'ru', value: 'сломалось' } } }, { status: 500 });
+        return HttpResponse.json(
+          {
+            error: {
+              message: { lang: 'ru', value: 'сломалось' },
+              innererror: { type: 'Npgsql.NpgsqlException', message: 'Exception while reading from stream' },
+            },
+          },
+          { status: 500 }
+        );
       })
     );
 
@@ -333,12 +341,156 @@ describe('HttpClient 5xx replay safety', () => {
     expect(count).toBe(1 + 3); // initial + MAX_RETRIES
   }, 20000);
 
-  it('non-OData 500 body is surfaced in details instead of being dropped', async () => {
+  it('PATCH with a deterministic OData business error (500) is NOT retried', async () => {
+    let count = 0;
     server.use(
-      http.delete(`${ORIGIN}/odata/ActivityDelete`, () =>
-        HttpResponse.text('<html>Server Error in Application</html>', { status: 500 })
+      http.patch(/\/odata\/SysAdminUnit\(1\)$/, () => {
+        count += 1;
+        return HttpResponse.json(
+          {
+            error: {
+              code: null,
+              message: 'Невозможно добавить корневую единицу администрирования',
+              innererror: {
+                message: 'Невозможно добавить корневую единицу администрирования',
+                type: 'BPMSoft.Web.OData.Exceptions.GenericODataException',
+              },
+            },
+          },
+          { status: 500 }
+        );
+      })
+    );
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    const client = new HttpClient(makeCfg());
+    client.setAllowedOrigin(ORIGIN);
+
+    await expect(
+      runWithAuth(auth(), () =>
+        client.request({ method: 'PATCH', url: `${ORIGIN}/odata/SysAdminUnit(1)`, body: { Name: 'x' } })
+      )
+    ).rejects.toMatchObject({
+      httpStatus: 500,
+      message: 'Невозможно добавить корневую единицу администрирования',
+    });
+
+    expect(count).toBe(1);
+    expect(errSpy.mock.calls.some((c) => String(c[0]).includes('прикладная ошибка сервера'))).toBe(true);
+    errSpy.mockRestore();
+  });
+
+  it('binary GET 500 with a JSON error body is decoded and NOT retried', async () => {
+    let count = 0;
+    server.use(
+      http.get(/\/odata\/SysImage\(1\)\/Data$/, () => {
+        count += 1;
+        const body = JSON.stringify({
+          error: {
+            message: 'Input string was not in a correct format.',
+            innererror: { type: 'System.FormatException' },
+          },
+        });
+        return new HttpResponse(Buffer.from(body), {
+          status: 500,
+          headers: { 'Content-Type': 'application/octet-stream' },
+        });
+      })
+    );
+
+    const client = new HttpClient(makeCfg());
+    client.setAllowedOrigin(ORIGIN);
+
+    await expect(
+      runWithAuth(auth(), () =>
+        client.request({
+          method: 'GET',
+          url: `${ORIGIN}/odata/SysImage(1)/Data`,
+          contentKind: 'binary',
+          responseType: 'binary',
+        })
+      )
+    ).rejects.toMatchObject({ httpStatus: 500, message: 'Input string was not in a correct format.' });
+    expect(count).toBe(1);
+  });
+
+  it('POST 500 warns in details and next_steps that the record may exist', async () => {
+    server.use(
+      http.post(`${ORIGIN}/odata/Activity`, () =>
+        HttpResponse.json({ error: { message: 'boom' } }, { status: 500 })
       )
     );
+    const client = new HttpClient(makeCfg());
+    client.setAllowedOrigin(ORIGIN);
+
+    const err = (await runWithAuth(auth(), () =>
+      client.request({ method: 'POST', url: `${ORIGIN}/odata/Activity`, body: { Title: 'x' } })
+    ).catch((e: unknown) => e)) as BpmApiError;
+
+    expect(err).toBeInstanceOf(BpmApiError);
+    expect(err.details).toContain('boom');
+    expect(err.details).toContain('мог выполниться на сервере');
+    expect(err.toToolError().next_steps?.join(' ')).toContain('bpm_get_records');
+  });
+
+  it('POST timeout keeps 408 and tells the agent not to retry blindly', async () => {
+    let count = 0;
+    server.use(
+      http.post(`${ORIGIN}/odata/Activity`, async () => {
+        count += 1;
+        await new Promise((r) => setTimeout(r, 300));
+        return HttpResponse.json({ Id: '1' }, { status: 201 });
+      })
+    );
+    const client = new HttpClient(makeCfg({ request_timeout: 50 }));
+    client.setAllowedOrigin(ORIGIN);
+
+    const err = (await runWithAuth(auth(), () =>
+      client.request({ method: 'POST', url: `${ORIGIN}/odata/Activity`, body: { Title: 'x' } })
+    ).catch((e: unknown) => e)) as BpmApiError;
+
+    expect(err.httpStatus).toBe(408);
+    expect(err.message).toMatch(
+      /^Превышен таймаут запроса \(50ms\)\. Запрос POST мог выполниться на сервере/
+    );
+    expect(err.nextSteps?.[0]).toContain('Не повторяйте запрос вслепую');
+    expect(count).toBe(1);
+  });
+
+  it('POST network error keeps status 0 and warns; GET timeout message is unchanged', async () => {
+    server.use(
+      http.post(`${ORIGIN}/odata/Activity`, () => HttpResponse.error()),
+      http.get(`${ORIGIN}/odata/Activity`, async () => {
+        await new Promise((r) => setTimeout(r, 300));
+        return HttpResponse.json({ value: [] });
+      })
+    );
+    const client = new HttpClient(makeCfg({ request_timeout: 50 }));
+    client.setAllowedOrigin(ORIGIN);
+
+    const postErr = (await runWithAuth(auth(), () =>
+      client.request({ method: 'POST', url: `${ORIGIN}/odata/Activity`, body: { Title: 'x' } })
+    ).catch((e: unknown) => e)) as BpmApiError;
+    expect(postErr.httpStatus).toBe(0);
+    expect(postErr.message).toMatch(/^Сетевая ошибка: .*Запрос POST мог выполниться на сервере/);
+    expect(postErr.nextSteps).toBeDefined();
+
+    const getErr = (await runWithAuth(auth(), () =>
+      client.request({ method: 'GET', url: `${ORIGIN}/odata/Activity` })
+    ).catch((e: unknown) => e)) as BpmApiError;
+    expect(getErr).toMatchObject({ httpStatus: 408, message: 'Превышен таймаут запроса (50ms)' });
+    expect(getErr.nextSteps).toBeUndefined();
+  });
+
+  it('non-OData 500 body is surfaced in details instead of being dropped (and still retried)', async () => {
+    let count = 0;
+    server.use(
+      http.delete(`${ORIGIN}/odata/ActivityDelete`, () => {
+        count += 1;
+        return HttpResponse.text('<html>Server Error in Application</html>', { status: 500 });
+      })
+    );
+    onTestFinished(() => expect(count).toBe(1 + 3));
 
     const client = new HttpClient(makeCfg());
     client.setAllowedOrigin(ORIGIN);

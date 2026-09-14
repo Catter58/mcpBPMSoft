@@ -137,3 +137,61 @@ describe('ODataClient.getRecords with auto-pagination', () => {
     expect(http.allowedOrigin).toBe('https://bpm.test');
   });
 });
+
+describe('ODataClient.getRecords $count fallback', () => {
+  const torn = () => {
+    throw new BpmApiError('Сетевая ошибка: terminated', 0);
+  };
+  const page = () => ({ status: 200, data: { value: [{ Id: '1' }] } });
+  const query = { $filter: 'OwnerId ne null', $top: 1, $count: true };
+
+  it('retries without $count and fills @odata.count from /$count', async () => {
+    const http = new MockHttpClient();
+    http.setResponses([torn, page, () => ({ status: 200, data: '﻿42' })]);
+    const client = new ODataClient(makeCfg(), http as unknown as never);
+
+    const result = await client.getRecords('Activity', query);
+
+    expect(result.value).toHaveLength(1);
+    expect(result['@odata.count']).toBe(42);
+    expect(http.requests).toHaveLength(3);
+    expect(http.requests[0].url).toContain('%24count=true');
+    expect(http.requests[1].url).not.toContain('count');
+    expect(http.requests[2].url).toContain('/Activity/$count?%24filter=OwnerId+ne+null');
+    expect(http.requests[2].contentKind).toBe('count');
+  });
+
+  it('leaves count absent when /$count fails too', async () => {
+    const http = new MockHttpClient();
+    http.setResponses([
+      torn,
+      page,
+      () => {
+        throw new BpmApiError('Exception has been thrown by the target of an invocation.', 500);
+      },
+    ]);
+    const client = new ODataClient(makeCfg(), http as unknown as never);
+
+    const result = await client.getRecords('Activity', query);
+
+    expect(result.value).toHaveLength(1);
+    expect(result['@odata.count']).toBeUndefined();
+  });
+
+  it('does not retry when $count was not requested or the error is not a query rejection', async () => {
+    const http = new MockHttpClient();
+    http.setResponses([torn]);
+    const client = new ODataClient(makeCfg(), http as unknown as never);
+    await expect(client.getRecords('Activity', { $filter: 'OwnerId ne null' })).rejects.toThrow('terminated');
+
+    const http2 = new MockHttpClient();
+    http2.setResponses([
+      () => {
+        throw new BpmApiError('Нет доступа', 403);
+      },
+    ]);
+    const client2 = new ODataClient(makeCfg(), http2 as unknown as never);
+    await expect(client2.getRecords('Activity', query)).rejects.toMatchObject({ httpStatus: 403 });
+    expect(http2.requests).toHaveLength(1);
+  });
+});

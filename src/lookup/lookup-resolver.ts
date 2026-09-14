@@ -13,6 +13,8 @@ import { assertSafeIdentifier, escapeODataString, containsExpression } from '../
 import { normalizeName, scoreCandidate, pickConfidentIndex } from '../utils/name-normalize.js';
 import { isTolowerSupported, markTolowerUnsupported } from '../utils/server-capabilities.js';
 import { getAuthCacheScope } from '../auth/request-context.js';
+import type { CurrentUserService } from '../user/current-user.js';
+import { isMeMacro, meIdFor } from '../utils/me-macro.js';
 
 interface CacheEntry {
   result: LookupResult;
@@ -39,13 +41,15 @@ export class LookupResolver {
   /** LRU is implemented via Map insertion order: re-set on hit, delete oldest on overflow. */
   private cache = new Map<string, CacheEntry>();
   private readonly maxCacheSize: number;
+  private readonly currentUser?: CurrentUserService;
   constructor(
     private config: BpmConfig,
     private odataClient: ODataClient,
     private metadataManager: MetadataManager,
-    options: { maxCacheSize?: number } = {}
+    options: { maxCacheSize?: number; currentUser?: CurrentUserService } = {}
   ) {
     this.maxCacheSize = options.maxCacheSize ?? DEFAULT_CACHE_MAX;
+    this.currentUser = options.currentUser;
   }
 
   async resolve(
@@ -198,6 +202,12 @@ export class LookupResolver {
         const lookupInfo = await this.metadataManager.getLookupInfo(collection, normalizedKey);
         if (!lookupInfo) {
           return { key: normalizedKey, value, note: null };
+        }
+
+        // «я» / @me в Owner, Author и т. п. — текущий пользователь, без поиска по имени.
+        if (isMeMacro(value) && this.currentUser) {
+          const meId = meIdFor(lookupInfo.lookupCollection, await this.currentUser.get());
+          if (meId) return { key: normalizedKey, value: meId, note: null };
         }
 
         // Пустая строка в lookup-поле — это «очистить связь», а не значение для поиска.

@@ -13,17 +13,36 @@
 
 import * as z from 'zod';
 import { readFile, writeFile, stat as fsStat } from 'node:fs/promises';
-import { basename } from 'node:path';
+import { basename, extname } from 'node:path';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import type { ServiceContainer } from './init-tool.js';
 import { getODataBaseUrl } from '../config.js';
 import { formatToolError } from '../utils/errors.js';
 import { getTool } from './registry.js';
-import { notInitialized, resolveCollectionName } from './_guards.js';
+import { notInitialized, resolveCollectionName, resolveRecordId } from './_guards.js';
 import { isSafeIdentifier } from '../utils/odata.js';
 import { confirmParam, confirmationRequired, confirmationResponse } from '../utils/confirm.js';
 import { confirmShape } from './_schemas.js';
+
+const MIME_BY_EXTENSION: Record<string, string> = {
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.svg': 'image/svg+xml',
+  '.webp': 'image/webp',
+  '.pdf': 'application/pdf',
+  '.txt': 'text/plain',
+  '.csv': 'text/csv',
+  '.json': 'application/json',
+  '.xml': 'application/xml',
+  '.zip': 'application/zip',
+  '.doc': 'application/msword',
+  '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  '.xls': 'application/vnd.ms-excel',
+  '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+};
 
 export function registerStreamTools(server: McpServer, services: ServiceContainer): void {
   // bpm_upload_file (SysImage)
@@ -41,7 +60,7 @@ export function registerStreamTools(server: McpServer, services: ServiceContaine
             .string()
             .optional()
             .describe('Коллекция записи, к которой привязывается файл (вместе с target_id и target_field)'),
-          target_id: z.string().optional().describe('UUID записи, к которой привязывается файл'),
+          target_id: z.string().optional().describe('UUID или название записи, к которой привязывается файл'),
           target_field: z
             .string()
             .optional()
@@ -85,8 +104,10 @@ export function registerStreamTools(server: McpServer, services: ServiceContaine
 
           const fileName = params.name || basename(params.file_path);
 
+          // Без MimeType BPMSoft потом не отдаёт Data: 500 FormatException на пустом заголовке.
           const created = await services.odataClient.createRecord<Record<string, unknown>>('SysImage', {
             Name: fileName,
+            MimeType: MIME_BY_EXTENSION[extname(fileName).toLowerCase()] ?? 'application/octet-stream',
           });
           const imageId = String(created.Id || created.id || '');
           if (!imageId) {
@@ -116,7 +137,8 @@ export function registerStreamTools(server: McpServer, services: ServiceContaine
 
           if (params.target_collection && params.target_id && params.target_field) {
             const linkData: Record<string, unknown> = { [params.target_field]: imageId };
-            await services.odataClient.updateRecord(params.target_collection, params.target_id, linkData);
+            const target = await resolveRecordId(services, params.target_collection, params.target_id);
+            await services.odataClient.updateRecord(params.target_collection, target.id, linkData);
             lines.push(
               `  Привязан к: ${params.target_collection}(${params.target_id}).${params.target_field}`
             );
@@ -247,7 +269,7 @@ export function registerStreamTools(server: McpServer, services: ServiceContaine
         description: meta.description,
         inputSchema: {
           collection: z.string().describe('Имя коллекции (EntitySet)'),
-          id: z.string().describe('UUID записи'),
+          id: z.string().describe('UUID записи или её название (Name/Title)'),
           field: z.string().describe('Имя бинарного поля сущности'),
           file_path: z.string().describe('Локальный путь к файлу'),
         },
@@ -264,6 +286,7 @@ export function registerStreamTools(server: McpServer, services: ServiceContaine
         try {
           await services.authManager.ensureAuthenticated();
           const collection = await resolveCollectionName(services, params.collection);
+          const { id } = await resolveRecordId(services, collection, params.id);
 
           if (!isSafeIdentifier(params.field)) {
             return {
@@ -293,18 +316,18 @@ export function registerStreamTools(server: McpServer, services: ServiceContaine
             };
           }
 
-          await services.odataClient.putFieldBinary(collection, params.id, params.field, buffer);
+          await services.odataClient.putFieldBinary(collection, id, params.field, buffer);
 
           return {
             content: [
               {
                 type: 'text',
-                text: `Бинарь записан в ${collection}(${params.id}).${params.field} (${(buffer.length / 1024).toFixed(1)} КБ).`,
+                text: `Бинарь записан в ${collection}(${id}).${params.field} (${(buffer.length / 1024).toFixed(1)} КБ).`,
               },
             ],
             structuredContent: {
               collection: collection,
-              id: params.id,
+              id,
               field: params.field,
               size_bytes: buffer.length,
             },
@@ -327,7 +350,7 @@ export function registerStreamTools(server: McpServer, services: ServiceContaine
         description: meta.description,
         inputSchema: {
           collection: z.string().describe('Имя коллекции (EntitySet)'),
-          id: z.string().describe('UUID записи'),
+          id: z.string().describe('UUID записи или её название (Name/Title)'),
           field: z.string().describe('Имя бинарного поля сущности'),
           save_path: z.string().optional().describe('Локальный путь для сохранения файла'),
         },
@@ -345,6 +368,7 @@ export function registerStreamTools(server: McpServer, services: ServiceContaine
         try {
           await services.authManager.ensureAuthenticated();
           const collection = await resolveCollectionName(services, params.collection);
+          const { id } = await resolveRecordId(services, collection, params.id);
           if (!isSafeIdentifier(params.field)) {
             return {
               content: [{ type: 'text', text: `Недопустимое имя поля: "${params.field}"` }],
@@ -352,10 +376,10 @@ export function registerStreamTools(server: McpServer, services: ServiceContaine
             };
           }
 
-          const buffer = await services.odataClient.getFieldBinary(collection, params.id, params.field);
+          const buffer = await services.odataClient.getFieldBinary(collection, id, params.field);
 
           const lines = [
-            `Бинарь ${collection}(${params.id}).${params.field}:`,
+            `Бинарь ${collection}(${id}).${params.field}:`,
             `  Размер: ${buffer.byteLength} байт`,
           ];
           if (params.save_path) {
@@ -370,7 +394,7 @@ export function registerStreamTools(server: McpServer, services: ServiceContaine
             content: [{ type: 'text', text: lines.join('\n') }],
             structuredContent: {
               collection: collection,
-              id: params.id,
+              id,
               field: params.field,
               size_bytes: buffer.byteLength,
               saved_to: params.save_path,
@@ -394,7 +418,7 @@ export function registerStreamTools(server: McpServer, services: ServiceContaine
         description: meta.description,
         inputSchema: {
           collection: z.string().describe('Имя коллекции (EntitySet)'),
-          id: z.string().describe('UUID записи'),
+          id: z.string().describe('UUID записи или её название (Name/Title)'),
           field: z.string().describe('Имя бинарного поля сущности'),
           confirm: confirmParam,
         },
@@ -412,6 +436,7 @@ export function registerStreamTools(server: McpServer, services: ServiceContaine
         try {
           await services.authManager.ensureAuthenticated();
           const collection = await resolveCollectionName(services, params.collection);
+          const { id } = await resolveRecordId(services, collection, params.id);
           if (!isSafeIdentifier(params.field)) {
             return {
               content: [{ type: 'text', text: `Недопустимое имя поля: "${params.field}"` }],
@@ -422,17 +447,17 @@ export function registerStreamTools(server: McpServer, services: ServiceContaine
           if (confirmationRequired(params)) {
             return confirmationResponse(
               meta.name,
-              [`Будет очищено поле ${collection}(${params.id}).${params.field}.`],
-              { collection: collection, id: params.id, field: params.field }
+              [`Будет очищено поле ${collection}(${id}).${params.field}.`],
+              { collection: collection, id, field: params.field }
             );
           }
 
-          await services.odataClient.deleteFieldBinary(collection, params.id, params.field);
+          await services.odataClient.deleteFieldBinary(collection, id, params.field);
           return {
-            content: [{ type: 'text', text: `Поле ${collection}(${params.id}).${params.field} очищено.` }],
+            content: [{ type: 'text', text: `Поле ${collection}(${id}).${params.field} очищено.` }],
             structuredContent: {
               collection: collection,
-              id: params.id,
+              id,
               field: params.field,
               deleted: true,
             },

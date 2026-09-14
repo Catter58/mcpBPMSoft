@@ -1,19 +1,18 @@
 /**
  * findOrCreate — generic helper for workflow tools.
  *
- * Looks up a record in `collection` by `matchOn.field == matchOn.value`. If a
- * single match is found, returns it. If none — creates a new record using
- * `createWith` (lookup-fields are resolved through LookupResolver). If 2+ —
- * throws BpmApiError(400) so the caller can ask the user to disambiguate.
+ * Looks up a record in `collection` by `matchOn.field` through LookupResolver
+ * with fuzzy matching (exact eq, then contains/core). One confident match —
+ * returns it. None — creates a new record using `createWith` (lookup-fields
+ * are resolved through LookupResolver). Several or unconfident candidates —
+ * throws LookupResolutionError with candidates and creates nothing.
  *
  * The collection name is resolved through MetadataManager (caption-aware), and
- * the field name is resolved through resolveFieldReference. Values are escaped
- * via escapeODataString — never concatenated raw into $filter.
+ * the field name is resolved through resolveFieldReference.
  */
 
 import type { ServiceContainer } from '../tools/init-tool.js';
-import { BpmApiError, UnknownCollectionError, UnknownFieldError } from '../utils/errors.js';
-import { escapeODataString } from '../utils/odata.js';
+import { LookupResolutionError, UnknownCollectionError, UnknownFieldError } from '../utils/errors.js';
 
 export interface FindOrCreateResult {
   id: string;
@@ -39,33 +38,20 @@ export async function findOrCreate(
   }
   const resolvedField = fieldRef.name;
 
-  const escaped = escapeODataString(matchOn.value);
-  const filter = `${resolvedField} eq '${escaped}'`;
-
-  const response = await services.odataClient.getRecords<Record<string, unknown>>(resolvedCollection, {
-    $filter: filter,
-    $top: 2,
+  // Нечёткий поиск: «Ромашка» должна находить «ООО «Ромашка»», а не плодить дубль.
+  const lookup = await services.lookupResolver.resolve(resolvedCollection, matchOn.value, resolvedField, {
+    fuzzy: true,
   });
-
-  const matches = response.value;
-  if (matches.length === 1) {
-    const record = matches[0];
-    const id = String(record.Id ?? record.id ?? '');
-    return { id, created: false, record };
+  if (lookup.resolved && lookup.id) {
+    const record = { Id: lookup.id, [resolvedField]: lookup.matchedValue ?? matchOn.value };
+    return { id: lookup.id, created: false, record };
   }
-
-  if (matches.length >= 2) {
-    throw new BpmApiError(
-      `Найдено ${matches.length} совпадений по ${resolvedField}='${matchOn.value}', уточните или используйте bpm_search_records`,
-      400,
-      resolvedCollection,
-      undefined,
-      undefined,
-      [
-        `Уточните значение, чтобы оно было уникальным.`,
-        `Или используйте bpm_search_records для поиска нужной записи и передайте UUID напрямую.`,
-      ]
-    );
+  if (lookup.matchCount > 0) {
+    // Несколько (или неуверенное) совпадений — не создаём, пусть выберут из кандидатов.
+    throw new LookupResolutionError(resolvedField, matchOn.value, lookup.matchCount, lookup.candidates, {
+      lookupCollection: resolvedCollection,
+      displayColumn: resolvedField,
+    });
   }
 
   const resolved = await services.lookupResolver.resolveDataLookups(resolvedCollection, createWith);

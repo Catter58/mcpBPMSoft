@@ -115,7 +115,7 @@ describe('bpm_update_record: справочники по имени', () => {
     const services = buildServices(updated);
     const result = await callUpdate(services, {
       collection: 'Activity',
-      id: 'act-1',
+      id: '5bdd0dca-0772-4e4c-82e5-303bcd9c8f42',
       data: { Результат: 'Выполнена' },
     });
     expect(result.isError).toBeFalsy();
@@ -129,7 +129,7 @@ describe('bpm_update_record: справочники по имени', () => {
     const services = buildServices(updated);
     const result = await callUpdate(services, {
       collection: 'Activity',
-      id: 'act-1',
+      id: '5bdd0dca-0772-4e4c-82e5-303bcd9c8f42',
       data: { Результат: 'выполнена' },
     });
     expect(result.isError).toBeFalsy();
@@ -143,7 +143,7 @@ describe('bpm_update_record: справочники по имени', () => {
     const services = buildServices(updated);
     const result = await callUpdate(services, {
       collection: 'Activity',
-      id: 'act-1',
+      id: '5bdd0dca-0772-4e4c-82e5-303bcd9c8f42',
       data: { Результат: 'Сделано' },
     });
     expect(result.isError).toBe(true);

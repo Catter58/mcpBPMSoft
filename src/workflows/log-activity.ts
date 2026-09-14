@@ -13,7 +13,12 @@ import type { ServiceContainer } from '../tools/init-tool.js';
 import type { EntityMetadata, EntityProperty } from '../types/index.js';
 import { formatToolError } from '../utils/errors.js';
 import { getTool } from '../tools/registry.js';
-import { notInitialized } from '../tools/_guards.js';
+import { notInitialized, resolveRecordId } from '../tools/_guards.js';
+import { isMeMacro, meIdFor } from '../utils/me-macro.js';
+import { guidLiteral, isGuid } from '../utils/odata.js';
+
+/** Тип, который BPMSoft ставит Activity по умолчанию (ActivityType «Задача»). */
+const DEFAULT_ACTIVITY_TYPE_ID = 'fbe0acdc-cfc0-df11-b00f-001d60e938c6';
 
 const TITLE_CANDIDATES = ['Title', 'Subject', 'Caption'];
 const OWNER_CANDIDATES = ['Owner', 'OwnerId', 'Author', 'AuthorId', 'Responsible', 'ResponsibleId'];
@@ -35,8 +40,53 @@ function findFieldName(meta: EntityMetadata, candidates: string[]): EntityProper
   return undefined;
 }
 
+/** Системные ссылки на Contact — связью с записью они не являются. */
+const SYSTEM_LOOKUPS = new Set(['CreatedById', 'ModifiedById', 'OwnerId', 'AuthorId']);
+
 function findLookupTo(meta: EntityMetadata, targetCollection: string): EntityProperty | undefined {
-  return meta.properties.find((p) => p.isLookup && p.lookupCollection === targetCollection);
+  const candidates = meta.properties.filter((p) => p.isLookup && p.lookupCollection === targetCollection);
+  // ContactId/Contact раньше системных CreatedById/ModifiedById: иначе связь с контактом
+  // записывалась в «Кем создан» (проверено на bpm9).
+  const entity = targetCollection.replace(/Collection$/, '');
+  return (
+    candidates.find((p) => p.name === `${entity}Id` || p.name === entity) ??
+    candidates.find((p) => !SYSTEM_LOOKUPS.has(p.name))
+  );
+}
+
+/**
+ * В ActivityCategory бывают одноимённые строки: «Звонок» для типа «Звонок» и для
+ * типа «Задача». Если все кандидаты названы одинаково, берём тот, чей ActivityTypeId
+ * совпадает с типом создаваемой активности (BPMSoft по умолчанию ставит «Задача»).
+ * Иначе null — и resolveDataLookups вернёт обычную ошибку неоднозначности.
+ */
+async function pickSameNamedCategory(
+  services: ServiceContainer,
+  typeField: EntityProperty,
+  value: string
+): Promise<string | null> {
+  if (!typeField.lookupCollection || isGuid(value)) return null;
+  const lookup = await services.lookupResolver.resolve(
+    typeField.lookupCollection,
+    value,
+    typeField.lookupDisplayColumn ?? 'Name',
+    { fuzzy: true }
+  );
+  if (lookup.resolved || lookup.matchCount < 2) return null;
+  if (new Set(lookup.candidates.map((c) => c.displayValue)).size !== 1) return null;
+  const version = services.config.odata_version;
+  const filter = lookup.candidates.map((c) => `Id eq ${guidLiteral(c.id, version)}`).join(' or ');
+  try {
+    const res = await services.odataClient.getRecords<Record<string, unknown>>(typeField.lookupCollection, {
+      $filter: filter,
+      $select: 'Id,ActivityTypeId',
+    });
+    const hits = res.value.filter((r) => r.ActivityTypeId === DEFAULT_ACTIVITY_TYPE_ID);
+    return hits.length === 1 ? String(hits[0].Id) : null;
+  } catch {
+    // Нет колонки ActivityTypeId (другая схема) — остаётся ошибка неоднозначности.
+    return null;
+  }
 }
 
 export function registerLogActivityTool(server: McpServer, services: ServiceContainer): void {
@@ -55,12 +105,17 @@ export function registerLogActivityTool(server: McpServer, services: ServiceCont
         owner_name: z
           .string()
           .optional()
-          .describe('ФИО владельца — будет найден в Contact.Name и подставлен в OwnerId.'),
+          .describe(
+            'ФИО владельца — будет найден в Contact.Name и подставлен в OwnerId. "я" / "@me" — текущий пользователь.'
+          ),
         related_collection: z
           .string()
           .optional()
           .describe('Коллекция связанной записи (Account, Contact, Opportunity, Lead и т.п.).'),
-        related_id: z.string().optional().describe('UUID связанной записи.'),
+        related_id: z
+          .string()
+          .optional()
+          .describe('UUID связанной записи или её название (ищется в related_collection нечётким поиском).'),
         due_date: z.string().optional().describe('Срок выполнения (ISO-8601).'),
         notes: z.string().optional().describe('Заметки (Notes/Description).'),
       },
@@ -113,7 +168,8 @@ export function registerLogActivityTool(server: McpServer, services: ServiceCont
         if (params.type !== undefined) {
           const typeField = findFieldName(activityMeta, TYPE_CANDIDATES);
           if (typeField && typeField.isLookup) {
-            data[typeField.name] = params.type;
+            data[typeField.name] =
+              (await pickSameNamedCategory(services, typeField, params.type)) ?? params.type;
             usedFields.type = typeField.name;
           } else if (typeField) {
             data[typeField.name] = params.type;
@@ -125,9 +181,20 @@ export function registerLogActivityTool(server: McpServer, services: ServiceCont
 
         if (params.owner_name !== undefined) {
           const ownerField = findFieldName(activityMeta, OWNER_CANDIDATES);
-          if (ownerField && ownerField.isLookup) {
+          const ownerCollection = ownerField?.lookupCollection ?? 'Contact';
+          if (ownerField && ownerField.isLookup && isMeMacro(params.owner_name)) {
+            const meId = meIdFor(ownerCollection, await services.currentUser.get());
+            if (meId) {
+              data[ownerField.name] = meId;
+              usedFields.owner = ownerField.name;
+            } else {
+              warnings.push(
+                `Текущий пользователь не связан с записью ${ownerCollection} — поле ${ownerField.name} оставлено пустым.`
+              );
+            }
+          } else if (ownerField && ownerField.isLookup) {
             const ownerLookup = await services.lookupResolver.resolve(
-              ownerField.lookupCollection ?? 'Contact',
+              ownerCollection,
               params.owner_name,
               ownerField.lookupDisplayColumn ?? 'Name',
               { fuzzy: true }
@@ -148,8 +215,14 @@ export function registerLogActivityTool(server: McpServer, services: ServiceCont
         if (params.related_collection && params.related_id) {
           const relField = findLookupTo(activityMeta, params.related_collection);
           if (relField) {
-            data[relField.name] = params.related_id;
+            const rel = await resolveRecordId(services, params.related_collection, params.related_id);
+            data[relField.name] = rel.id;
             usedFields.relation = relField.name;
+            if (rel.matched && rel.matched !== params.related_id) {
+              warnings.push(
+                `Связанная запись "${params.related_id}" найдена как "${rel.matched}" (${rel.id}).`
+              );
+            }
           } else {
             warnings.push(
               `В Activity нет lookup-поля, ссылающегося на ${params.related_collection}; связь не установлена.`

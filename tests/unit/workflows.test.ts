@@ -9,7 +9,7 @@ import { describe, it, expect } from 'vitest';
 import { findOrCreate } from '../../src/workflows/find-or-create.js';
 import type { ServiceContainer } from '../../src/tools/init-tool.js';
 import type { EntityMetadata, EntityProperty } from '../../src/types/index.js';
-import { BpmApiError } from '../../src/utils/errors.js';
+import { LookupResolutionError } from '../../src/utils/errors.js';
 
 interface CreatedRecord {
   collection: string;
@@ -206,7 +206,15 @@ function buildStubServices(state: StubState): ServiceContainer {
           candidates: [{ id: hit.id, displayValue: value }],
         };
       }
-      return { resolved: false, searchValue: value, matchCount: 0, candidates: [] };
+      // Иначе — точное совпадение по записям коллекции (findOrCreate ходит через resolve).
+      const matches = (state.recordsByCollection[lookupCollection] ?? []).filter(
+        (r) => String(r[column] ?? '') === value
+      );
+      const candidates = matches.map((r) => ({ id: String(r.Id), displayValue: String(r[column]) }));
+      if (candidates.length === 1) {
+        return { resolved: true, id: candidates[0].id, searchValue: value, matchCount: 1, candidates };
+      }
+      return { resolved: false, searchValue: value, matchCount: candidates.length, candidates };
     },
     async resolveDataLookups(_collection: string, data: Record<string, unknown>) {
       return { data: { ...data }, notes: [] };
@@ -283,7 +291,7 @@ describe('findOrCreate', () => {
     expect(state.created).toHaveLength(0);
   });
 
-  it('throws BpmApiError(400) on multiple matches', async () => {
+  it('throws LookupResolutionError on multiple matches', async () => {
     const state = emptyState();
     state.recordsByCollection.Account = [
       { Id: 'acc-1', Name: 'Ромашка' },
@@ -293,7 +301,7 @@ describe('findOrCreate', () => {
 
     await expect(
       findOrCreate(services, 'Account', { field: 'Name', value: 'Ромашка' }, { Name: 'Ромашка' })
-    ).rejects.toBeInstanceOf(BpmApiError);
+    ).rejects.toBeInstanceOf(LookupResolutionError);
   });
 
   it('escapes single quotes inside the search value', async () => {

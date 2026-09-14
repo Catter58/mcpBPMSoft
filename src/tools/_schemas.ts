@@ -38,3 +38,18 @@ export const confirmShape = {
   requires_confirmation: z.boolean().optional().describe('true — это превью, ничего не изменено'),
   code: z.string().optional().describe('Машинный код состояния (confirm_required и т.п.)'),
 };
+
+/** Критерий criteria-DSL: компилируется сервером в $filter (см. utils/filter-compiler.ts). */
+export const criterionSchema = z.object({
+  field: z.string().describe('Имя поля, caption или путь навигации (например "Account.City")'),
+  op: z
+    .string()
+    .describe(
+      'Оператор: равно/eq, не равно/ne, больше/gt, больше или равно/ge, меньше/lt, меньше или равно/le, содержит/contains (регистронезависимо), не содержит/not_contains, начинается с/startswith, заканчивается на/endswith, в списке/in, пусто/is_null, не пусто/is_not_null, за последние N дней/in_last_days, за последние N часов/in_last_hours, между/between, похоже на/similar_to, сегодня/вчера/завтра/на этой неделе/в этом месяце/в этом квартале/в этом году. Для lookup на контакт/пользователя value="я" подставляет текущего пользователя.'
+    ),
+  value: z
+    .unknown()
+    .optional()
+    .describe('Значение (отсутствует для is_null/is_not_null и календарных операторов)'),
+  value_to: z.unknown().optional().describe('Верхняя граница для оператора between'),
+});
