@@ -9,7 +9,9 @@
  * Пишем в stderr: stdout зарезервирован под stdio-транспорт MCP.
  */
 
+import * as z from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { suggest } from '../utils/suggest.js';
 
 /** Длиннее в одну строку лога не нужно: полный ответ агент и так получает. */
 const MAX_REASON_LENGTH = 300;
@@ -42,6 +44,57 @@ function record(name: string, ms: number, isError: boolean): void {
 }
 
 type ToolHandler = (...args: unknown[]) => unknown;
+
+/**
+ * Потолок текста ответа модели. Больше — почти всегда выгрузка, которую надо было сузить
+ * фильтром/select; обрезаем с объяснением, а не заливаем окно контекста.
+ * ponytail: режется только text, structuredContent отдаётся целиком — ограничить и его,
+ * если клиенты начнут пересылать его модели как есть.
+ */
+export const CHARACTER_LIMIT = 25_000;
+
+/**
+ * Сырой shape инструмента → строгий объект: неизвестный ключ (`filters` вместо `filter`)
+ * раньше молча отбрасывался, и модель получала не то, что просила. Теперь — ошибка
+ * с ближайшим допустимым именем.
+ */
+export function strictInputSchema(schema: unknown): unknown {
+  if (!schema || typeof schema !== 'object' || schema instanceof z.ZodType) return schema;
+  const shape = schema as z.ZodRawShape;
+  const known = Object.keys(shape);
+  return z.strictObject(shape, {
+    error: (issue) => {
+      if (issue.code !== 'unrecognized_keys') return undefined;
+      const hints = issue.keys.map((key: string) => {
+        const [best] = suggest(key, known, { maxResults: 1 });
+        return best ? `«${key}» — возможно, «${best}»` : `«${key}»`;
+      });
+      return `Неизвестные параметры: ${hints.join(', ')}. Допустимые: ${known.join(', ')}.`;
+    },
+  });
+}
+
+/** Обрезает текстовые части ответа до CHARACTER_LIMIT с пояснением для модели. */
+export function limitResultText(result: unknown): unknown {
+  const content = (result as { content?: Array<{ type?: string; text?: string }> } | undefined)?.content;
+  if (!Array.isArray(content)) return result;
+  const total = content.reduce((n, part) => n + (part.type === 'text' ? (part.text?.length ?? 0) : 0), 0);
+  if (total <= CHARACTER_LIMIT) return result;
+  let left = CHARACTER_LIMIT;
+  const trimmed = content.map((part) => {
+    if (part.type !== 'text' || typeof part.text !== 'string') return part;
+    const text = part.text.slice(0, Math.max(0, left));
+    left -= text.length;
+    return { ...part, text };
+  });
+  trimmed.push({
+    type: 'text',
+    text:
+      `\n[Ответ обрезан: ${CHARACTER_LIMIT} из ${total} символов. Сузьте выборку — фильтр, top, select — ` +
+      'полные данные есть в structuredContent.]',
+  });
+  return { ...(result as object), content: trimmed };
+}
 
 function summarize(status: unknown, code: unknown, message: unknown, details?: unknown): string {
   const head = [
@@ -109,7 +162,7 @@ export function instrumentTools(server: McpServer): McpServer {
         const isError = Boolean((result as { isError?: boolean } | undefined)?.isError);
         record(name, ms, isError);
         console.error(`[tool] ${name} ${ms}ms ${isError ? `error ${describeToolError(result)}` : 'ok'}`);
-        return result;
+        return limitResultText(result);
       } catch (error) {
         const ms = Date.now() - started;
         record(name, ms, true);
@@ -117,7 +170,11 @@ export function instrumentTools(server: McpServer): McpServer {
         throw error;
       }
     };
-    return original(name, config, wrapped);
+    const cfg = config as { inputSchema?: unknown } | undefined;
+    const strictConfig = cfg?.inputSchema
+      ? { ...cfg, inputSchema: strictInputSchema(cfg.inputSchema) }
+      : config;
+    return original(name, strictConfig, wrapped);
   };
 
   target.__instrumented = true;
