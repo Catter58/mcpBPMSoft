@@ -12,8 +12,8 @@
  */
 
 import * as z from 'zod';
-import { readFile, writeFile, stat as fsStat } from 'node:fs/promises';
-import { basename, extname } from 'node:path';
+import { readFile, writeFile, stat as fsStat, realpath } from 'node:fs/promises';
+import { basename, dirname, extname, join, resolve, sep } from 'node:path';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import type { ServiceContainer } from './init-tool.js';
@@ -44,6 +44,123 @@ const MIME_BY_EXTENSION: Record<string, string> = {
   '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
 };
 
+type PathCheck = { ok: true; path: string } | { ok: false; error: string };
+
+/**
+ * Единственная точка допуска локальных путей. В HTTP-режиме любой держатель
+ * cookies BPMSoft иначе читал бы/писал бы произвольные файлы на хосте MCP.
+ * Разрешено: stdio-транспорт (локальный процесс пользователя) либо путь внутри
+ * BPMSOFT_FILE_ROOT после realpath (симлинки наружу не проходят).
+ * Для записи realpath берётся от самого файла, если он есть, иначе от родителя.
+ */
+export async function checkLocalPath(input: string, forWrite: boolean): Promise<PathCheck> {
+  if (process.env.MCP_TRANSPORT === 'stdio') return { ok: true, path: input };
+  const root = process.env.BPMSOFT_FILE_ROOT;
+  if (!root) {
+    return {
+      ok: false,
+      error:
+        'Работа с локальными файлами сервера отключена в HTTP-режиме. ' +
+        (forWrite
+          ? 'Используйте return_base64=true, чтобы получить содержимое в ответе, '
+          : 'Передайте содержимое файла в параметре content_base64, ') +
+        'или попросите администратора задать BPMSOFT_FILE_ROOT (каталог, внутри которого разрешены файлы).',
+    };
+  }
+  let realRoot: string;
+  let real: string;
+  try {
+    realRoot = await realpath(root);
+    const abs = resolve(realRoot, input);
+    if (!forWrite) {
+      real = await realpath(abs);
+    } else {
+      try {
+        real = await realpath(abs);
+      } catch {
+        real = join(await realpath(dirname(abs)), basename(abs));
+      }
+    }
+  } catch {
+    return { ok: false, error: `Файл или каталог не найден: ${input}` };
+  }
+  if (real !== realRoot && !real.startsWith(realRoot + sep)) {
+    return { ok: false, error: `Путь ${input} вне разрешённого каталога BPMSOFT_FILE_ROOT (${realRoot}).` };
+  }
+  return { ok: true, path: real };
+}
+
+const mb = (n: number): string => (n / 1024 / 1024).toFixed(2);
+
+/** Байты для загрузки: из content_base64 или из файла (размер проверяется ДО чтения). */
+async function loadUploadBytes(
+  filePath: string | undefined,
+  contentBase64: string | undefined,
+  maxSize: number
+): Promise<{ ok: true; buffer: Buffer } | { ok: false; error: string }> {
+  if (!filePath === !contentBase64) {
+    return { ok: false, error: 'Укажите ровно один из параметров: file_path или content_base64.' };
+  }
+  const limit = `превышает лимит (${mb(maxSize)} МБ)`;
+  if (contentBase64) {
+    const buffer = Buffer.from(contentBase64, 'base64');
+    if (buffer.length > maxSize)
+      return { ok: false, error: `Размер данных (${mb(buffer.length)} МБ) ${limit}` };
+    return { ok: true, buffer };
+  }
+  const checked = await checkLocalPath(filePath!, false);
+  if (!checked.ok) return checked;
+  try {
+    const st = await fsStat(checked.path);
+    if (!st.isFile()) return { ok: false, error: `Не файл: ${filePath}` };
+    if (st.size > maxSize) return { ok: false, error: `Размер файла (${mb(st.size)} МБ) ${limit}` };
+    return { ok: true, buffer: await readFile(checked.path) };
+  } catch {
+    return { ok: false, error: `Файл не найден: ${filePath}` };
+  }
+}
+
+const errorResult = (text: string): CallToolResult => ({ content: [{ type: 'text', text }], isError: true });
+
+/** Опциональное base64 в structuredContent (не в тексте — чтобы не раздувать контекст). */
+function base64Part(
+  data: Buffer,
+  returnBase64: boolean | undefined,
+  maxSize: number,
+  lines: string[]
+): { content_base64?: string } {
+  if (!returnBase64) return {};
+  if (data.byteLength > maxSize) {
+    lines.push(
+      `  base64 не возвращён: размер (${mb(data.byteLength)} МБ) превышает лимит (${mb(maxSize)} МБ).`
+    );
+    return {};
+  }
+  lines.push('  Содержимое в base64 — в structuredContent.content_base64.');
+  return { content_base64: Buffer.from(data).toString('base64') };
+}
+
+const uploadShape = {
+  file_path: z
+    .string()
+    .optional()
+    .describe(
+      'Путь к файлу на хосте MCP-сервера (только stdio-режим или внутри BPMSOFT_FILE_ROOT). Альтернатива — content_base64'
+    ),
+  content_base64: z.string().optional().describe('Содержимое файла в base64 (вместо file_path)'),
+};
+
+const downloadShape = {
+  save_path: z
+    .string()
+    .optional()
+    .describe('Путь для сохранения на хосте MCP-сервера (только stdio-режим или внутри BPMSOFT_FILE_ROOT)'),
+  return_base64: z
+    .boolean()
+    .optional()
+    .describe('true — вернуть содержимое в structuredContent.content_base64 (если не больше лимита размера)'),
+};
+
 export function registerStreamTools(server: McpServer, services: ServiceContainer): void {
   // bpm_upload_file (SysImage)
   {
@@ -54,8 +171,11 @@ export function registerStreamTools(server: McpServer, services: ServiceContaine
         title: meta.title,
         description: meta.description,
         inputSchema: {
-          file_path: z.string().describe('Путь к файлу для загрузки на сервер'),
-          name: z.string().optional().describe('Имя файла в системе (по умолчанию — из пути)'),
+          ...uploadShape,
+          name: z
+            .string()
+            .optional()
+            .describe('Имя файла в системе (по умолчанию — из пути; обязательно при content_base64)'),
           target_collection: z
             .string()
             .optional()
@@ -80,29 +200,15 @@ export function registerStreamTools(server: McpServer, services: ServiceContaine
           await services.authManager.ensureAuthenticated();
           const baseUrl = getODataBaseUrl(services.config);
 
-          let fileBuffer: Buffer;
-          try {
-            fileBuffer = await readFile(params.file_path);
-          } catch {
-            return {
-              content: [{ type: 'text', text: `Файл не найден: ${params.file_path}` }],
-              isError: true,
-            };
-          }
-
-          if (fileBuffer.length > services.config.max_file_size) {
-            return {
-              content: [
-                {
-                  type: 'text',
-                  text: `Размер файла (${(fileBuffer.length / 1024 / 1024).toFixed(2)} МБ) превышает лимит (${(services.config.max_file_size / 1024 / 1024).toFixed(0)} МБ)`,
-                },
-              ],
-              isError: true,
-            };
-          }
-
-          const fileName = params.name || basename(params.file_path);
+          const fileName = params.name || (params.file_path ? basename(params.file_path) : '');
+          if (!fileName) return errorResult('При content_base64 укажите name — имя файла с расширением.');
+          const loaded = await loadUploadBytes(
+            params.file_path,
+            params.content_base64,
+            services.config.max_file_size
+          );
+          if (!loaded.ok) return errorResult(loaded.error);
+          const fileBuffer = loaded.buffer;
 
           // Без MimeType BPMSoft потом не отдаёт Data: 500 FormatException на пустом заголовке.
           const created = await services.odataClient.createRecord<Record<string, unknown>>('SysImage', {
@@ -176,7 +282,7 @@ export function registerStreamTools(server: McpServer, services: ServiceContaine
         description: meta.description,
         inputSchema: {
           image_id: z.string().describe('UUID записи в SysImage'),
-          save_path: z.string().optional().describe('Путь для сохранения файла'),
+          ...downloadShape,
         },
         outputSchema: {
           image_id: z.string(),
@@ -184,12 +290,19 @@ export function registerStreamTools(server: McpServer, services: ServiceContaine
           mime_type: z.string(),
           size_bytes: z.number().int(),
           saved_to: z.string().optional(),
+          content_base64: z.string().optional(),
         },
         annotations: meta.annotations,
       },
       async (params): Promise<CallToolResult> => {
         if (!services.initialized) return notInitialized();
         try {
+          let savePath: string | undefined;
+          if (params.save_path) {
+            const checked = await checkLocalPath(params.save_path, true);
+            if (!checked.ok) return errorResult(checked.error);
+            savePath = checked.path;
+          }
           await services.authManager.ensureAuthenticated();
           const baseUrl = getODataBaseUrl(services.config);
 
@@ -228,18 +341,19 @@ export function registerStreamTools(server: McpServer, services: ServiceContaine
             `  Размер: ${data?.byteLength ?? 0} байт`,
           ];
 
-          if (params.save_path) {
+          if (savePath) {
             try {
-              await writeFile(params.save_path, data);
+              await writeFile(savePath, data);
               lines.push(`  Сохранён: ${params.save_path}`);
             } catch (writeError) {
               lines.push(
                 `  Ошибка сохранения: ${writeError instanceof Error ? writeError.message : String(writeError)}`
               );
             }
-          } else {
-            lines.push('', 'Укажите save_path для сохранения файла на диск.');
+          } else if (!params.return_base64) {
+            lines.push('', 'Укажите save_path или return_base64=true, чтобы получить содержимое.');
           }
+          const b64 = base64Part(data, params.return_base64, services.config.max_file_size, lines);
 
           return {
             content: [{ type: 'text', text: lines.join('\n') }],
@@ -249,6 +363,7 @@ export function registerStreamTools(server: McpServer, services: ServiceContaine
               mime_type: mimeType,
               size_bytes: data?.byteLength ?? 0,
               saved_to: params.save_path,
+              ...b64,
             },
           };
         } catch (error) {
@@ -271,7 +386,7 @@ export function registerStreamTools(server: McpServer, services: ServiceContaine
           collection: z.string().describe('Имя коллекции (EntitySet)'),
           id: z.string().describe('UUID записи или её название (Name/Title)'),
           field: z.string().describe('Имя бинарного поля сущности'),
-          file_path: z.string().describe('Локальный путь к файлу'),
+          ...uploadShape,
         },
         outputSchema: {
           collection: z.string(),
@@ -295,26 +410,13 @@ export function registerStreamTools(server: McpServer, services: ServiceContaine
             };
           }
 
-          let buffer: Buffer;
-          try {
-            buffer = await readFile(params.file_path);
-          } catch {
-            return {
-              content: [{ type: 'text', text: `Файл не найден: ${params.file_path}` }],
-              isError: true,
-            };
-          }
-          if (buffer.length > services.config.max_file_size) {
-            return {
-              content: [
-                {
-                  type: 'text',
-                  text: `Размер файла (${(buffer.length / 1024 / 1024).toFixed(2)} МБ) превышает лимит`,
-                },
-              ],
-              isError: true,
-            };
-          }
+          const loaded = await loadUploadBytes(
+            params.file_path,
+            params.content_base64,
+            services.config.max_file_size
+          );
+          if (!loaded.ok) return errorResult(loaded.error);
+          const buffer = loaded.buffer;
 
           await services.odataClient.putFieldBinary(collection, id, params.field, buffer);
 
@@ -352,7 +454,7 @@ export function registerStreamTools(server: McpServer, services: ServiceContaine
           collection: z.string().describe('Имя коллекции (EntitySet)'),
           id: z.string().describe('UUID записи или её название (Name/Title)'),
           field: z.string().describe('Имя бинарного поля сущности'),
-          save_path: z.string().optional().describe('Локальный путь для сохранения файла'),
+          ...downloadShape,
         },
         outputSchema: {
           collection: z.string(),
@@ -360,12 +462,19 @@ export function registerStreamTools(server: McpServer, services: ServiceContaine
           field: z.string(),
           size_bytes: z.number().int(),
           saved_to: z.string().optional(),
+          content_base64: z.string().optional(),
         },
         annotations: meta.annotations,
       },
       async (params): Promise<CallToolResult> => {
         if (!services.initialized) return notInitialized();
         try {
+          let savePath: string | undefined;
+          if (params.save_path) {
+            const checked = await checkLocalPath(params.save_path, true);
+            if (!checked.ok) return errorResult(checked.error);
+            savePath = checked.path;
+          }
           await services.authManager.ensureAuthenticated();
           const collection = await resolveCollectionName(services, params.collection);
           const { id } = await resolveRecordId(services, collection, params.id);
@@ -382,13 +491,14 @@ export function registerStreamTools(server: McpServer, services: ServiceContaine
             `Бинарь ${collection}(${id}).${params.field}:`,
             `  Размер: ${buffer.byteLength} байт`,
           ];
-          if (params.save_path) {
-            await writeFile(params.save_path, buffer);
-            const st = await fsStat(params.save_path);
+          if (savePath) {
+            await writeFile(savePath, buffer);
+            const st = await fsStat(savePath);
             lines.push(`  Сохранён: ${params.save_path} (${st.size} байт)`);
-          } else {
-            lines.push('', 'Укажите save_path для сохранения файла на диск.');
+          } else if (!params.return_base64) {
+            lines.push('', 'Укажите save_path или return_base64=true, чтобы получить содержимое.');
           }
+          const b64 = base64Part(buffer, params.return_base64, services.config.max_file_size, lines);
 
           return {
             content: [{ type: 'text', text: lines.join('\n') }],
@@ -398,6 +508,7 @@ export function registerStreamTools(server: McpServer, services: ServiceContaine
               field: params.field,
               size_bytes: buffer.byteLength,
               saved_to: params.save_path,
+              ...b64,
             },
           };
         } catch (error) {

@@ -422,19 +422,22 @@ bpmsoft://schema/{name}                  — только схема колле�
 
 ### Основные параметры
 
-| Переменная                 | По умолчанию      | Описание                                                                                              |
-| -------------------------- | ----------------- | ----------------------------------------------------------------------------------------------------- |
-| `BPMSOFT_URL`              | — _(обязательно)_ | URL приложения, например `https://mycompany.bpmsoft.com`                                              |
-| `MCP_TRANSPORT`            | `http`            | Транспорт: `http` (Streamable HTTP, production) или `stdio` (локальная отладка)                       |
-| `MCP_HTTP_PORT`            | `8007`            | Порт HTTP-сервера (при `MCP_TRANSPORT=http`)                                                          |
-| `BPMSOFT_ODATA_VERSION`    | `4`               | `4` или `3`                                                                                           |
-| `BPMSOFT_PLATFORM`         | `net8`            | `net8` или `netframework`                                                                             |
-| `BPMSOFT_PAGE_SIZE`        | `5000`            | Размер страницы при автопагинации                                                                     |
-| `BPMSOFT_MAX_BATCH_SIZE`   | `100`             | Лимит подзапросов в `$batch`                                                                          |
-| `BPMSOFT_LOOKUP_CACHE_TTL` | `300`             | TTL кеша lookup в секундах                                                                            |
-| `BPMSOFT_REQUEST_TIMEOUT`  | `30000`           | Таймаут одного HTTP-запроса (мс)                                                                      |
-| `BPMSOFT_MAX_FILE_SIZE`    | `10485760`        | Лимит размера файла (10 МБ)                                                                           |
-| `BPMSOFT_DEBUG`            | `off`             | `1` — логировать `method url status duration`; `trace` — ещё и тела с маскированием паролей и токенов |
+| Переменная                 | По умолчанию      | Описание                                                                                                                                                                                             |
+| -------------------------- | ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `BPMSOFT_URL`              | — _(обязательно)_ | URL приложения, например `https://mycompany.bpmsoft.com`                                                                                                                                             |
+| `MCP_TRANSPORT`            | `http`            | Транспорт: `http` (Streamable HTTP, production) или `stdio` (локальная отладка)                                                                                                                      |
+| `MCP_HTTP_PORT`            | `8007`            | Порт HTTP-сервера (при `MCP_TRANSPORT=http`)                                                                                                                                                         |
+| `BPMSOFT_ODATA_VERSION`    | `4`               | `4` или `3`                                                                                                                                                                                          |
+| `BPMSOFT_PLATFORM`         | `net8`            | `net8` или `netframework`                                                                                                                                                                            |
+| `BPMSOFT_PAGE_SIZE`        | `5000`            | Размер страницы при автопагинации                                                                                                                                                                    |
+| `BPMSOFT_MAX_BATCH_SIZE`   | `100`             | Лимит подзапросов в `$batch`                                                                                                                                                                         |
+| `BPMSOFT_LOOKUP_CACHE_TTL` | `300`             | TTL кеша lookup в секундах                                                                                                                                                                           |
+| `BPMSOFT_REQUEST_TIMEOUT`  | `30000`           | Таймаут одного HTTP-запроса (мс)                                                                                                                                                                     |
+| `BPMSOFT_MAX_FILE_SIZE`    | `10485760`        | Лимит размера файла (10 МБ)                                                                                                                                                                          |
+| `BPMSOFT_FILE_ROOT`        | —                 | Каталог, где файловые инструменты могут читать/писать локальные файлы в HTTP-режиме. Не задан — локальные пути в HTTP запрещены (только `content_base64` / `return_base64`); в stdio ограничений нет |
+| `MCP_ALLOWED_HOSTS`        | —                 | Доп. разрешённые значения `Host` (`host:port`, через запятую) для защиты от DNS rebinding. В Docker (`0.0.0.0`) без неё проверка Host выключена, при старте предупреждение                           |
+| `MCP_ALLOWED_ORIGINS`      | —                 | Разрешённые `Origin` (через запятую); проверяются, если клиент их присылает                                                                                                                          |
+| `BPMSOFT_DEBUG`            | `off`             | `1` — логировать `method url status duration`; `trace` — ещё и тела с маскированием паролей и токенов                                                                                                |
 
 ### Авторизация
 

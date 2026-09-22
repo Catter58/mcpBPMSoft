@@ -38,6 +38,14 @@
  *
  * The ALS wrap (`runWithAuth`) surrounds `transport.handleRequest`, so the
  * caller's auth is in-context when the tool callback runs.
+ *
+ * DNS-rebinding protection (SDK `enableDnsRebindingProtection`):
+ *   Host must be one of `127.0.0.1:<port>`, `localhost:<port>`, `<bound host>:<port>`
+ *   plus MCP_ALLOWED_HOSTS (comma list). Origin, when the browser sends one, must be
+ *   in MCP_ALLOWED_ORIGINS (if set). Exception: bound to a wildcard address
+ *   (0.0.0.0 / ::, e.g. Docker) with no MCP_ALLOWED_HOSTS — the public host name is
+ *   unknown, so the Host check is skipped with a startup warning instead of locking
+ *   everyone out. Set MCP_ALLOWED_HOSTS in such deployments.
  */
 
 import http from 'node:http';
@@ -64,10 +72,38 @@ export interface HttpServerOptions {
  *
  * `createServer` must return a fully-registered McpServer (tools/prompts/resources).
  */
+const splitEnv = (name: string): string[] =>
+  (process.env[name] ?? '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+type RebindingOptions = { allowedHosts?: string[]; allowedOrigins?: string[] };
+
+/** Allowed Host/Origin lists for the SDK's DNS-rebinding check (exported for tests). */
+export function buildRebindingOptions(host: string, port: number): RebindingOptions {
+  const extraHosts = splitEnv('MCP_ALLOWED_HOSTS');
+  const origins = splitEnv('MCP_ALLOWED_ORIGINS');
+  const wildcard = host === '0.0.0.0' || host === '::';
+  let allowedHosts: string[] | undefined;
+  if (wildcard && extraHosts.length === 0) {
+    console.error(
+      `[http-transport] WARNING: bound to ${host} without MCP_ALLOWED_HOSTS — Host header check is off. ` +
+        'Set MCP_ALLOWED_HOSTS=<public-host:port>[,...] to enable DNS-rebinding protection.'
+    );
+  } else {
+    const hostPort = host.includes(':') ? `[${host}]:${port}` : `${host}:${port}`;
+    allowedHosts = [...new Set([`127.0.0.1:${port}`, `localhost:${port}`, hostPort, ...extraHosts])];
+  }
+  return { allowedHosts, allowedOrigins: origins.length ? origins : undefined };
+}
+
 export async function startHttpServer(
   createServer: () => McpServer,
   opts: HttpServerOptions
 ): Promise<http.Server> {
+  const host = opts.host ?? '127.0.0.1';
+  let rebinding: RebindingOptions = {};
   const httpServer = http.createServer((req, res) => {
     // GET/DELETE (standalone SSE / session teardown) unsupported in stateless JSON mode.
     if (req.method !== 'POST') {
@@ -105,7 +141,7 @@ export async function startHttpServer(
       } catch {
         body = undefined;
       }
-      void handlePost(createServer, auth, req, res, body);
+      void handlePost(createServer, rebinding, auth, req, res, body);
     });
 
     req.on('error', (err) => {
@@ -118,18 +154,20 @@ export async function startHttpServer(
   });
 
   await new Promise<void>((resolve) => {
-    httpServer.listen(opts.port, opts.host ?? '0.0.0.0', () => resolve());
+    httpServer.listen(opts.port, host, () => resolve());
   });
 
   const addr = httpServer.address();
   const shownPort = typeof addr === 'object' && addr ? addr.port : opts.port;
-  console.error(`[http-transport] listening on ${opts.host ?? '0.0.0.0'}:${shownPort}`);
+  rebinding = buildRebindingOptions(host, shownPort);
+  console.error(`[http-transport] listening on ${host}:${shownPort}`);
 
   return httpServer;
 }
 
 async function handlePost(
   createServer: () => McpServer,
+  rebinding: RebindingOptions,
   auth: ReturnType<typeof extractAuthFromHeaders>,
   req: http.IncomingMessage,
   res: http.ServerResponse,
@@ -139,6 +177,8 @@ async function handlePost(
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: undefined,
     enableJsonResponse: true,
+    enableDnsRebindingProtection: true,
+    ...rebinding,
   });
   try {
     await server.connect(transport);
