@@ -187,6 +187,10 @@ describe('bpm_delete_by_filter confirmation', () => {
   });
 });
 
+const UUID_A = 'bbbbbbbb-0000-0000-0000-000000000001';
+const UUID_B = 'bbbbbbbb-0000-0000-0000-000000000002';
+const UUID_C = 'bbbbbbbb-0000-0000-0000-000000000003';
+
 describe('bpm_batch_delete confirmation', () => {
   it('without confirm returns a preview and does not call executeBatch', async () => {
     const state: StubState = { deleteRecordCalls: [], executeBatchCalls: [], deleteFieldCalls: [] };
@@ -195,7 +199,7 @@ describe('bpm_batch_delete confirmation', () => {
     registerBatchTools(server as never, services);
 
     const handler = getHandler(server, 'bpm_batch_delete');
-    const result = await handler({ collection: 'Contact', ids: ['id-1', 'id-2', 'id-3'] });
+    const result = await handler({ collection: 'Contact', ids: [UUID_A, UUID_B, UUID_C] });
 
     expect(state.executeBatchCalls).toHaveLength(0);
     expect(result.structuredContent?.requires_confirmation).toBe(true);
@@ -209,7 +213,7 @@ describe('bpm_batch_delete confirmation', () => {
     registerBatchTools(server as never, services);
 
     const handler = getHandler(server, 'bpm_batch_delete');
-    const result = await handler({ collection: 'Contact', ids: ['id-1', 'id-2'], confirm: true });
+    const result = await handler({ collection: 'Contact', ids: [UUID_A, UUID_B], confirm: true });
 
     expect(state.executeBatchCalls).toHaveLength(1);
     expect(state.executeBatchCalls[0]).toHaveLength(2);

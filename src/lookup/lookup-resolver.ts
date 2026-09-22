@@ -15,6 +15,7 @@ import { isTolowerSupported, markTolowerUnsupported } from '../utils/server-capa
 import { getAuthCacheScope } from '../auth/request-context.js';
 import type { CurrentUserService } from '../user/current-user.js';
 import { isMeMacro, meIdFor } from '../utils/me-macro.js';
+import { coerceValue, needsTimeZone, type CoercedValueNote } from '../utils/coerce.js';
 
 interface CacheEntry {
   result: LookupResult;
@@ -33,6 +34,8 @@ export interface ResolvedLookupNote {
 export interface ResolvedData {
   data: Record<string, unknown>;
   notes: ResolvedLookupNote[];
+  /** Значения, приведённые к типу колонки («25.09.2026» → «2026-09-25» и т. п.). */
+  coerced: CoercedValueNote[];
 }
 
 const DEFAULT_CACHE_MAX = 1000;
@@ -179,7 +182,22 @@ export class LookupResolver {
   async resolveDataLookups(collection: string, data: Record<string, unknown>): Promise<ResolvedData> {
     // Схему тянем заранее: неверная коллекция должна падать сразу, а не на
     // первом же поле, и дальше все резолвы полей идут по прогретому кэшу.
-    await this.metadataManager.getEntityMetadata(collection);
+    const entityMeta = await this.metadataManager.getEntityMetadata(collection);
+    const propTypes = new Map((entityMeta?.properties ?? []).map((p) => [p.name, p]));
+
+    // Пояс пользователя — один раз на вызов и только если его требует хоть одна дата.
+    let timeZonePromise: Promise<string | undefined> | undefined;
+    const userTimeZone = (): Promise<string | undefined> => {
+      timeZonePromise ??= (async () => {
+        if (!this.currentUser) return undefined;
+        try {
+          return (await this.currentUser.get()).timeZoneId || undefined;
+        } catch {
+          return undefined; // DataService недоступен — считаем в поясе сервера.
+        }
+      })();
+      return timeZonePromise;
+    };
 
     // Поля независимы друг от друга, поэтому резолвим их параллельно. На
     // bpm_batch_create из сотни записей последовательный обход давал сотни
@@ -194,6 +212,18 @@ export class LookupResolver {
           throw new UnknownFieldError(rawKey, collection, fieldRef.suggestions);
         }
         const normalizedKey = fieldRef.name;
+
+        // Не-lookup колонка с известным типом: приводим значение («да», «25.09.2026 15:00»).
+        const prop = propTypes.get(normalizedKey);
+        if (prop && !prop.isLookup) {
+          const tz = needsTimeZone(value, prop.type) ? await userTimeZone() : undefined;
+          const c = coerceValue(normalizedKey, value, prop.type, tz);
+          // Неизменённое значение (строка, Guid, уже верный тип) идёт обычным путём ниже.
+          if (c.changed) {
+            const coerced = { field: normalizedKey, input: value, output: c.value, type: prop.type };
+            return { key: normalizedKey, value: c.value, note: null, coerced };
+          }
+        }
 
         if (typeof value !== 'string' || this.isUuid(value)) {
           return { key: normalizedKey, value, note: null };
@@ -251,12 +281,14 @@ export class LookupResolver {
 
     const resolved: Record<string, unknown> = {};
     const notes: ResolvedLookupNote[] = [];
+    const coerced: CoercedValueNote[] = [];
     for (const entry of entries) {
       resolved[entry.key] = entry.value;
       if (entry.note) notes.push(entry.note as ResolvedLookupNote);
+      if ('coerced' in entry && entry.coerced) coerced.push(entry.coerced);
     }
 
-    return { data: resolved, notes };
+    return { data: resolved, notes, coerced };
   }
 
   /** Выборка первых значений справочника для контекста ошибок (ошибки сети глотаются). */

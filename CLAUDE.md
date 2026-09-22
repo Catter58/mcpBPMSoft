@@ -88,7 +88,7 @@ env-creds путь не упоминается — показывать толь
   число не совпадает с `expected_count`, операция отменяется до начала изменений.
 - **Lookup-фильтры через навигацию (v4).** `filter-compiler` сравнивает uuid как `Nav/Id eq`,
   `ne` — как `not (Nav/Id eq)`, пустоту — `Nav eq null` / `Nav/Id ne null`. FK-формы (`OwnerId ne null`)
-  на bpm9 рвут поток или валят `/$count`, а `Nav/Id ne`/`Nav/Id eq null` теряют записи без связи.
+  на тестовом стенде рвут поток или валят `/$count`, а `Nav/Id ne`/`Nav/Id eq null` теряют записи без связи.
 
 ## Как добавить новый MCP-tool
 

@@ -27,7 +27,16 @@ import { isQueryUnsupportedError, UnknownFieldError } from './errors.js';
 export const ALL_COLUMNS = '*';
 
 /** Колонка отображения — берём первую существующую из списка. */
-const DISPLAY_CANDIDATES = ['Name', 'Title', 'LeadName', 'Subject', 'Caption', 'FullName', 'Code', 'Number'];
+export const DISPLAY_CANDIDATES = [
+  'Name',
+  'Title',
+  'LeadName',
+  'Subject',
+  'Caption',
+  'FullName',
+  'Code',
+  'Number',
+];
 
 /** Сколько Id за один запрос к справочнику ($filter=Id eq .. or Id eq ..). */
 const ID_CHUNK = 50;
@@ -89,12 +98,14 @@ export async function getDisplayColumn(
  *                      «Город» → `CityId`; неизвестная колонка даёт ошибку
  *                      с подсказками, а не 400 от BPMSoft
  *
+ * Однозначная опечатка («Nmae») исправляется, заметка — в `notes` (select — это чтение).
  * Метаданные недоступны → возвращаем то, что передал клиент (прежнее поведение).
  */
 export async function resolveSelect(
   metadataManager: MetadataManager,
   collection: string,
-  select?: string
+  select?: string,
+  notes?: string[]
 ): Promise<string | undefined> {
   const trimmed = select?.trim();
   if (trimmed === ALL_COLUMNS) return undefined;
@@ -124,13 +135,14 @@ export async function resolveSelect(
     }
     let ref: Awaited<ReturnType<MetadataManager['resolveFieldReference']>>;
     try {
-      ref = await metadataManager.resolveFieldReference(collection, token);
+      ref = await metadataManager.resolveFieldReference(collection, token, { autoCorrect: true });
     } catch {
       return select; // метаданные недоступны — не мешаем запросу
     }
     if (ref.name === null) {
       throw new UnknownFieldError(token, collection, ref.suggestions);
     }
+    if (ref.autoCorrected) notes?.push(fieldCorrectionNote(token, ref.name));
     resolved.push(ref.name);
   }
 
@@ -143,12 +155,14 @@ export async function resolveSelect(
  * `$orderby` по тому, что написала модель: «Дата создания desc» → `CreatedOn desc`,
  * «Контрагент» → `Account/Name` (сортировать по uuid связи бессмысленно).
  * Неизвестная колонка — ошибка с подсказками, а не 400 от BPMSoft.
+ * Однозначная опечатка исправляется, заметка — в `notes`.
  * Метаданные недоступны → строка уходит как есть.
  */
 export async function resolveOrderBy(
   metadataManager: MetadataManager,
   collection: string,
-  orderby?: string
+  orderby?: string,
+  notes?: string[]
 ): Promise<string | undefined> {
   const trimmed = orderby?.trim();
   if (!trimmed) return undefined;
@@ -167,12 +181,13 @@ export async function resolveOrderBy(
     let ref: Awaited<ReturnType<MetadataManager['resolveFieldReference']>>;
     let meta: EntityMetadata;
     try {
-      ref = await metadataManager.resolveFieldReference(collection, field);
+      ref = await metadataManager.resolveFieldReference(collection, field, { autoCorrect: true });
       meta = await metadataManager.getEntityMetadata(collection);
     } catch {
       return orderby;
     }
     if (ref.name === null) throw new UnknownFieldError(field, collection, ref.suggestions);
+    if (ref.autoCorrected) notes?.push(fieldCorrectionNote(field, ref.name));
 
     let path = ref.name;
     const prop = meta.properties.find((p) => p.name === ref.name);
@@ -420,6 +435,11 @@ export async function enrichLookups<T extends Record<string, unknown>>(
     );
     return records;
   }
+}
+
+/** Заметка об исправленной опечатке в имени поля — для warnings в выдаче чтения. */
+export function fieldCorrectionNote(input: string, name: string): string {
+  return `Поле «${input}» → ${name} (исправлена опечатка)`;
 }
 
 /** `CityId` → `CityName`; в v3 (`City`) → `CityName`. */

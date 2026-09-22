@@ -305,7 +305,7 @@ describe('getRecordsWithLookupNames', () => {
       ): Promise<ODataCollectionResponse<Record<string, unknown>>> {
         calls.push({ collection, expand: query?.$expand });
         if (query?.$expand) {
-          // Так ведёт себя bpm9: 200 и обрыв тела вместо честного 4xx.
+          // Так ведёт себя тестовый стенд: 200 и обрыв тела вместо честного 4xx.
           throw new BpmApiError('Сетевая ошибка: terminated', 0);
         }
         if (collection === 'City') return { value: [{ Id: MOSCOW_ID, Name: 'Москва' }] };

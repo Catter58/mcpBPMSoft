@@ -218,15 +218,18 @@ export class MetadataManager {
    * Resolve a possibly-Russian field reference into the actual OData field name
    * for the current OData version. Returns:
    *   - { name }                — if exact match found
+   *   - { name, autoCorrected } — only with `autoCorrect`: a single unambiguous typo fix
    *   - { suggestions }         — if no match; up to 5 closest names+captions
    *
    * Used by tools to convert business-language field names ("Город", "Дата создания")
    * into OData identifiers ("CityId", "CreatedOn") before sending the request.
+   * `autoCorrect` is for READ paths only: a write must never land in a guessed column.
    */
   async resolveFieldReference(
     collection: string,
-    query: string
-  ): Promise<{ name: string } | { name: null; suggestions: string[] }> {
+    query: string,
+    options: { autoCorrect?: boolean } = {}
+  ): Promise<{ name: string; autoCorrected?: boolean } | { name: null; suggestions: string[] }> {
     const metadata = await this.getEntityMetadata(collection);
     const lower = query.toLowerCase();
 
@@ -273,8 +276,21 @@ export class MetadataManager {
       }
     }
 
+    const { suggestFields, uniqueClosest } = await import('../utils/suggest.js');
+
+    // 7. Опечатка («Nmae», «Accont») — только на чтении и только при однозначном кандидате.
+    if (options.autoCorrect) {
+      const hit = uniqueClosest(
+        query,
+        metadata.properties.map((p) => ({
+          value: p.name,
+          keys: [p.name, p.isLookup && p.name.endsWith('Id') ? p.name.slice(0, -2) : undefined, p.caption],
+        }))
+      );
+      if (hit) return { name: hit, autoCorrected: true };
+    }
+
     // No match → produce suggestions from {name, caption} pairs
-    const { suggestFields } = await import('../utils/suggest.js');
     const suggestions = suggestFields(
       query,
       metadata.properties.map((p) => ({ name: p.name, caption: p.caption }))
@@ -285,48 +301,85 @@ export class MetadataManager {
   /**
    * Resolve a (possibly-Russian) collection reference into the canonical EntitySet name.
    * Returns either { name } or { name: null, suggestions: string[] }.
+   *
+   * `autoCorrected: true` — имя угадано, а не совпало: суффикс `Collection` не той версии
+   * OData («ContactCollection» на v4), множественное число подписи («Контакты»), опечатка.
+   * Суффикс правится всегда (та же сущность); множественное число и опечатка — только
+   * с `autoCorrect` (пути чтения).
    */
   async resolveCollectionReference(
-    query: string
-  ): Promise<{ name: string } | { name: null; suggestions: string[] }> {
+    query: string,
+    options: { autoCorrect?: boolean } = {}
+  ): Promise<{ name: string; autoCorrected?: boolean } | { name: null; suggestions: string[] }> {
     await this.ensureMetadataLoaded();
     const sets = Array.from(this.parsedMetadata!.entitySets.keys());
+    const findSet = (name: string) => {
+      const lower = name.toLowerCase();
+      return sets.includes(name) ? name : sets.find((s) => s.toLowerCase() === lower);
+    };
 
     if (sets.includes(query)) return { name: query };
-    const lower = query.toLowerCase();
-    const ci = sets.find((s) => s.toLowerCase() === lower);
+    const ci = findSet(query);
     if (ci) return { name: ci };
+
+    // «ContactCollection» на v4 → Contact; «Contact» на v3 → ContactCollection.
+    const swapped = /collection$/i.test(query) ? findSet(query.slice(0, -10)) : findSet(`${query}Collection`);
+    if (swapped) return { name: swapped, autoCorrected: true };
+
+    // SysSchema знает имя объекта (Contact), EntitySet на v3 — ContactCollection.
+    const setForSchema = (schema: string | null) =>
+      schema ? (findSet(schema) ?? findSet(`${schema}Collection`)) : undefined;
 
     // Русское имя объекта («Контакт») — единственный доступный источник подписей
     // сущностей это SysSchema; колонок он не покрывает, но объекты — да.
-    const bySchemaCaption = await this.resolveCollectionByCaption(query);
-    if (bySchemaCaption && sets.includes(bySchemaCaption)) return { name: bySchemaCaption };
+    const bySchemaCaption = setForSchema(await this.resolveCollectionByCaption([query]));
+    if (bySchemaCaption) return { name: bySchemaCaption };
 
-    const { suggest } = await import('../utils/suggest.js');
+    const { suggest, uniqueClosest } = await import('../utils/suggest.js');
+    if (options.autoCorrect) {
+      const singulars = singularCaptionCandidates(query);
+      const bySingular = singulars.length
+        ? setForSchema(await this.resolveCollectionByCaption(singulars))
+        : undefined;
+      if (bySingular) return { name: bySingular, autoCorrected: true };
+      const typo = uniqueClosest(
+        query,
+        sets.map((s) => ({ value: s, keys: [s, s.replace(/Collection$/, '')] }))
+      );
+      if (typo) return { name: typo, autoCorrected: true };
+    }
+
     return { name: null, suggestions: suggest(query, sets) };
   }
 
   /**
-   * Имя EntitySet по русской подписи объекта через SysSchema.Caption.
+   * Имя объекта по русской подписи через SysSchema.Caption; несколько вариантов подписи —
+   * одним запросом через `or`, приоритет — по порядку в списке.
    * Недоступность SysSchema не считается ошибкой — просто нет подсказки.
    */
-  private async resolveCollectionByCaption(caption: string): Promise<string | null> {
-    if (this.captionByCollection.has(caption)) return this.captionByCollection.get(caption) ?? null;
+  private async resolveCollectionByCaption(captions: string[]): Promise<string | null> {
+    const key = captions.join('|');
+    if (this.captionByCollection.has(key)) return this.captionByCollection.get(key) ?? null;
     if (!this.httpClient) return null;
 
-    const escaped = escapeODataString(caption);
-    const url = `${getODataBaseUrl(this.config)}/SysSchema?$filter=Caption eq '${escaped}'&$select=Name&$top=5`;
+    const filter = captions.map((c) => `Caption eq '${escapeODataString(c)}'`).join(' or ');
+    const url = `${getODataBaseUrl(this.config)}/SysSchema?$filter=${filter}&$select=Name,Caption&$top=${5 * captions.length}`;
     try {
-      const response = await this.httpClient.request<ODataCollectionResponse<{ Name: string }>>({
+      const response = await this.httpClient.request<
+        ODataCollectionResponse<{ Name: string; Caption?: string }>
+      >({
         method: 'GET',
         url,
         contentKind: 'crud',
       });
-      const name = response.data?.value?.find((row) => typeof row.Name === 'string')?.Name ?? null;
-      this.captionByCollection.set(caption, name);
+      const rows = (response.data?.value ?? []).filter((row) => typeof row.Name === 'string');
+      const lowered = captions.map((c) => c.toLowerCase());
+      rows.sort((a, b) => rankOf(lowered, a.Caption) - rankOf(lowered, b.Caption));
+      const name = rows[0]?.Name ?? null;
+      this.captionByCollection.set(key, name);
       return name;
     } catch {
-      this.captionByCollection.set(caption, null);
+      this.captionByCollection.set(key, null);
       return null;
     }
   }
@@ -803,6 +856,28 @@ function singleNavTarget(meta: ParsedMetadata, np: EdmxNavigationProperty): stri
   const end = toArray(meta.associations.get(relationship)?.End).find((e) => e['@_Role'] === toRole);
   const multiplicity = end?.['@_Multiplicity'];
   return multiplicity === '0..1' || multiplicity === '1' ? (end?.['@_Type'] ?? null) : null;
+}
+
+/** Позиция подписи в списке вариантов; неизвестная — в конец. */
+function rankOf(lowered: string[], caption: string | undefined): number {
+  const i = caption ? lowered.indexOf(caption.toLowerCase()) : -1;
+  return i === -1 ? lowered.length : i;
+}
+
+/**
+ * Единственное число русской подписи во множественном: «Контакты» → «Контакт»,
+ * «Задачи» → «Задача», «Активности» → «Активность», «Счета» → «Счет».
+ * ponytail: эвристика окончаний без морфологии — беглые гласные («Звонки» → «Звонок») не ловит.
+ */
+export function singularCaptionCandidates(caption: string): string[] {
+  const word = caption.trim();
+  if (!/[а-яё]$/i.test(word) || word.length < 4) return [];
+  const stem = word.slice(0, -1);
+  const last = word.slice(-1).toLowerCase();
+  if (last === 'ы') return [stem, `${stem}а`];
+  if (last === 'и') return [`${stem}а`, `${stem}я`, `${stem}ь`, stem, `${stem}й`];
+  if (last === 'а' || last === 'я') return [stem];
+  return [];
 }
 
 function toArray<T>(value: T | T[] | undefined | null): T[] {

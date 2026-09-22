@@ -5,8 +5,9 @@
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import type { ServiceContainer } from './init-tool.js';
 import type { ResolvedLookupNote } from '../lookup/lookup-resolver.js';
+import type { MetadataManager } from '../metadata/metadata-manager.js';
 import { LookupResolutionError, UnknownCollectionError } from '../utils/errors.js';
-import { getDisplayColumn } from '../utils/display.js';
+import { getDisplayColumn, fieldCorrectionNote } from '../utils/display.js';
 import { compileFilter, type CompileResult, type Criterion } from '../utils/filter-compiler.js';
 
 export const NOT_INITIALIZED_RESULT: CallToolResult = {
@@ -101,15 +102,52 @@ export function lookupNotesStructured(
  * хотя `resolveCollectionReference` умеет и то, и другое.
  */
 export async function resolveCollectionName(services: ServiceContainer, input: string): Promise<string> {
+  return (await resolveCollection(services, input)).name;
+}
+
+/**
+ * То же, что `resolveCollectionName`, плюс заметка об исправлении («Коллекция «Контакты» → Contact»).
+ * `autoCorrect` (множественное число подписи, опечатка) — только для путей чтения.
+ */
+export async function resolveCollection(
+  services: ServiceContainer,
+  input: string,
+  options: { autoCorrect?: boolean } = {}
+): Promise<{ name: string; note?: string }> {
   let ref: Awaited<ReturnType<ServiceContainer['metadataManager']['resolveCollectionReference']>>;
   try {
-    ref = await services.metadataManager.resolveCollectionReference(input);
+    ref = await services.metadataManager.resolveCollectionReference(input, options);
   } catch {
     // Схема недоступна — не мешаем запросу: пусть отвечает сам BPMSoft.
-    return input;
+    return { name: input };
   }
-  if (ref.name) return ref.name;
+  if (ref.name) {
+    return 'autoCorrected' in ref && ref.autoCorrected
+      ? { name: ref.name, note: `Коллекция «${input}» → ${ref.name}` }
+      : { name: ref.name };
+  }
   throw new UnknownCollectionError(input, 'suggestions' in ref ? ref.suggestions : []);
+}
+
+/**
+ * MetadataManager, у которого resolveFieldReference исправляет однозначные опечатки и
+ * складывает заметки в `notes`. Для чтения: filter-compiler получает его вместо обычного.
+ * Proxy, а не наследник: состояние (кэш $metadata) остаётся в исходном экземпляре.
+ */
+export function autoCorrectingMetadata(mm: MetadataManager, notes: string[]): MetadataManager {
+  return new Proxy(mm, {
+    get(target, prop) {
+      if (prop === 'resolveFieldReference') {
+        return async (collection: string, query: string) => {
+          const ref = await target.resolveFieldReference(collection, query, { autoCorrect: true });
+          if (ref.name !== null && ref.autoCorrected) notes.push(fieldCorrectionNote(query, ref.name));
+          return ref;
+        };
+      }
+      const value = Reflect.get(target, prop, target) as unknown;
+      return typeof value === 'function' ? (value as (...a: unknown[]) => unknown).bind(target) : value;
+    },
+  });
 }
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -145,7 +183,8 @@ export async function compileCriteria(
   services: ServiceContainer,
   collection: string,
   criteria: Criterion[],
-  join?: 'and' | 'or'
+  join?: 'and' | 'or',
+  options: { autoCorrect?: boolean } = {}
 ): Promise<CompileResult> {
   let timeZone: string | undefined;
   try {
@@ -153,14 +192,19 @@ export async function compileCriteria(
   } catch {
     // DataService недоступен — считаем в поясе сервера.
   }
-  return compileFilter(criteria, {
+  const notes: string[] = [];
+  const compiled = await compileFilter(criteria, {
     collection,
-    metadataManager: services.metadataManager,
+    metadataManager: options.autoCorrect
+      ? autoCorrectingMetadata(services.metadataManager, notes)
+      : services.metadataManager,
     odataVersion: services.config.odata_version,
     join,
     timeZone,
     currentUser: services.currentUser,
   });
+  compiled.warnings.unshift(...new Set(notes));
+  return compiled;
 }
 
 /** Сырой $filter и скомпилированные criteria через and; пустые части отбрасываются. */

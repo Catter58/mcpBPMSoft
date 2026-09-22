@@ -13,9 +13,16 @@ import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import type { ServiceContainer } from './init-tool.js';
 import { formatToolError } from '../utils/errors.js';
 import { getTool } from './registry.js';
-import { notInitialized, resolveRecordId, compileCriteria, combineFilters } from './_guards.js';
-import { resolveCollectionName } from './_guards.js';
+import {
+  notInitialized,
+  resolveRecordId,
+  compileCriteria,
+  combineFilters,
+  resolveCollection,
+  autoCorrectingMetadata,
+} from './_guards.js';
 import { compileFilter, type Criterion } from '../utils/filter-compiler.js';
+import { compactRecord } from '../utils/compact.js';
 import { isQueryUnsupportedError } from '../utils/errors.js';
 import { markTolowerUnsupported } from '../utils/server-capabilities.js';
 import { renderRecordsText, type RenderFormat } from '../utils/render.js';
@@ -92,7 +99,7 @@ export function registerReadTools(server: McpServer, services: ServiceContainer)
             .enum(FORMAT_VALUES)
             .optional()
             .describe(
-              "Формат текстовой выдачи: 'compact' (по умолчанию) — сводка + первые 5 записей; 'full' — полный JSON; 'markdown' — таблица для ≤20 записей. structuredContent всегда полный."
+              "Формат текстовой выдачи: 'compact' (по умолчанию) — сводка + до 50 записей по строке на каждую (только непустые поля); 'full' — полный JSON; 'markdown' — таблица для ≤20 записей. structuredContent всегда полный."
             ),
           cursor: z
             .string()
@@ -105,6 +112,7 @@ export function registerReadTools(server: McpServer, services: ServiceContainer)
           collection: z.string(),
           ...paginationShape,
           records: z.array(recordShape),
+          warnings: z.array(z.string()).optional().describe('Автоисправления имён коллекции и полей'),
           dry_run: z.boolean().optional(),
           request: z
             .object({
@@ -157,11 +165,19 @@ export function registerReadTools(server: McpServer, services: ServiceContainer)
             count = params.count;
           }
 
-          collection = await resolveCollectionName(services, collection);
+          const warnings: string[] = [];
+          const resolved = await resolveCollection(services, collection, { autoCorrect: true });
+          collection = resolved.name;
+          if (resolved.note) warnings.push(resolved.note);
           const maxRecords = params.max_records ?? DEFAULT_MAX_RECORDS;
           const autoPaginate = params.auto_paginate ?? false;
-          const effectiveSelect = await resolveSelect(services.metadataManager, collection, select);
-          const effectiveOrderBy = await resolveOrderBy(services.metadataManager, collection, orderby);
+          const effectiveSelect = await resolveSelect(services.metadataManager, collection, select, warnings);
+          const effectiveOrderBy = await resolveOrderBy(
+            services.metadataManager,
+            collection,
+            orderby,
+            warnings
+          );
 
           const query = {
             $filter: filter,
@@ -174,7 +190,10 @@ export function registerReadTools(server: McpServer, services: ServiceContainer)
           };
 
           if (params.dry_run) {
-            return dryRunResult(services, collection, query, params.resolve_lookups);
+            return withWarnings(
+              await dryRunResult(services, collection, query, params.resolve_lookups),
+              warnings
+            );
           }
 
           const { response: result, records } = await getRecordsWithLookupNames(
@@ -209,20 +228,23 @@ export function registerReadTools(server: McpServer, services: ServiceContainer)
             cursor: nextCursor,
           });
 
-          return {
-            content: [{ type: 'text', text }],
-            structuredContent: {
-              collection,
-              count: records.length,
-              total_count: result['@odata.count'],
-              has_more: hasMore || truncated,
-              cursor: nextCursor,
-              records,
+          return withWarnings(
+            {
+              content: [{ type: 'text', text }],
+              structuredContent: {
+                collection,
+                count: records.length,
+                total_count: result['@odata.count'],
+                has_more: hasMore || truncated,
+                cursor: nextCursor,
+                records,
+              },
             },
-          };
+            warnings
+          );
         } catch (error) {
           const toolError = formatToolError(error, params.collection);
-          // Стенд оборвал ответ на ручном $filter (на bpm9 так ведут себя `XxxId eq null`, `tolower()`,
+          // Стенд оборвал ответ на ручном $filter (на тестовом стенде так ведут себя `XxxId eq null`, `tolower()`,
           // `in`): criteria-путь собирает совместимые конструкции сам.
           if (params.filter && isQueryUnsupportedError(error)) {
             toolError.next_steps = [
@@ -259,6 +281,7 @@ export function registerReadTools(server: McpServer, services: ServiceContainer)
           collection: z.string(),
           id: z.string(),
           record: recordShape,
+          warnings: z.array(z.string()).optional().describe('Автоисправления имён коллекции и полей'),
         },
         annotations: meta.annotations,
       },
@@ -267,8 +290,14 @@ export function registerReadTools(server: McpServer, services: ServiceContainer)
         try {
           await services.authManager.ensureAuthenticated();
 
-          const collection = await resolveCollectionName(services, params.collection);
-          const effectiveSelect = await resolveSelect(services.metadataManager, collection, params.select);
+          const warnings: string[] = [];
+          const resolved = await resolveCollection(services, params.collection, { autoCorrect: true });
+          const collection = resolved.name;
+          if (resolved.note) warnings.push(resolved.note);
+          // Одна запись — все колонки по умолчанию: второй вызов «а покажи ещё поле» дороже.
+          const effectiveSelect = params.select?.trim()
+            ? await resolveSelect(services.metadataManager, collection, params.select, warnings)
+            : undefined;
           const { id } = await resolveRecordId(services, collection, params.id);
 
           const record = await getRecordWithLookupNames(
@@ -279,15 +308,15 @@ export function registerReadTools(server: McpServer, services: ServiceContainer)
             { resolveLookups: params.resolve_lookups }
           );
 
-          return {
-            content: [
-              {
-                type: 'text',
-                text: `Запись ${collection}(${id}):\n${JSON.stringify(record, null, 2)}`,
-              },
-            ],
-            structuredContent: { collection, id, record },
-          };
+          // Текст — только содержательные поля; полная запись — в structuredContent.
+          const lines = Object.entries(compactRecord(record)).map(([k, v]) => `${k}: ${String(v)}`);
+          return withWarnings(
+            {
+              content: [{ type: 'text', text: `Запись ${collection}(${id}):\n${lines.join('\n')}` }],
+              structuredContent: { collection, id, record },
+            },
+            warnings
+          );
         } catch (error) {
           const toolError = formatToolError(error, params.collection);
           return {
@@ -325,6 +354,7 @@ export function registerReadTools(server: McpServer, services: ServiceContainer)
           collection: z.string(),
           filter: z.string().optional(),
           count: z.number().int(),
+          warnings: z.array(z.string()).optional().describe('Автоисправления имён коллекции и полей'),
         },
         annotations: meta.annotations,
       },
@@ -333,22 +363,29 @@ export function registerReadTools(server: McpServer, services: ServiceContainer)
         try {
           await services.authManager.ensureAuthenticated();
 
-          const collection = await resolveCollectionName(services, params.collection);
+          const resolved = await resolveCollection(services, params.collection, { autoCorrect: true });
+          const collection = resolved.name;
           const compiled = params.criteria?.length
-            ? await compileCriteria(services, collection, params.criteria as Criterion[], params.join)
+            ? await compileCriteria(services, collection, params.criteria as Criterion[], params.join, {
+                autoCorrect: true,
+              })
             : undefined;
           const filter = combineFilters(params.filter, compiled?.filter);
           const count = await services.odataClient.getCount(collection, filter);
+          const warnings = [...(resolved.note ? [resolved.note] : []), ...(compiled?.warnings ?? [])];
 
-          return {
-            content: [
-              {
-                type: 'text',
-                text: `Количество записей в ${collection}${filter ? ` (фильтр: ${filter})` : ''}: ${count}`,
-              },
-            ],
-            structuredContent: { collection, filter, count },
-          };
+          return withWarnings(
+            {
+              content: [
+                {
+                  type: 'text',
+                  text: `Количество записей в ${collection}${filter ? ` (фильтр: ${filter})` : ''}: ${count}`,
+                },
+              ],
+              structuredContent: { collection, filter, count },
+            },
+            warnings
+          );
         } catch (error) {
           const toolError = formatToolError(error, params.collection);
           return {
@@ -402,7 +439,7 @@ export function registerReadTools(server: McpServer, services: ServiceContainer)
             .enum(FORMAT_VALUES)
             .optional()
             .describe(
-              "Формат выдачи: 'compact' (по умолчанию) — превью; 'full' — полный JSON; 'markdown' — таблица."
+              "Формат выдачи: 'compact' (по умолчанию) — до 50 записей по строке на каждую; 'full' — полный JSON; 'markdown' — таблица."
             ),
         },
         outputSchema: {
@@ -431,10 +468,13 @@ export function registerReadTools(server: McpServer, services: ServiceContainer)
         try {
           await services.authManager.ensureAuthenticated();
 
-          const collection = await resolveCollectionName(services, params.collection);
+          const resolved = await resolveCollection(services, params.collection, { autoCorrect: true });
+          const collection = resolved.name;
+          // Исправленные поля: criteria — через обёртку metadataManager, select/orderby — напрямую.
+          const fieldNotes: string[] = [];
           const compileOptions = {
             collection,
-            metadataManager: services.metadataManager,
+            metadataManager: autoCorrectingMetadata(services.metadataManager, fieldNotes),
             odataVersion: services.config.odata_version,
             join: params.join,
             // «сегодня» считается в поясе пользователя, а не сервера
@@ -446,17 +486,25 @@ export function registerReadTools(server: McpServer, services: ServiceContainer)
           const top = params.top ?? DEFAULT_TOP;
           const maxRecords = params.max_records ?? DEFAULT_MAX_RECORDS;
           const autoPaginate = params.auto_paginate ?? false;
-          const effectiveSelect = await resolveSelect(services.metadataManager, collection, params.select);
+          const effectiveSelect = await resolveSelect(
+            services.metadataManager,
+            collection,
+            params.select,
+            fieldNotes
+          );
 
           const searchQuery = {
             $filter: compiled.filter || undefined,
             $select: effectiveSelect,
             $top: top,
             $skip: params.skip,
-            $orderby: await resolveOrderBy(services.metadataManager, collection, params.orderby),
+            $orderby: await resolveOrderBy(services.metadataManager, collection, params.orderby, fieldNotes),
             $expand: params.expand,
             $count: params.count,
           };
+
+          const corrections = () => [...(resolved.note ? [resolved.note] : []), ...new Set(fieldNotes)];
+          compiled.warnings.unshift(...corrections());
 
           if (params.dry_run) {
             const preview = await dryRunResult(services, collection, searchQuery, params.resolve_lookups);
@@ -490,6 +538,7 @@ export function registerReadTools(server: McpServer, services: ServiceContainer)
             if (!compiled.filter.includes('tolower(') || !isQueryUnsupportedError(error)) throw error;
             markTolowerUnsupported();
             compiled = await compileFilter(params.criteria as Criterion[], compileOptions);
+            compiled.warnings.unshift(...corrections());
             compiled.warnings.push(
               'Инстанс не поддерживает tolower(): поиск по подстроке выполнен с учётом регистра.'
             );
@@ -617,6 +666,19 @@ async function userTimeZone(services: ServiceContainer): Promise<string | undefi
   } catch {
     return undefined;
   }
+}
+
+/** Автоисправления имён — строкой в начало текста и полем `warnings` в structuredContent. */
+function withWarnings(result: CallToolResult, warnings: string[]): CallToolResult {
+  if (warnings.length === 0) return result;
+  const note = `Предупреждения: ${warnings.join('; ')}`;
+  const [first, ...rest] = result.content;
+  return {
+    ...result,
+    content:
+      first?.type === 'text' ? [{ type: 'text', text: `${note}\n${first.text}` }, ...rest] : result.content,
+    structuredContent: { ...result.structuredContent, warnings },
+  };
 }
 
 /** Зависимости подстановки имён lookup-полей из сервис-контейнера. */

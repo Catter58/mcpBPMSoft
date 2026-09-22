@@ -193,14 +193,14 @@ export async function compileFilter(criteria: Criterion[], options: CompileOptio
     // Lookup + текстовое значение → сравниваем с отображаемой колонкой справочника
     // (Type/Name), а не с FK-колонкой, куда текст всё равно не подставить.
     const byDisplayName = Boolean(resolved.displayPath) && isTextComparison(op, criterion);
-    // uuid в lookup сравниваем через навигацию (Owner/Id): на bpm9 /$count и $count=true
+    // uuid в lookup сравниваем через навигацию (Owner/Id): на тестовом стенде /$count и $count=true
     // падают на `OwnerId eq <uuid>`, а с навигацией работают. ne и пусто остаются на FK —
     // навигация отбросила бы записи с пустой связью.
     const byNavId = !byDisplayName && Boolean(resolved.idPath) && isUuidEquality(op, criterion);
     let path = resolved.path;
     if (byDisplayName) path = resolved.displayPath as string;
     else if (byNavId) path = resolved.idPath as string;
-    // Пустота на FK (`AccountId eq null`, `OwnerId ne null`) на bpm9 рвёт поток даже без $count;
+    // Пустота на FK (`AccountId eq null`, `OwnerId ne null`) на тестовом стенде рвёт поток даже без $count;
     // через навигацию работает и в выборке, и в /$count: `Account eq null`, `Owner/Id ne null`.
     else if (op === 'is_null' && resolved.idPath) path = resolved.idPath.replace(/\/Id$/, '');
     else if (op === 'is_not_null' && resolved.idPath) path = resolved.idPath;
@@ -211,7 +211,7 @@ export async function compileFilter(criteria: Criterion[], options: CompileOptio
     if (resolved.lookupWarning && !byDisplayName && !byNavId && !uuidValue && criterion.value !== undefined)
       warnings.push(resolved.lookupWarning);
 
-    // `OwnerId ne <uuid>` на bpm9 рвёт поток, а `Owner/Id ne <uuid>` теряет записи без связи
+    // `OwnerId ne <uuid>` на тестовом стенде рвёт поток, а `Owner/Id ne <uuid>` теряет записи без связи
     // (inner join). `not (Owner/Id eq <uuid>)` даёт верный результат и в выборке, и в /$count.
     if (
       op === 'ne' &&

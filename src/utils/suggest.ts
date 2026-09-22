@@ -113,3 +113,53 @@ export function suggestFields(
   scored.sort((a, b) => a.score - b.score);
   return scored.slice(0, max).map((s) => s.display);
 }
+
+/**
+ * Damerau-Levenshtein в варианте OSA: перестановка соседних букв («Nmae» → «Name») стоит 1,
+ * а не 2, как в обычном Levenshtein. Без учёта регистра.
+ */
+export function damerauLevenshtein(a: string, b: string): number {
+  a = a.toLowerCase();
+  b = b.toLowerCase();
+  if (a === b) return 0;
+  const d: number[][] = Array.from({ length: a.length + 1 }, (_, i) => [i]);
+  for (let j = 0; j <= b.length; j++) d[0][j] = j;
+  for (let i = 1; i <= a.length; i++) {
+    for (let j = 1; j <= b.length; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      d[i][j] = Math.min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + cost);
+      if (i > 1 && j > 1 && a[i - 1] === b[j - 2] && a[i - 2] === b[j - 1]) {
+        d[i][j] = Math.min(d[i][j], d[i - 2][j - 2] + 1);
+      }
+    }
+  }
+  return d[a.length][b.length];
+}
+
+/**
+ * Единственный однозначный кандидат для автоисправления опечатки, иначе null.
+ * Каждый кандидат сравнивается по нескольким ключам (имя, имя без Id, подпись) — берётся лучший.
+ * Условия: запрос не короче 3 символов, дистанция ≤ 1 для коротких (≤ 5) и ≤ 2 для длинных,
+ * и лучший кандидат строго ближе второго — иначе угадывать нельзя.
+ */
+export function uniqueClosest<T>(
+  query: string,
+  candidates: Array<{ value: T; keys: Array<string | undefined> }>
+): T | null {
+  if (query.length < 3) return null;
+  const limit = query.length <= 5 ? 1 : 2;
+  let best: { value: T; distance: number } | null = null;
+  let second = Infinity;
+  for (const c of candidates) {
+    const distance = Math.min(
+      ...c.keys.filter((k): k is string => Boolean(k)).map((k) => damerauLevenshtein(query, k))
+    );
+    if (!best || distance < best.distance) {
+      if (best) second = best.distance;
+      best = { value: c.value, distance };
+    } else if (distance < second) {
+      second = distance;
+    }
+  }
+  return best && best.distance <= limit && second > best.distance ? best.value : null;
+}

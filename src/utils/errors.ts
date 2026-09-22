@@ -8,6 +8,7 @@
  */
 
 import type { ToolError, ToolErrorCode, ODataErrorResponse } from '../types/index.js';
+import { isEnvCredsAllowed } from '../config.js';
 
 function codeFromStatus(httpStatus: number): ToolErrorCode {
   if (httpStatus === 401 || httpStatus === 403) return 'auth_required';
@@ -91,8 +92,7 @@ export class NotFoundError extends BpmApiError {
     const msg = id ? `Запись не найдена: ${collection}(${id})` : `Коллекция не найдена: ${collection}`;
     const next: string[] = id
       ? [
-          `Возможно, ID устарел. Найдите актуальную запись: bpm_lookup_value(${collection}, Name, "<имя из контекста>")`,
-          `Или проверьте список через bpm_get_records(${collection}, filter="...").`,
+          `Возможно, ID устарел. Повторите вызов, передав вместо id название записи — инструмент найдёт её сам.`,
         ]
       : [
           'Запросите список доступных коллекций: bpm_get_collections.',
@@ -143,8 +143,8 @@ export class LookupResolutionError extends Error {
         ];
       } else {
         this.nextSteps = [
-          `Попробуйте bpm_lookup_value — нечёткий каскад найдёт значение по неточному имени.`,
-          `Полный список допустимых значений даёт bpm_get_enum_values(field=${field}).`,
+          `Нечёткий поиск уже выполнен и ничего не нашёл — повторять его через bpm_lookup_value бессмысленно.`,
+          `Уточните значение у пользователя или посмотрите допустимые: bpm_get_enum_values(field=${field}).`,
         ];
       }
     } else {
@@ -165,10 +165,16 @@ export class UnknownFieldError extends BpmApiError {
     suggestions: string[]
   ) {
     const msg = `Поле "${fieldQuery}" не найдено в коллекции ${collectionName}`;
-    super(msg, 400, collectionName, undefined, suggestions, [
-      `Запросите схему коллекции: bpm_get_schema(${collectionName}).`,
-      `Найдите поле по русскому названию: bpm_find_field("${fieldQuery}", "${collectionName}").`,
-    ]);
+    super(
+      msg,
+      400,
+      collectionName,
+      undefined,
+      suggestions,
+      suggestions.length > 0
+        ? ['Повторите вызов с одним из предложенных имён поля.']
+        : [`Найдите поле по русскому названию: bpm_find_field("${fieldQuery}", "${collectionName}").`]
+    );
     this.name = 'UnknownFieldError';
   }
 }
@@ -269,7 +275,7 @@ function defaultNextSteps(httpStatus?: number, collection?: string): string[] {
   if (httpStatus === 401 || httpStatus === 403) {
     return [
       'Сессия BPMSoft могла истечь — переавторизуйтесь в BPMSoft и повторите запрос с актуальными BPMCSRF/cookies.',
-      'Если сервер запущен в режиме env-creds (BPMSOFT_ALLOW_ENV_CREDS=true) — повторно вызовите bpm_init с актуальными учётными данными.',
+      ...(isEnvCredsAllowed() ? ['Повторно вызовите bpm_init с актуальными учётными данными.'] : []),
     ];
   }
   if (httpStatus === 400 && collection) {
@@ -298,7 +304,7 @@ const QUERY_REJECTED_STATUSES = new Set([400, 405, 501]);
  * Отличает «сервер не умеет такую конструкцию запроса» от настоящего сбоя.
  *
  * Обычный случай — 4xx. Но BPMSoft на некоторых стендах отвечает 200 и рвёт
- * поток посреди тела (проверено на bpm9: `tolower()`, `in (...)`,
+ * поток посреди тела (проверено на тестовом стенде: `tolower()`, `in (...)`,
  * `$apply=groupby` — заголовки 200, затем `other side closed`). Для клиента это
  * сетевая ошибка со status=0, и без этой проверки каскадные фолбэки (contains
  * без tolower и т. п.) не срабатывают, а пользователь видит «Сетевая ошибка».

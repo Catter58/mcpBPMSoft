@@ -46,7 +46,7 @@ const SYSTEM_LOOKUPS = new Set(['CreatedById', 'ModifiedById', 'OwnerId', 'Autho
 function findLookupTo(meta: EntityMetadata, targetCollection: string): EntityProperty | undefined {
   const candidates = meta.properties.filter((p) => p.isLookup && p.lookupCollection === targetCollection);
   // ContactId/Contact раньше системных CreatedById/ModifiedById: иначе связь с контактом
-  // записывалась в «Кем создан» (проверено на bpm9).
+  // записывалась в «Кем создан» (проверено на тестовом стенде).
   const entity = targetCollection.replace(/Collection$/, '');
   return (
     candidates.find((p) => p.name === `${entity}Id` || p.name === entity) ??
@@ -233,6 +233,11 @@ export function registerLogActivityTool(server: McpServer, services: ServiceCont
         const resolved = await services.lookupResolver.resolveDataLookups('Activity', data);
         for (const n of resolved.notes) {
           warnings.push(`Поле ${n.field}: "${n.input}" разрешено неточно как "${n.matchedValue}"`);
+        }
+        for (const c of resolved.coerced ?? []) {
+          warnings.push(
+            `Поле ${c.field}: ${JSON.stringify(c.input)} приведено к ${JSON.stringify(c.output)}`
+          );
         }
         const created = await services.odataClient.createRecord<Record<string, unknown>>(
           'Activity',

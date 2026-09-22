@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { splitAgenda, type AgendaItem } from '../../src/workflows/my-agenda.js';
-import { compactRecord } from '../../src/tools/record-card-tool.js';
+import { compactRecord } from '../../src/utils/compact.js';
 
 const item = (id: string, due: string | null): AgendaItem => ({
   id,

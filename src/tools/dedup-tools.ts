@@ -384,7 +384,7 @@ async function countReferences(
     try {
       return { ...job, count: await services.odataClient.getCount(job.source.collection, filter) };
     } catch {
-      // /$count на части таблиц падает (bpm9: PostgresException), а выборка может работать — считаем ею.
+      // /$count на части таблиц падает (тестовый стенд: PostgresException), а выборка может работать — считаем ею.
       try {
         const page = await services.odataClient.getRecords<Record<string, unknown>>(job.source.collection, {
           $filter: filter,

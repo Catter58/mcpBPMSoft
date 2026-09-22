@@ -79,7 +79,7 @@ export class ODataClient {
       });
     } catch (error) {
       if (query?.$count !== true || !isQueryUnsupportedError(error)) throw error;
-      // bpm9: $count=true вместе с $filter по guid-колонке рвёт поток (200, 0 байт).
+      // Тестовый стенд: $count=true вместе с $filter по guid-колонке рвёт поток (200, 0 байт).
       // Берём страницу без $count, а итог — отдельным /$count, если сервер его осилит.
       response = await this.httpClient.request<ODataCollectionResponse<T>>({
         method: 'GET',

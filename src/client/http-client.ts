@@ -545,7 +545,7 @@ const REPLAY_NEXT_STEPS = [
 ];
 
 /** Признаки временного сбоя в тексте/типе исключения: такие 5xx повторять имеет смысл. */
-// Тип исключения СУБД (Npgsql/SqlException) сам по себе не значит «временно»: на bpm9 битая таблица
+// Тип исключения СУБД (Npgsql/SqlException) сам по себе не значит «временно»: на тестовом стенде битая таблица
 // отвечает PostgresException на каждый запрос. Повторяем только по признакам временного сбоя.
 const TRANSIENT_ERROR_RE =
   /timeout|timed out|deadlock|could not serialize|too many clients|connection|transport|temporar|reading from stream|end of stream|broken pipe/i;

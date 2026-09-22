@@ -238,7 +238,7 @@ describe('compileFilter — navigation and captions', () => {
       },
     ]);
     // Navigation property name in v4 is "Account"; uuid equality on the final lookup
-    // goes through its navigation (City/Id) — bpm9 /$count rejects `CityId eq <uuid>`.
+    // goes through its navigation (City/Id) — the test instance's /$count rejects `CityId eq <uuid>`.
     expect(r.filter).toBe('Account/City/Id eq 11111111-1111-1111-1111-111111111111');
   });
 

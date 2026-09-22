@@ -72,12 +72,12 @@ describe('lookup в criteria-DSL', () => {
     expect(await compile('Город', 'содержит', 'Моск')).toBe("contains(tolower(City/Name), 'моск')");
   });
 
-  it('равенство UUID идёт через навигацию City/Id: /$count на bpm9 падает на CityId eq <uuid>', async () => {
+  it('равенство UUID идёт через навигацию City/Id: /$count на тестовом стенде падает на CityId eq <uuid>', async () => {
     expect(await compile('Город', 'равно', MOSCOW_ID)).toBe(`City/Id eq ${MOSCOW_ID}`);
     expect(await compile('Город', 'не равно', MOSCOW_ID)).toBe(`not (City/Id eq ${MOSCOW_ID})`);
   });
 
-  it('пустота проверяется через навигацию: на bpm9 FK eq/ne null рвёт поток', async () => {
+  it('пустота проверяется через навигацию: на тестовом стенде FK eq/ne null рвёт поток', async () => {
     expect(await compile('Город', 'пусто')).toBe('City eq null');
     expect(await compile('Город', 'не пусто')).toBe('City/Id ne null');
   });

@@ -2,7 +2,8 @@
  * Token-aware rendering helpers for tool results.
  *
  * `format` strategies:
- *   'compact'  — summary + первые `compact_preview` записей в виде JSON, без полного дампа.
+ *   'compact'  — summary + до 50 записей, по строке на запись: `key=value` без пустых и
+ *                служебных полей (compactRecord), Id первым, колонка отображения вторым.
  *                По умолчанию для bpm_get_records и bpm_search_records.
  *   'full'     — полный JSON.stringify(records, null, 2).
  *   'markdown' — markdown-таблица для ≤ `markdown_threshold` записей; иначе fallback в compact.
@@ -11,7 +12,12 @@
  * поэтому MCP-клиент с поддержкой structuredContent ничего не теряет.
  */
 
-const COMPACT_PREVIEW = 5;
+import { compactRecord } from './compact.js';
+import { DISPLAY_CANDIDATES } from './display.js';
+
+const COMPACT_PREVIEW = 50;
+/** Длинные значения (описания, заметки) в строке списка обрезаются — полностью есть в bpm_get_record. */
+const COMPACT_MAX_VALUE = 200;
 const MARKDOWN_THRESHOLD = 20;
 const MARKDOWN_MAX_COL_WIDTH = 60;
 
@@ -24,7 +30,7 @@ export interface RenderRecordsOptions {
   truncated?: boolean;
   nextLink?: string;
   cursor?: string;
-  /** Сколько записей в превью для format=compact (default 5) */
+  /** Сколько записей показать строками для format=compact (default 50) */
   preview?: number;
 }
 
@@ -53,9 +59,27 @@ export function renderRecordsText(
   const remaining = records.length - head.length;
   const tail =
     remaining > 0
-      ? `\n\n…и ещё ${remaining} ${pluralize(remaining)}. Запросите format='full' или используйте structuredContent для полного списка.`
+      ? `\n…и ещё ${remaining} ${pluralize(remaining)} — уточните фильтр или запросите format='full'.`
       : '';
-  return `${summary}\n\nПревью (${head.length} из ${records.length}):\n${JSON.stringify(head, null, 2)}${tail}`;
+  return `${summary}\n\n${head.map(compactLine).join('\n')}${tail}`;
+}
+
+/** Одна запись одной строкой: `Id=…; Name=…; остальное` без пустых и служебных полей. */
+export function compactLine(record: Record<string, unknown>): string {
+  const compact = compactRecord(record);
+  const display = DISPLAY_CANDIDATES.find((c) => c in compact);
+  const keys = Object.keys(compact).sort((a, b) => rank(a, display) - rank(b, display));
+  return keys.map((k) => `${k}=${oneLine(compact[k])}`).join('; ');
+}
+
+function rank(key: string, display: string | undefined): number {
+  if (key === 'Id') return 0;
+  return key === display ? 1 : 2;
+}
+
+function oneLine(value: unknown): string {
+  const s = String(value).replace(/\s*\r?\n\s*/g, ' ');
+  return s.length > COMPACT_MAX_VALUE ? `${s.slice(0, COMPACT_MAX_VALUE - 1)}…` : s;
 }
 
 function buildSummary(records: Array<Record<string, unknown>>, options: RenderRecordsOptions): string {
