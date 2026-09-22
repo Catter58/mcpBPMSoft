@@ -257,8 +257,10 @@ export class ODataClient {
           id: String(++globalIndex),
           method: req.method,
           url: req.url,
+          // Без IEEE754Compatible: с ним Edm.Decimal ждут строкой, а числом подзапрос падает 500
+          // (проверено на тестовом стенде) — одиночные запросы идут так же, без этого флага.
           headers: {
-            'Content-Type': 'application/json; odata=verbose; IEEE754Compatible=true',
+            'Content-Type': 'application/json; odata=verbose',
             ...req.headers,
           },
           body: req.body,
