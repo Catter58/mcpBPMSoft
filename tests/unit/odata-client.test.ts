@@ -1,7 +1,8 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach } from 'vitest';
 import { ODataClient } from '../../src/client/odata-client.js';
 import { BpmApiError } from '../../src/utils/errors.js';
 import { MockHttpClient } from '../setup/mock-http-client.js';
+import { resetServerCapabilities } from '../../src/utils/server-capabilities.js';
 import type { BpmConfig } from '../../src/types/index.js';
 
 function makeCfg(overrides: Partial<BpmConfig> = {}): BpmConfig {
@@ -100,6 +101,82 @@ describe('ODataClient.executeBatch', () => {
     await expect(client.executeBatch([{ method: 'GET', url: '/Contact' }])).rejects.toBeInstanceOf(
       BpmApiError
     );
+  });
+});
+
+describe('ODataClient.executeBulk', () => {
+  beforeEach(() => resetServerCapabilities());
+  const coll = 'https://bpm.test/odata/Contact';
+  const posts = [
+    { method: 'POST' as const, url: coll, body: { Name: 'A' } },
+    { method: 'POST' as const, url: coll, body: { Name: 'B' } },
+  ];
+
+  it('probes $batch once, then sends records in one $batch', async () => {
+    const http = new MockHttpClient();
+    http.setFallback((opts) => ({
+      data: {
+        responses: (opts.body as { requests: unknown[] }).requests.map(() => ({ status: 200, body: {} })),
+      },
+    }));
+    const client = new ODataClient(makeCfg(), http as unknown as never);
+    expect((await client.executeBulk(posts, false, coll)).mode).toBe('batch');
+    expect((await client.executeBulk(posts, false, coll)).mode).toBe('batch');
+    // проба + два пакета: вторая проба не нужна
+    expect(http.requests.map((r) => r.url)).toEqual([
+      'https://bpm.test/odata/$batch',
+      'https://bpm.test/odata/$batch',
+      'https://bpm.test/odata/$batch',
+    ]);
+    expect((http.requests[0].body as { requests: Array<{ method: string }> }).requests[0].method).toBe('GET');
+  });
+
+  it('falls back to one-by-one when the probe fails, records never go into $batch', async () => {
+    const http = new MockHttpClient();
+    http.setFallback((opts) => {
+      if (opts.url.endsWith('$batch')) throw new BpmApiError('terminated', 0);
+      return { status: 201, data: { Id: (opts.body as { Name: string }).Name } };
+    });
+    const client = new ODataClient(makeCfg(), http as unknown as never);
+    const result = await client.executeBulk(posts, false, coll);
+    expect(result.mode).toBe('single');
+    expect(result.responses.map((r) => r.status)).toEqual([201, 201]);
+    expect(http.requests.filter((r) => r.url.endsWith('$batch'))).toHaveLength(1);
+    await client.executeBulk(posts, false, coll);
+    expect(http.requests.filter((r) => r.url.endsWith('$batch'))).toHaveLength(1);
+  });
+
+  it('one-by-one stops on first error unless continue_on_error', async () => {
+    const http = new MockHttpClient();
+    let n = 0;
+    http.setFallback(() => {
+      if (++n === 1) throw new BpmApiError('bad', 400);
+      return { status: 201, data: {} };
+    });
+    const client = new ODataClient(
+      makeCfg({ odata_version: 3, platform: 'netframework' }),
+      http as unknown as never
+    );
+    const stopped = await client.executeBulk(posts, false, coll);
+    expect(stopped.responses.map((r) => r.status)).toEqual([400]);
+    n = 0;
+    const all = await client.executeBulk(posts, true, coll);
+    expect(all.responses.map((r) => r.status)).toEqual([400, 201]);
+  });
+
+  it('does not latch on auth failure of the probe', async () => {
+    const http = new MockHttpClient();
+    http.setFallback(() => {
+      throw new BpmApiError('no', 401);
+    });
+    const client = new ODataClient(makeCfg(), http as unknown as never);
+    await expect(client.executeBulk(posts, false, coll)).rejects.toBeInstanceOf(BpmApiError);
+    http.setFallback((opts) => ({
+      data: {
+        responses: (opts.body as { requests: unknown[] }).requests.map(() => ({ status: 200, body: {} })),
+      },
+    }));
+    expect((await client.executeBulk(posts, false, coll)).mode).toBe('batch');
   });
 });
 

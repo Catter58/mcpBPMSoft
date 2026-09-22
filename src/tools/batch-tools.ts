@@ -1,5 +1,8 @@
 /**
- * MCP Tools: Batch operations (OData v4 only)
+ * MCP Tools: Batch operations
+ *
+ * Модель передаёт массив; как его отправить ($batch или по одному) решает
+ * ODataClient.executeBulk.
  *
  * bpm_batch_create — create multiple records in one $batch
  * bpm_batch_update — update multiple records in one $batch
@@ -16,6 +19,23 @@ import { notInitialized, lookupNotesText, lookupNotesStructured, resolveCollecti
 import type { ResolvedLookupNote } from '../lookup/lookup-resolver.js';
 import { confirmParam, confirmationRequired, confirmationResponse, previewIdList } from '../utils/confirm.js';
 import { confirmShape, resolvedLookupNoteShape } from './_schemas.js';
+
+const modeShape = z.enum(['batch', 'single']).describe('batch — одним $batch, single — по одному запросу');
+
+function modeText(mode: 'batch' | 'single'): string {
+  return mode === 'batch' ? 'одним $batch' : 'по одному запросу ($batch на инстансе не работает)';
+}
+
+type BulkResponse = { status: number; body: unknown };
+
+function splitResults(responses: BulkResponse[]): {
+  succeeded: Array<BulkResponse & { index: number }>;
+  failed: Array<BulkResponse & { index: number }>;
+} {
+  const indexed = responses.map((r, index) => ({ index, ...r }));
+  const ok = (r: BulkResponse): boolean => r.status >= 200 && r.status < 300;
+  return { succeeded: indexed.filter(ok), failed: indexed.filter((r) => !ok(r)) };
+}
 
 export function registerBatchTools(server: McpServer, services: ServiceContainer): void {
   // bpm_batch_create
@@ -43,6 +63,7 @@ export function registerBatchTools(server: McpServer, services: ServiceContainer
           failed: z.number().int(),
           created: z.array(z.union([z.string(), z.null()])),
           first_failed_index: z.number().int().nullable(),
+          mode: modeShape,
           resolved_lookups: z.array(resolvedLookupNoteShape).optional(),
         },
         annotations: meta.annotations,
@@ -90,22 +111,27 @@ export function registerBatchTools(server: McpServer, services: ServiceContainer
             body: record,
           }));
 
-          const result = await services.odataClient.executeBatch(
+          const result = await services.odataClient.executeBulk(
             batchRequests,
-            params.continue_on_error ?? false
+            params.continue_on_error ?? false,
+            services.odataClient.buildCollectionPath(collection)
           );
 
-          const succeeded = result.responses
-            .map((r, i) => ({ index: i, ...r }))
-            .filter((r) => r.status >= 200 && r.status < 300);
-          const failed = result.responses.map((r, i) => ({ index: i, ...r })).filter((r) => r.status >= 300);
+          const { succeeded, failed } = splitResults(result.responses);
 
           const lines = [
             `Пакетное создание в ${collection}:`,
             `  Всего запросов: ${params.records.length}`,
+            `  Способ: ${modeText(result.mode)}`,
             `  Успешно создано: ${succeeded.length}`,
             `  Ошибок: ${failed.length}`,
           ];
+          const skipped = params.records.length - result.responses.length;
+          if (skipped > 0) {
+            lines.push(
+              `  Не выполнено (остановлено на первой ошибке): ${skipped} — повторите их с continue_on_error=true`
+            );
+          }
           // Id созданных записей нужны модели для следующего шага, а structuredContent читают не все клиенты.
           const createdIds = succeeded
             .map((r) => (r.body as Record<string, unknown> | null)?.Id)
@@ -116,7 +142,9 @@ export function registerBatchTools(server: McpServer, services: ServiceContainer
           if (failed.length > 0) {
             lines.push('', 'Ошибки:');
             failed.forEach((f) =>
-              lines.push(`  #${f.index + 1}: HTTP ${f.status} — ${JSON.stringify(f.body).slice(0, 300)}`)
+              lines.push(
+                `  #${f.index + 1}: ${f.status ? `HTTP ${f.status}` : 'сеть'} — ${JSON.stringify(f.body).slice(0, 300)}`
+              )
             );
           }
 
@@ -130,6 +158,7 @@ export function registerBatchTools(server: McpServer, services: ServiceContainer
               failed: failed.length,
               created: succeeded.map((s) => (s.body as Record<string, unknown> | null)?.Id ?? null),
               first_failed_index: failed.length > 0 ? failed[0].index : null,
+              mode: result.mode,
               ...(allNotes.length ? { resolved_lookups: lookupNotesStructured(allNotes) } : {}),
             },
           };
@@ -167,6 +196,7 @@ export function registerBatchTools(server: McpServer, services: ServiceContainer
           succeeded: z.number().int(),
           failed: z.number().int(),
           first_failed_index: z.number().int().nullable(),
+          mode: modeShape,
           resolved_lookups: z.array(resolvedLookupNoteShape).optional(),
         },
         annotations: meta.annotations,
@@ -206,29 +236,34 @@ export function registerBatchTools(server: McpServer, services: ServiceContainer
             }
           }
 
-          const result = await services.odataClient.executeBatch(
+          const result = await services.odataClient.executeBulk(
             batchRequests,
-            params.continue_on_error ?? false
+            params.continue_on_error ?? false,
+            services.odataClient.buildCollectionPath(collection)
           );
 
-          const succeeded = result.responses
-            .map((r, i) => ({ index: i, ...r }))
-            .filter((r) => r.status >= 200 && r.status < 300);
-          const failed = result.responses.map((r, i) => ({ index: i, ...r })).filter((r) => r.status >= 300);
+          const { succeeded, failed } = splitResults(result.responses);
 
           const lines = [
             `Пакетное обновление в ${collection}:`,
             `  Всего запросов: ${params.updates.length}`,
+            `  Способ: ${modeText(result.mode)}`,
             `  Успешно обновлено: ${succeeded.length}`,
             `  Ошибок: ${failed.length}`,
           ];
+          const skipped = params.updates.length - result.responses.length;
+          if (skipped > 0) {
+            lines.push(
+              `  Не выполнено (остановлено на первой ошибке): ${skipped} — повторите их с continue_on_error=true`
+            );
+          }
           const notesLine = lookupNotesText(allNotes);
           if (notesLine) lines.push(notesLine);
           if (failed.length > 0) {
             lines.push('', 'Ошибки:');
             failed.forEach((f) =>
               lines.push(
-                `  #${f.index + 1} (id=${params.updates[f.index]?.id}): HTTP ${f.status} — ${JSON.stringify(f.body).slice(0, 300)}`
+                `  #${f.index + 1} (id=${params.updates[f.index]?.id}): ${f.status ? `HTTP ${f.status}` : 'сеть'} — ${JSON.stringify(f.body).slice(0, 300)}`
               )
             );
           }
@@ -242,6 +277,7 @@ export function registerBatchTools(server: McpServer, services: ServiceContainer
               succeeded: succeeded.length,
               failed: failed.length,
               first_failed_index: failed.length > 0 ? failed[0].index : null,
+              mode: result.mode,
               ...(allNotes.length ? { resolved_lookups: lookupNotesStructured(allNotes) } : {}),
             },
           };
@@ -274,6 +310,7 @@ export function registerBatchTools(server: McpServer, services: ServiceContainer
           succeeded: z.number().int().optional(),
           failed: z.number().int().optional(),
           first_failed_index: z.number().int().nullable().optional(),
+          mode: modeShape.optional(),
           ids: z.array(z.string()).optional(),
           count: z.number().int().optional(),
         },
@@ -301,27 +338,32 @@ export function registerBatchTools(server: McpServer, services: ServiceContainer
             url: services.odataClient.buildRecordPath(collection, id),
           }));
 
-          const result = await services.odataClient.executeBatch(
+          const result = await services.odataClient.executeBulk(
             batchRequests,
-            params.continue_on_error ?? false
+            params.continue_on_error ?? false,
+            services.odataClient.buildCollectionPath(collection)
           );
 
-          const succeeded = result.responses
-            .map((r, i) => ({ index: i, ...r }))
-            .filter((r) => r.status >= 200 && r.status < 300);
-          const failed = result.responses.map((r, i) => ({ index: i, ...r })).filter((r) => r.status >= 300);
+          const { succeeded, failed } = splitResults(result.responses);
 
           const lines = [
             `Пакетное удаление из ${collection}:`,
             `  Всего запросов: ${params.ids.length}`,
+            `  Способ: ${modeText(result.mode)}`,
             `  Успешно удалено: ${succeeded.length}`,
             `  Ошибок: ${failed.length}`,
           ];
+          const skipped = params.ids.length - result.responses.length;
+          if (skipped > 0) {
+            lines.push(
+              `  Не выполнено (остановлено на первой ошибке): ${skipped} — повторите их с continue_on_error=true`
+            );
+          }
           if (failed.length > 0) {
             lines.push('', 'Ошибки:');
             failed.forEach((f) =>
               lines.push(
-                `  #${f.index + 1} (id=${params.ids[f.index]}): HTTP ${f.status} — ${JSON.stringify(f.body).slice(0, 300)}`
+                `  #${f.index + 1} (id=${params.ids[f.index]}): ${f.status ? `HTTP ${f.status}` : 'сеть'} — ${JSON.stringify(f.body).slice(0, 300)}`
               )
             );
           }
@@ -335,6 +377,7 @@ export function registerBatchTools(server: McpServer, services: ServiceContainer
               succeeded: succeeded.length,
               failed: failed.length,
               first_failed_index: failed.length > 0 ? failed[0].index : null,
+              mode: result.mode,
             },
           };
         } catch (error) {

@@ -207,7 +207,8 @@ export const TOOLS: ToolDescriptor[] = [
       'их каскадно (точное совпадение → нечёткое: кавычки/орг-формы/регистр игнорируются). ' +
       'Пример: {"collection": "Contact", "data": {"Name": "Иванов Иван", "Город": "Москва", "AccountId": "Ланит"}}. ' +
       'Неточно разрешённые поля перечислены в resolved_lookups; при нескольких кандидатах — ошибка ' +
-      'lookup_ambiguous со списком (тогда нужен точный текст или UUID). Возвращает созданную запись.',
+      'lookup_ambiguous со списком (тогда нужен точный текст или UUID). Возвращает созданную запись. ' +
+      'Несколько записей — одним вызовом bpm_batch_create.',
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     blurb: 'создать запись (с авторезолвингом lookup-полей)',
     category: 'write',
@@ -369,41 +370,45 @@ export const TOOLS: ToolDescriptor[] = [
     category: 'schema',
   },
 
-  // ---- BATCH (v4 only) ----
+  // ---- BATCH ----
   {
     name: 'bpm_batch_create',
     title: 'Пакетное создание',
     description:
-      'Создаёт несколько записей одним $batch-запросом (только OData v4; на v3 — ошибка batch_unsupported). ' +
+      'Создаёт несколько записей за один вызов. Когда нужно создать больше одной записи — всегда этот ' +
+      'инструмент, а не серия или параллельные вызовы bpm_create_record. Способ отправки сервер выбирает ' +
+      'сам: одним $batch, если инстанс его поддерживает (проверяется один раз), иначе по одному запросу; ' +
+      'в ответе поле mode. Работает на OData v3 и v4, заранее проверять ничего не нужно. ' +
       'Lookup-поля резолвятся как в bpm_create_record (неточные — в resolved_lookups). ' +
       'Пример: {"collection": "Contact", "records": [{"Name": "А"}, {"Name": "Б"}], "continue_on_error": true}. ' +
       'continue_on_error=true пропускает ошибочные записи вместо остановки. До ~100 записей за вызов.',
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
-    blurb: 'пакетное создание (OData v4)',
+    blurb: 'пакетное создание (сервер сам выбирает $batch или по одному)',
     category: 'batch',
   },
   {
     name: 'bpm_batch_update',
     title: 'Пакетное обновление',
     description:
-      'Обновляет несколько записей одним $batch-запросом (только OData v4). ' +
+      'Обновляет несколько записей за один вызов (вместо серии bpm_update_record). Способ отправки — ' +
+      '$batch или по одному запросу — сервер выбирает сам, работает на v3 и v4. ' +
       'Пример: {"collection": "Contact", "updates": [{"id": "<uuid1>", "data": {"Job": "Директор"}}]}. ' +
       'Lookup-поля резолвятся автоматически; continue_on_error пропускает ошибочные элементы. ' +
       'Когда записи отбираются условием, а не списком UUID — bpm_update_by_filter.',
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
-    blurb: 'пакетное обновление (OData v4)',
+    blurb: 'пакетное обновление',
     category: 'batch',
   },
   {
     name: 'bpm_batch_delete',
     title: 'Пакетное удаление',
     description:
-      'Удаляет набор записей по UUID одним $batch-запросом (только OData v4). Необратимо; без ' +
+      'Удаляет набор записей по UUID за один вызов ($batch или по одному — выбирает сервер). Необратимо; без ' +
       'confirm=true возвращает превью списка ID, удаление — повторным вызовом с confirm=true после ' +
       'согласия пользователя. Пример: {"collection": "Contact", "ids": ["<uuid1>", "<uuid2>"], "confirm": true}. ' +
       'Удаление по условию — bpm_delete_by_filter.',
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
-    blurb: 'пакетное удаление (OData v4, требует confirm=true)',
+    blurb: 'пакетное удаление (требует confirm=true)',
     category: 'batch',
   },
 

@@ -60,9 +60,15 @@ function buildStubServices(state: StubState): ServiceContainer {
     buildRecordPath(collection: string, id: string) {
       return `/${collection}(${id})`;
     },
-    async executeBatch(requests: Array<{ method: string; url: string }>, _continueOnError: boolean) {
+    buildCollectionPath(collection: string) {
+      return `/${collection}`;
+    },
+    async executeBulk(requests: Array<{ method: string; url: string }>, _continueOnError: boolean) {
       state.executeBatchCalls.push(requests);
-      return { responses: requests.map((_, i) => ({ id: String(i + 1), status: 204, body: null })) };
+      return {
+        responses: requests.map((_, i) => ({ id: String(i + 1), status: 204, body: null })),
+        mode: 'batch',
+      };
     },
     async deleteFieldBinary(collection: string, id: string, field: string) {
       state.deleteFieldCalls.push({ collection, id, field });

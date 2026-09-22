@@ -30,4 +30,23 @@ export function markTolowerUnsupported(): void {
 /** Сброс — только для тестов. */
 export function resetServerCapabilities(): void {
   tolowerUnsupported = false;
+  batchSupported = undefined;
+}
+
+/**
+ * Поддержка $batch. undefined — ещё не проверяли. Проверка делается один раз
+ * безвредным GET внутри $batch (см. ODataClient.executeBulk); при отказе пакетные
+ * инструменты шлют запросы по одному, и модель не тратит вызовы на заведомо
+ * падающий путь.
+ */
+let batchSupported: boolean | undefined;
+
+export function getBatchSupport(): boolean | undefined {
+  return batchSupported;
+}
+
+export function setBatchSupport(supported: boolean, reason?: string): void {
+  if (batchSupported === supported) return;
+  batchSupported = supported;
+  if (!supported) console.error(`[capabilities] $batch не работает на инстансе (${reason}), шлю по одному`);
 }

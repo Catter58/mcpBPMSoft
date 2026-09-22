@@ -162,8 +162,7 @@ const ENTITY_GRAPH: { entities: string[]; relations: EntityRelation[] } = {
 
 const LIMITS = [
   'Максимум строк в одном OData-ответе: 20 000.',
-  'Максимум подзапросов в $batch: 100.',
-  'OData v3 не поддерживает $batch (используйте OData v4).',
+  'Несколько записей — одним вызовом bpm_batch_*: сервер сам шлёт $batch (до 100 подзапросов в пакете) или по одному, если $batch не работает (в т.ч. OData v3). Параллельные вызовы bpm_create_record не нужны.',
   'Размер файла на загрузку: 10 МБ (настраивается через BPMSOFT_MAX_FILE_SIZE).',
   'OData v3 EntitySet с суффиксом Collection (ContactCollection); v4 — без (Contact).',
   'Lookup-поля: v4 — суффикс Id (CityId), v3 — без суффикса (City).',

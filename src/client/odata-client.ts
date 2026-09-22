@@ -6,10 +6,17 @@
  * binary field I/O, and response normalization.
  */
 
-import type { BpmConfig, HttpResponse, ODataCollectionResponse, ODataVersion } from '../types/index.js';
+import type {
+  BpmConfig,
+  HttpRequestOptions,
+  HttpResponse,
+  ODataCollectionResponse,
+  ODataVersion,
+} from '../types/index.js';
 import { HttpClient } from './http-client.js';
 import { getODataBaseUrl } from '../config.js';
 import { BpmApiError, isQueryUnsupportedError } from '../utils/errors.js';
+import { getBatchSupport, setBatchSupport } from '../utils/server-capabilities.js';
 import { assertSafeIdentifier, assertGuid } from '../utils/odata.js';
 
 export interface QueryOptions {
@@ -275,6 +282,75 @@ export class ODataClient {
     }
 
     return { responses: allResponses };
+  }
+
+  /**
+   * Пакетное выполнение с выбором пути на стороне сервера.
+   *
+   * Модель передаёт массив, а как его отправить — решает сервер: одним $batch,
+   * если инстанс его переваривает, иначе по одному запросу. Поддержка $batch
+   * проверяется один раз на процесс безвредным GET внутри $batch по той же
+   * коллекции — до того, как в пакет попадут записи: при неудачном пакете с
+   * POST неизвестно, что успело создаться, а повтор по одному дал бы дубли.
+   */
+  async executeBulk(
+    requests: Array<{ method: HttpRequestOptions['method']; url: string; body?: Record<string, unknown> }>,
+    continueOnError: boolean,
+    probeCollectionPath: string
+  ): Promise<{ responses: Array<{ id?: string; status: number; body: unknown }>; mode: 'batch' | 'single' }> {
+    if (this.odataVersion === 4 && (await this.probeBatch(probeCollectionPath))) {
+      return { ...(await this.executeBatch(requests, continueOnError)), mode: 'batch' };
+    }
+    return { responses: await this.executeOneByOne(requests, continueOnError), mode: 'single' };
+  }
+
+  private async probeBatch(collectionPath: string): Promise<boolean> {
+    const known = getBatchSupport();
+    if (known !== undefined) return known;
+    try {
+      const { responses } = await this.executeBatch([
+        { method: 'GET', url: `${collectionPath}?$top=1&$select=Id` },
+      ]);
+      const status = responses[0]?.status;
+      const ok = status !== undefined && status >= 200 && status < 300;
+      setBatchSupport(ok, ok ? undefined : `ответ пробы: ${status ?? 'без responses'}`);
+      return ok;
+    } catch (error) {
+      // Нет прав или сессии — это не свойство инстанса, латч не трогаем.
+      if (error instanceof BpmApiError && (error.httpStatus === 401 || error.httpStatus === 403)) throw error;
+      setBatchSupport(false, error instanceof Error ? error.message : String(error));
+      return false;
+    }
+  }
+
+  /**
+   * Запросы по одному. ponytail: строго последовательно — порядок ответов совпадает
+   * с порядком массива, а стенд не получает залп запросов; пул параллелизма — если
+   * сотни записей по одному станут узким местом.
+   */
+  private async executeOneByOne(
+    requests: Array<{ method: HttpRequestOptions['method']; url: string; body?: Record<string, unknown> }>,
+    continueOnError: boolean
+  ): Promise<Array<{ id?: string; status: number; body: unknown }>> {
+    const responses: Array<{ id?: string; status: number; body: unknown }> = [];
+    for (const [i, req] of requests.entries()) {
+      try {
+        const res = await this.httpClient.request({
+          method: req.method,
+          url: req.url,
+          body: req.body,
+          contentKind: 'crud',
+        });
+        responses.push({ id: String(i + 1), status: res.status, body: res.data });
+      } catch (error) {
+        if (error instanceof BpmApiError && error.httpStatus === 401) throw error;
+        const status = error instanceof BpmApiError ? error.httpStatus : 0;
+        const message = error instanceof Error ? error.message : String(error);
+        responses.push({ id: String(i + 1), status, body: { error: message } });
+        if (!continueOnError) break;
+      }
+    }
+    return responses;
   }
 
   /**
