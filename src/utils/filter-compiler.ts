@@ -84,7 +84,11 @@ type CanonicalOp =
   | 'between'
   | 'not_contains'
   | 'similar_to'
+  | StateOp
   | CalendarPeriod;
+
+/** Состояние записи по признакам справочника статуса/стадии (End, IsFinal, Successful…). */
+type StateOp = 'state_open' | 'state_closed' | 'state_won' | 'state_lost';
 
 const OP_ALIASES: Record<string, CanonicalOp> = {
   // eq
@@ -156,7 +160,42 @@ const OP_ALIASES: Record<string, CanonicalOp> = {
   'в этом году': 'this_year',
   'этот год': 'this_year',
   this_year: 'this_year',
+  // состояние по признакам справочника статуса (Stage/End, Status/IsFinal…)
+  открыт: 'state_open',
+  открыта: 'state_open',
+  открыто: 'state_open',
+  открытые: 'state_open',
+  open: 'state_open',
+  active: 'state_open',
+  закрыт: 'state_closed',
+  закрыта: 'state_closed',
+  закрыто: 'state_closed',
+  закрытые: 'state_closed',
+  завершён: 'state_closed',
+  завершен: 'state_closed',
+  завершена: 'state_closed',
+  closed: 'state_closed',
+  final: 'state_closed',
+  успешно: 'state_won',
+  успешна: 'state_won',
+  успешные: 'state_won',
+  выиграна: 'state_won',
+  won: 'state_won',
+  successful: 'state_won',
+  неуспешно: 'state_lost',
+  проиграна: 'state_lost',
+  lost: 'state_lost',
 };
+
+const STATE_OPS: StateOp[] = ['state_open', 'state_closed', 'state_won', 'state_lost'];
+/** Поле не указано или указано обобщённо — ищем справочник статуса сами. */
+const STATE_FIELD_ALIASES = ['', 'состояние', 'state'];
+/** Признак «запись в конечном состоянии» — по приоритету. */
+const FINAL_FLAGS = ['End', 'FinalStatus', 'IsFinal', 'Finish'];
+/** Признак успешного исхода — по приоритету. */
+const SUCCESS_FLAGS = ['Successful', 'IsResolved'];
+/** Обратный признак: Active=false — закрыт (LeadStatus). */
+const ACTIVE_FLAG = 'Active';
 
 const CALENDAR_PERIODS: CalendarPeriod[] = [
   'today',
@@ -182,11 +221,21 @@ export async function compileFilter(criteria: Criterion[], options: CompileOptio
   const expressions: string[] = [];
 
   for (let criterion of criteria) {
-    if (!criterion || typeof criterion.field !== 'string' || typeof criterion.op !== 'string') {
+    if (!criterion || typeof criterion.op !== 'string') {
       throw new Error('Каждый critera должен быть объектом вида {field: string, op: string, value?: any}.');
     }
 
     const op = canonicalOp(criterion.op);
+    if (STATE_OPS.includes(op as StateOp)) {
+      const state = await compileState(criterion, op as StateOp, options);
+      used.push(state.used);
+      warnings.push(state.note);
+      expressions.push(state.expr);
+      continue;
+    }
+    if (typeof criterion.field !== 'string') {
+      throw new Error('Каждый critera должен быть объектом вида {field: string, op: string, value?: any}.');
+    }
     const resolved = await resolveFieldPath(criterion.field, options);
     criterion = await substituteMe(criterion, resolved, options);
 
@@ -242,6 +291,102 @@ export async function compileFilter(criteria: Criterion[], options: CompileOptio
   const filter = expressions.length === 1 ? expressions[0] : expressions.map((e) => `(${e})`).join(join);
 
   return { filter, used_fields: used, warnings };
+}
+
+/**
+ * «открыт»/«закрыт»/«выиграна»/«проиграна» → фильтр по признакам справочника статуса:
+ * `Stage/End eq false`, `(Stage/End eq true and Stage/Successful eq true)` и т.п.
+ * Только навигационная форма: FK-формы на тестовом стенде рвут поток.
+ */
+async function compileState(
+  criterion: Criterion,
+  op: StateOp,
+  options: CompileOptions
+): Promise<{ expr: string; used: UsedField; note: string }> {
+  const input = typeof criterion.field === 'string' ? criterion.field.trim() : '';
+  const resolved = STATE_FIELD_ALIASES.includes(input.toLowerCase())
+    ? await resolveFieldPath(await detectStateField(options), options)
+    : await resolveFieldPath(input, options);
+  const nav = resolved.displayPath?.replace(/\/[^/]+$/, '') ?? resolved.idPath?.replace(/\/Id$/, '');
+  if (!resolved.lookupCollection || !nav) {
+    throw new Error(
+      `Оператор "${criterion.op}" применим только к справочнику статуса или стадии, ` +
+        `а поле "${input}" (${resolved.path}) — не справочник.`
+    );
+  }
+
+  const target = await options.metadataManager.getEntityMetadata(resolved.lookupCollection);
+  const booleans = new Set(target.properties.filter((p) => /bool/i.test(p.type)).map((p) => p.name));
+  const finalFlag = FINAL_FLAGS.find((f) => booleans.has(f));
+  const successFlag = SUCCESS_FLAGS.find((f) => booleans.has(f));
+  const where = `справочник ${resolved.lookupCollection} (поле ${nav})`;
+  if (!finalFlag && !booleans.has(ACTIVE_FLAG)) {
+    throw new Error(
+      `Не удалось определить «${criterion.op}»: ${where} не содержит признака завершённости — ` +
+        `искали логические колонки ${FINAL_FLAGS.join(', ')} или ${ACTIVE_FLAG}. ` +
+        `Отфильтруйте по названию статуса: {field: "${nav}", op: "в списке", value: ["…", "…"]}.`
+    );
+  }
+
+  const isFinal = finalFlag ? `${nav}/${finalFlag} eq true` : `${nav}/${ACTIVE_FLAG} eq false`;
+  const notFinal = finalFlag ? `${nav}/${finalFlag} eq false` : `${nav}/${ACTIVE_FLAG} eq true`;
+  let expr: string;
+  if (op === 'state_open') {
+    // Пустой статус — запись не закрыта. `Nav eq null` (v4), а не `Nav/Id eq null` — та теряет записи.
+    const empty = options.odataVersion === 4 ? `${nav} eq null` : `${resolved.path} eq null`;
+    expr = `(${empty} or ${notFinal})`;
+  } else if (op === 'state_closed') {
+    expr = isFinal;
+  } else {
+    if (!successFlag) {
+      throw new Error(
+        `Не удалось определить «${criterion.op}»: ${where} не содержит признака успеха — ` +
+          `искали логические колонки ${SUCCESS_FLAGS.join(', ')}. Доступно только «открыт»/«закрыт»; ` +
+          `исход отфильтруйте по названию статуса: {field: "${nav}", op: "в списке", value: ["…"]}.`
+      );
+    }
+    expr = `(${isFinal} and ${nav}/${successFlag} eq ${op === 'state_won'})`;
+  }
+
+  return {
+    expr,
+    used: { input: input || 'состояние', resolved: nav, caption: resolved.caption },
+    note: `«${criterion.op}» → ${expr} (справочник ${resolved.lookupCollection}).`,
+  };
+}
+
+/**
+ * Справочник состояния коллекции: lookup с Status/Stage/State в имени. Точные Stage/Status/State
+ * (у Lead — QualifyStatus) выигрывают; иначе единственный кандидат с признаком завершённости.
+ */
+async function detectStateField(options: CompileOptions): Promise<string> {
+  const meta = await options.metadataManager.getEntityMetadata(options.collection);
+  const candidates = meta.properties.filter(
+    (p) => p.isLookup && p.lookupCollection && /Status|Stage|State/i.test(p.name)
+  );
+  const base = (name: string) => name.replace(/Id$/, '');
+  const preferred = [...(options.collection === 'Lead' ? ['QualifyStatus'] : []), 'Stage', 'Status', 'State'];
+  for (const name of preferred) {
+    const hit = candidates.find((p) => base(p.name) === name);
+    if (hit) return hit.name;
+  }
+  if (candidates.length === 1) return candidates[0].name;
+
+  const flagged: string[] = [];
+  for (const p of candidates) {
+    const target = await options.metadataManager.getEntityMetadata(p.lookupCollection as string);
+    const flags = [...FINAL_FLAGS, ACTIVE_FLAG];
+    if (target.properties.some((t) => flags.includes(t.name) && /bool/i.test(t.type))) flagged.push(p.name);
+  }
+  if (flagged.length === 1) return flagged[0];
+  if (candidates.length === 0) {
+    throw new Error(
+      `В ${options.collection} не найдено поле статуса/стадии (lookup с Status/Stage/State в имени). ` +
+        `Укажите field явно.`
+    );
+  }
+  const list = (flagged.length > 1 ? flagged : candidates.map((p) => p.name)).join(', ');
+  throw new Error(`В ${options.collection} несколько полей состояния: ${list}. Укажите field явно.`);
 }
 
 /** «я»/@me в lookup на Contact или SysAdminUnit → Id текущего пользователя (и в списке для in). */
@@ -316,7 +461,7 @@ function canonicalOp(input: string): CanonicalOp {
       `не содержит/not_contains, начинается с/startswith, заканчивается на/endswith, ` +
       `в списке/in, пусто/is_null, не пусто/is_not_null, ` +
       `за последние N дней/in_last_days, за последние N часов/in_last_hours, между/between, ` +
-      `похоже на/similar_to.`
+      `похоже на/similar_to, открыт/open, закрыт/closed, успешно/won, неуспешно/lost.`
   );
 }
 

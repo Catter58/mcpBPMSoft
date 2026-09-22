@@ -41,11 +41,16 @@ export const confirmShape = {
 
 /** Критерий criteria-DSL: компилируется сервером в $filter (см. utils/filter-compiler.ts). */
 export const criterionSchema = z.object({
-  field: z.string().describe('Имя поля, caption или путь навигации (например "Account.City")'),
+  field: z
+    .string()
+    .optional()
+    .describe(
+      'Имя поля, caption или путь навигации (например "Account.City"). Для открыт/закрыт/выиграна/проиграна можно не указывать — сервер найдёт поле состояния сам'
+    ),
   op: z
     .string()
     .describe(
-      'Оператор: равно/eq, не равно/ne, больше/gt, больше или равно/ge, меньше/lt, меньше или равно/le, содержит/contains (регистронезависимо), не содержит/not_contains, начинается с/startswith, заканчивается на/endswith, в списке/in, пусто/is_null, не пусто/is_not_null, за последние N дней/in_last_days, за последние N часов/in_last_hours, между/between, похоже на/similar_to, сегодня/вчера/завтра/на этой неделе/в этом месяце/в этом квартале/в этом году. Для lookup на контакт/пользователя value="я" подставляет текущего пользователя.'
+      'Оператор: равно/eq, не равно/ne, больше/gt, больше или равно/ge, меньше/lt, меньше или равно/le, содержит/contains (регистронезависимо), не содержит/not_contains, начинается с/startswith, заканчивается на/endswith, в списке/in, пусто/is_null, не пусто/is_not_null, за последние N дней/in_last_days, за последние N часов/in_last_hours, между/between, похоже на/similar_to, сегодня/вчера/завтра/на этой неделе/в этом месяце/в этом квартале/в этом году; состояние записи — открыт/open, закрыт/closed, выиграна/won, проиграна/lost (по флагам справочника статуса/стадии). Для lookup на контакт/пользователя value="я" подставляет текущего пользователя.'
     ),
   value: z
     .unknown()
@@ -53,3 +58,9 @@ export const criterionSchema = z.object({
     .describe('Значение (отсутствует для is_null/is_not_null и календарных операторов)'),
   value_to: z.unknown().optional().describe('Верхняя граница для оператора between'),
 });
+
+/** Что сервер заполнил и пересчитал в строках заказа/счёта и сумме родителя (workflows/line-items). */
+export const lineItemsNotesShape = z
+  .array(z.string())
+  .optional()
+  .describe('Что сервер заполнил и пересчитал в строках заказа/счёта и сумме родителя');

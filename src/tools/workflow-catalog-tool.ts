@@ -6,7 +6,7 @@
  * быстрая ориентация в начале сессии без перебора bpm_get_collections.
  *
  * Контент статичный (не требует сетевых вызовов), берётся из проектной
- * документации BPMSoft 1.8.
+ * документации BPMSoft 1.8 и сверен с коробочной конфигурацией тестового стенда.
  */
 
 import * as z from 'zod';
@@ -68,25 +68,25 @@ const SCENARIOS: WorkflowScenario[] = [
     id: 'browse-data',
     title: 'Посмотреть карточку записи',
     user_intent: '«Покажи карточку Иванова», «что в этой задаче», «детали по сделке».',
-    recommended_tools: ['bpm_lookup_value', 'bpm_get_record'],
+    recommended_tools: ['bpm_record_card', 'bpm_get_record'],
     notes:
-      'Сначала bpm_lookup_value по имени → UUID, затем bpm_get_record по UUID. Или ресурс bpmsoft://entity/{collection}/{id}.',
+      'Оба принимают название записи вместо UUID — искать Id отдельно не нужно. bpm_record_card — карточка 360° со связанными разделами, файлами и лентой.',
   },
   {
     id: 'mass-update',
     title: 'Массовое обновление по фильтру',
     user_intent: '«Закрой все заявки старше года», «обнови менеджера у этих клиентов», «переведи в архив».',
-    recommended_tools: ['bpm_search_records', 'bpm_update_by_filter'],
+    recommended_tools: ['bpm_update_by_filter'],
     notes:
-      'Сначала проверьте число затрагиваемых записей через bpm_search_records, потом передайте expected_count в bpm_update_by_filter — операция отменится при несовпадении.',
+      'Первый вызов без expected_count сам показывает число и названия найденных записей; повторите с этим expected_count — при несовпадении операция отменится.',
   },
   {
     id: 'mass-delete',
     title: 'Массовое удаление по фильтру',
     user_intent: 'Запрос на массовое удаление (требует подтверждения пользователя!).',
-    recommended_tools: ['bpm_search_records', 'bpm_delete_by_filter'],
+    recommended_tools: ['bpm_delete_by_filter'],
     notes:
-      'ВАЖНО: всегда показывайте пользователю предполагаемые записи и явное подтверждение, прежде чем вызывать bpm_delete_by_filter. expected_count обязателен.',
+      'Первый вызов возвращает список «Название (Id)» — покажите его пользователю; после согласия повторите с expected_count и confirm=true.',
   },
   {
     id: 'attach-file',
@@ -97,13 +97,13 @@ const SCENARIOS: WorkflowScenario[] = [
       'bpm_upload_file — для общего хранилища SysImage с привязкой. bpm_field_upload — прямая запись в произвольное бинарное поле сущности.',
   },
   {
-    id: 'esq-via-process',
-    title: 'Сложные запросы (агрегации, JOIN-ы) через ESQ',
+    id: 'analytics',
+    title: 'Цифры: суммы, группировки, воронка, динамика',
     user_intent:
-      '«Сделай SQL-подобный отчёт с группировкой», «нужны цифры по воронке с агрегацией», «JOIN нескольких сущностей с условиями».',
-    recommended_tools: ['bpm_run_process'],
+      '«Сколько открытых сделок по стадиям», «сумма заказов за квартал», «закрытые обращения за месяц против прошлого».',
+    recommended_tools: ['bpm_aggregate', 'bpm_count_records'],
     notes:
-      'BPMSoft не предоставляет HTTP-API для прямого выполнения EntitySchemaQuery. Стандартный паттерн: разработчик создаёт бизнес-процесс с Script Task внутри, который выполняет ESQ-запрос и возвращает JSON в выходной параметр. Затем этот процесс вызывается через bpm_run_process с указанием result_parameter_name. Пример доступен в документации «Запустить бизнес-процесс через веб-сервис».',
+      'Считает сервер, выгружать записи не нужно. Открытость/закрытость/успех — операторы «открыт»/«закрыт»/«успешно» по флагам справочника статусов (End, FinalStatus, IsFinal, Finish). Нестандартный ESQ-отчёт — бизнес-процесс через bpm_run_process.',
   },
   {
     id: 'post-to-feed',
@@ -118,9 +118,17 @@ const SCENARIOS: WorkflowScenario[] = [
     id: 'discover-options',
     title: 'Узнать допустимые значения',
     user_intent: '«Какие бывают типы активности», «какие статусы у лида», «варианты для поля Тип».',
-    recommended_tools: ['bpm_get_schema', 'bpm_get_enum_values'],
+    recommended_tools: ['bpm_get_enum_values'],
     notes:
-      'bpm_get_schema даёт перечень полей; bpm_get_enum_values возвращает все значения справочника к указанному lookup-полю.',
+      'Нужен, чтобы показать варианты пользователю. Для записи не обязателен: create/update сами сопоставят текст и при промахе вернут допустимые значения.',
+  },
+  {
+    id: 'order-with-products',
+    title: 'Заказ или счёт с продуктами',
+    user_intent: '«Оформи заказ Ромашке на 2 ноутбука и 3 мыши», «выставь счёт по заказу».',
+    recommended_tools: ['bpm_create_record', 'bpm_batch_create'],
+    notes:
+      'Создайте Order (номер присвоится сам), затем строки OrderProduct одним bpm_batch_create с OrderId, ProductId (по названию) и Quantity. Цену, название, единицу, суммы строк и итог заказа сервер посчитает сам — OData этого не делает. То же для Invoice/InvoiceProduct.',
   },
   {
     id: 'onboarding',
@@ -140,7 +148,22 @@ interface EntityRelation {
 }
 
 const ENTITY_GRAPH: { entities: string[]; relations: EntityRelation[] } = {
-  entities: ['Contact', 'Account', 'Lead', 'Opportunity', 'Activity', 'Order', 'Case'],
+  entities: [
+    'Contact',
+    'Account',
+    'Lead',
+    'Opportunity',
+    'Order',
+    'OrderProduct',
+    'Product',
+    'Contract',
+    'Invoice',
+    'InvoiceProduct',
+    'Activity',
+    'Case',
+    'Project',
+    'Document',
+  ],
   relations: [
     { from: 'Contact', to: 'Account', via: 'AccountId', meaning: 'контакт работает в контрагенте' },
     { from: 'Activity', to: 'Contact', via: 'ContactId', meaning: 'активность с контактом' },
@@ -157,11 +180,45 @@ const ENTITY_GRAPH: { entities: string[]; relations: EntityRelation[] } = {
     { from: 'Opportunity', to: 'Contact', via: 'ContactId', meaning: 'основной контакт сделки' },
     { from: 'Order', to: 'Account', via: 'AccountId', meaning: 'заказ от контрагента' },
     { from: 'Order', to: 'Opportunity', via: 'OpportunityId', meaning: 'заказ из сделки' },
+    { from: 'Lead', to: 'Opportunity', via: 'OpportunityId', meaning: 'лид → сделка' },
+    {
+      from: 'Opportunity',
+      to: 'Product',
+      via: 'OpportunityProductInterest',
+      meaning: 'интерес к продуктам в сделке',
+    },
+    {
+      from: 'OrderProduct',
+      to: 'Order',
+      via: 'OrderId',
+      meaning: 'строка заказа (ProductId, Quantity, Price)',
+    },
+    {
+      from: 'OrderProduct',
+      to: 'Product',
+      via: 'ProductId',
+      meaning: 'продукт из каталога (Price, UnitId, TaxId)',
+    },
+    { from: 'Contract', to: 'Order', via: 'OrderId', meaning: 'договор по заказу' },
+    {
+      from: 'Contract',
+      to: 'Account',
+      via: 'AccountId',
+      meaning: 'договор с контрагентом (номер, срок, состояние)',
+    },
+    { from: 'Invoice', to: 'Order', via: 'OrderId', meaning: 'счёт по заказу' },
+    { from: 'Invoice', to: 'Contract', via: 'ContractId', meaning: 'счёт по договору' },
+    { from: 'InvoiceProduct', to: 'Invoice', via: 'InvoiceId', meaning: 'строка счёта' },
+    { from: 'Case', to: 'Contact', via: 'ContactId', meaning: 'обращение клиента' },
+    { from: 'Project', to: 'Opportunity', via: 'OpportunityId', meaning: 'проект по сделке' },
+    { from: 'Document', to: 'Contract', via: 'ContractId', meaning: 'документ по договору' },
   ],
 };
 
 const LIMITS = [
   'Максимум строк в одном OData-ответе: 20 000.',
+  'Запись через OData не запускает расчёты страницы: суммы строк заказа/счёта и итог заказа сервер MCP считает сам, при прямой записи они остались бы нулевыми.',
+  'Номер заказа (Number) присваивается автоматически — не передавайте его без просьбы пользователя.',
   'Несколько записей — одним вызовом bpm_batch_*: сервер сам шлёт $batch (до 100 подзапросов в пакете) или по одному, если $batch не работает (в т.ч. OData v3). Параллельные вызовы bpm_create_record не нужны.',
   'Размер файла на загрузку: 10 МБ (настраивается через BPMSOFT_MAX_FILE_SIZE).',
   'OData v3 EntitySet с суффиксом Collection (ContactCollection); v4 — без (Contact).',

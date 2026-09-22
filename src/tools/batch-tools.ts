@@ -26,9 +26,10 @@ import {
 import { coercedText, type CoercedValueNote } from '../utils/coerce.js';
 import type { ResolvedLookupNote } from '../lookup/lookup-resolver.js';
 import { confirmParam, confirmationRequired, confirmationResponse } from '../utils/confirm.js';
-import { confirmShape, resolvedLookupNoteShape } from './_schemas.js';
+import { confirmShape, lineItemsNotesShape, resolvedLookupNoteShape } from './_schemas.js';
 import { getDisplayColumn } from '../utils/display.js';
 import { assertSafeIdentifier, escapeODataString, guidLiteral, isGuid } from '../utils/odata.js';
+import { enrichLineItem, lineNotesText, lineParentIds, recalcParentTotals } from '../workflows/line-items.js';
 
 const modeShape = z.enum(['batch', 'single']).describe('batch — одним $batch, single — по одному запросу');
 const itemErrorShape = z.object({ index: z.number().int(), reason: z.string() });
@@ -177,6 +178,17 @@ async function findExisting(
   return found;
 }
 
+/** Пересчёт родителей строк, записанных успешно: по одному разу на родителя. */
+async function recalcDone(
+  services: ServiceContainer,
+  collection: string,
+  parents: Map<number, string[]>,
+  ok: Map<number, BulkResponse>
+): Promise<string[]> {
+  const done = [...parents].filter(([index]) => ok.has(index)).flatMap(([, ids]) => ids);
+  return recalcParentTotals(services, collection, done);
+}
+
 /** Имена записей по Id одним запросом на чанк; недоступность схемы — пустой результат. */
 async function fetchNames(
   services: ServiceContainer,
@@ -248,6 +260,7 @@ export function registerBatchTools(server: McpServer, services: ServiceContainer
           first_failed_index: z.number().int().nullable(),
           mode: modeShape.optional(),
           resolved_lookups: z.array(resolvedLookupNoteShape).optional(),
+          line_items_notes: lineItemsNotesShape,
         },
         annotations: meta.annotations,
       },
@@ -289,10 +302,15 @@ export function registerBatchTools(server: McpServer, services: ServiceContainer
           const allNotes: ResolvedLookupNote[] = [];
           const allCoerced: CoercedValueNote[] = [];
           const errors: ItemError[] = [];
+          const lineNotes: string[] = [];
+          const lineParents = new Map<number, string[]>();
           for (let i = 0; i < total; i++) {
             try {
               const r = await services.lookupResolver.resolveDataLookups(collection, params.records[i]);
-              resolved[i] = r.data;
+              const line = await enrichLineItem(services, collection, r.data);
+              resolved[i] = line.data;
+              lineNotes.push(...line.notes.map((n) => `#${i + 1} ${n}`));
+              if (line.parents.length) lineParents.set(i, line.parents);
               allNotes.push(...r.notes);
               allCoerced.push(...(r.coerced ?? []).map((c) => ({ ...c, field: `#${i + 1} ${c.field}` })));
             } catch (error) {
@@ -342,6 +360,7 @@ export function registerBatchTools(server: McpServer, services: ServiceContainer
 
           const run = await runOps(services, collection, ops, continueOnError);
           errors.push(...run.errors);
+          lineNotes.push(...(await recalcDone(services, collection, lineParents, run.ok)));
 
           const created: Array<string | null> = new Array(total).fill(null);
           const updated: Array<string | null> = new Array(total).fill(null);
@@ -389,6 +408,7 @@ export function registerBatchTools(server: McpServer, services: ServiceContainer
           if (notesLine) lines.push(notesLine);
           const coercedLine = coercedText(allCoerced);
           if (coercedLine) lines.push(coercedLine);
+          if (lineNotes.length) lines.push(lineNotesText(lineNotes));
           lines.push(...errorLines(errors, label));
 
           const sortedErrors = [...errors].sort((a, b) => a.index - b.index);
@@ -406,6 +426,7 @@ export function registerBatchTools(server: McpServer, services: ServiceContainer
               first_failed_index: sortedErrors[0]?.index ?? null,
               ...(run.mode ? { mode: run.mode } : {}),
               ...(allNotes.length ? { resolved_lookups: lookupNotesStructured(allNotes) } : {}),
+              ...(lineNotes.length ? { line_items_notes: lineNotes } : {}),
             },
           };
         } catch (error) {
@@ -452,6 +473,7 @@ export function registerBatchTools(server: McpServer, services: ServiceContainer
           first_failed_index: z.number().int().nullable(),
           mode: modeShape.optional(),
           resolved_lookups: z.array(resolvedLookupNoteShape).optional(),
+          line_items_notes: lineItemsNotesShape,
         },
         annotations: meta.annotations,
       },
@@ -474,6 +496,8 @@ export function registerBatchTools(server: McpServer, services: ServiceContainer
           const errors: ItemError[] = [];
           const allNotes: ResolvedLookupNote[] = [];
           const allCoerced: CoercedValueNote[] = [];
+          const lineNotes: string[] = [];
+          const lineParents = new Map<number, string[]>();
           for (let i = 0; i < total; i++) {
             const update = params.updates[i];
             try {
@@ -490,11 +514,14 @@ export function registerBatchTools(server: McpServer, services: ServiceContainer
               allCoerced.push(
                 ...(resolved.coerced ?? []).map((c) => ({ ...c, field: `#${i + 1} ${c.field}` }))
               );
+              const line = await enrichLineItem(services, collection, resolved.data, { id: ids[i]! });
+              lineNotes.push(...line.notes.map((n) => `#${i + 1} ${n}`));
+              if (line.parents.length) lineParents.set(i, line.parents);
               ops.push({
                 index: i,
                 method: 'PATCH',
                 url: services.odataClient.buildRecordPath(collection, ids[i]!),
-                body: resolved.data,
+                body: line.data,
               });
             } catch (error) {
               errors.push({ index: i, reason: `ошибка резолвинга lookup: ${errorOf(error)}` });
@@ -507,6 +534,7 @@ export function registerBatchTools(server: McpServer, services: ServiceContainer
 
           const run = await runOps(services, collection, ops, continueOnError);
           errors.push(...run.errors);
+          lineNotes.push(...(await recalcDone(services, collection, lineParents, run.ok)));
 
           const lines = [
             `Пакетное обновление в ${collection}:`,
@@ -525,6 +553,7 @@ export function registerBatchTools(server: McpServer, services: ServiceContainer
           if (notesLine) lines.push(notesLine);
           const coercedLine = coercedText(allCoerced);
           if (coercedLine) lines.push(coercedLine);
+          if (lineNotes.length) lines.push(lineNotesText(lineNotes));
           lines.push(...errorLines(errors, label));
 
           const sortedErrors = [...errors].sort((a, b) => a.index - b.index);
@@ -541,6 +570,7 @@ export function registerBatchTools(server: McpServer, services: ServiceContainer
               first_failed_index: sortedErrors[0]?.index ?? null,
               ...(run.mode ? { mode: run.mode } : {}),
               ...(allNotes.length ? { resolved_lookups: lookupNotesStructured(allNotes) } : {}),
+              ...(lineNotes.length ? { line_items_notes: lineNotes } : {}),
             },
           };
         } catch (error) {
@@ -584,6 +614,7 @@ export function registerBatchTools(server: McpServer, services: ServiceContainer
             .array(z.object({ index: z.number().int(), input: z.string(), id: z.string(), name: z.string() }))
             .optional(),
           errors: z.array(itemErrorShape).optional(),
+          line_items_notes: lineItemsNotesShape,
         },
         annotations: meta.annotations,
       },
@@ -679,8 +710,15 @@ export function registerBatchTools(server: McpServer, services: ServiceContainer
             method: 'DELETE',
             url: services.odataClient.buildRecordPath(collection, it.id),
           }));
+          // Родителей строк читаем до удаления: после него пересчитывать будет не по чему.
+          const parents = await lineParentIds(
+            services,
+            collection,
+            found.map((it) => it.id)
+          );
           const run = await runOps(services, collection, ops, continueOnError);
           errors.push(...run.errors);
+          const lineNotes = run.ok.size ? await recalcParentTotals(services, collection, parents) : [];
 
           const lines = [
             `Пакетное удаление из ${collection}:`,
@@ -696,6 +734,7 @@ export function registerBatchTools(server: McpServer, services: ServiceContainer
           }
           const deleted = found.filter((it) => run.ok.has(it.index));
           if (deleted.length) lines.push('', 'Удалены:', ...deleted.map(itemLine));
+          if (lineNotes.length) lines.push(lineNotesText(lineNotes));
           lines.push(...errorLines(errors, label));
 
           const sortedErrors = [...errors].sort((a, b) => a.index - b.index);
@@ -711,6 +750,7 @@ export function registerBatchTools(server: McpServer, services: ServiceContainer
               ...(run.mode ? { mode: run.mode } : {}),
               ids: deleted.map((it) => it.id),
               ...(errors.length ? { errors: sortedErrors } : {}),
+              ...(lineNotes.length ? { line_items_notes: lineNotes } : {}),
             },
           };
         } catch (error) {

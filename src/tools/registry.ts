@@ -85,7 +85,8 @@ export const TOOLS: ToolDescriptor[] = [
       '(русские подписи, «сегодня», «я») и/или сырой filter. ' +
       'Пример: {"collection": "Activity", "criteria": [{"field": "Ответственный", "op": "равно", "value": "я"}, ' +
       '{"field": "CreatedOn", "op": "на этой неделе"}]}. Для группировки и сумм — bpm_aggregate. ' +
-      'Однозначные опечатки в коллекции и полях criteria исправляются автоматически — см. warnings.',
+      'Однозначные опечатки в коллекции и полях criteria исправляются автоматически — см. warnings. ' +
+      'Состояние записи — одним критерием: op «открыт»/«закрыт»/«выиграна»/«проиграна» (open/closed/won/lost) по полю статуса или стадии или без field — сервер сам найдёт справочник состояния и его признаки (End, IsFinal, FinalStatus, Successful), например {"op": "открыт"}.',
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     blurb: 'подсчёт записей с опциональным фильтром',
     category: 'read',
@@ -108,7 +109,8 @@ export const TOOLS: ToolDescriptor[] = [
       'контакт подставляет текущего пользователя; orderby принимает подписи («Контрагент desc»). ' +
       'Текстовый ответ — до 50 записей, по строке на запись; однозначные опечатки в коллекции и полях ' +
       'исправляются автоматически — см. warnings. ' +
-      'Ответ: compiled_filter, records, count/total_count/has_more/cursor.',
+      'Ответ: compiled_filter, records, count/total_count/has_more/cursor. ' +
+      'Состояние записи — одним критерием: op «открыт»/«закрыт»/«выиграна»/«проиграна» (open/closed/won/lost) по полю статуса или стадии или без field — сервер сам найдёт справочник состояния и его признаки (End, IsFinal, FinalStatus, Successful), например {"op": "открыт"}.',
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     blurb: 'поиск по criteria-DSL (RU/EN, авто-резолвинг полей, similar_to)',
     category: 'read',
@@ -128,7 +130,8 @@ export const TOOLS: ToolDescriptor[] = [
       '"group_by": "Ответственный", "compare_previous": true}. ' +
       'Lookup-группы подписаны именами (не uuid). Просматривает до max_records записей на период (по умолчанию 10000); ' +
       'при достижении лимита truncated=true. Ответ: groups [{label, bucket, count, metrics, previous_count, delta}], ' +
-      'period, previous_period, scanned.',
+      'period, previous_period, scanned. ' +
+      'Состояние записи — одним критерием: op «открыт»/«закрыт»/«выиграна»/«проиграна» (open/closed/won/lost) по полю статуса или стадии или без field — сервер сам найдёт справочник состояния и его признаки (End, IsFinal, FinalStatus, Successful), например {"op": "открыт"}.',
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     blurb: 'группировка и итоги (count/sum/avg/min/max) на сервере',
     category: 'read',
@@ -214,7 +217,8 @@ export const TOOLS: ToolDescriptor[] = [
       'Пример: {"collection": "Contact", "data": {"Name": "Иванов Иван", "Город": "Москва", "AccountId": "Ланит"}}. ' +
       'Неточно разрешённые поля перечислены в resolved_lookups; при нескольких кандидатах — ошибка ' +
       'lookup_ambiguous со списком (тогда нужен точный текст или UUID). Возвращает созданную запись. ' +
-      'Несколько записей — одним вызовом bpm_batch_create.',
+      'Несколько записей — одним вызовом bpm_batch_create. ' +
+      'Для строк заказа, счёта и продуктов сделки (OrderProduct, InvoiceProduct, OpportunityProductInterest) сервер сам подставляет название, единицу, налог и цену из продукта или прайс-листа, считает суммы, скидку и налог строки и пересчитывает сумму заказа или счёта — передавайте только продукт, количество и при необходимости цену или скидку.',
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     blurb: 'создать запись (с авторезолвингом lookup-полей)',
     category: 'write',
@@ -395,7 +399,8 @@ export const TOOLS: ToolDescriptor[] = [
       'записи; created[] выровнен по индексу входа. Против дублей: match_on — колонки, по которым запись уже ' +
       'существует (например ["Name"] или ["Email"], без учёта регистра), и if_exists: skip (по умолчанию, в ответе ' +
       '«уже есть: Id»), update (обновить найденную) или error. Пример: {"collection": "Account", "records": [...], ' +
-      '"match_on": ["Name"]}. До ~100 записей за вызов.',
+      '"match_on": ["Name"]}. До ~100 записей за вызов. ' +
+      'Строки заказа, счёта и продуктов сделки дополняются и рассчитываются так же, как в bpm_create_record; сумма каждого затронутого заказа или счёта пересчитывается один раз после записи.',
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     blurb: 'пакетное создание (сервер сам выбирает $batch или по одному)',
     category: 'batch',

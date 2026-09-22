@@ -25,11 +25,18 @@ import {
 } from './_guards.js';
 import type { ResolvedLookupNote } from '../lookup/lookup-resolver.js';
 import { confirmParam, confirmationRequired, confirmationResponse, previewIdList } from '../utils/confirm.js';
-import { confirmShape, recordShape, resolvedLookupNoteShape, criterionSchema } from './_schemas.js';
+import {
+  confirmShape,
+  recordShape,
+  resolvedLookupNoteShape,
+  criterionSchema,
+  lineItemsNotesShape,
+} from './_schemas.js';
 import type { Criterion } from '../utils/filter-compiler.js';
 import { coercedText } from '../utils/coerce.js';
 import { compactRecord } from '../utils/compact.js';
 import { getDisplayColumn } from '../utils/display.js';
+import { enrichLineItem, lineNotesText, lineParentIds, recalcParentTotals } from '../workflows/line-items.js';
 
 function formatLookupAmbiguity(error: LookupResolutionError): CallToolResult {
   return {
@@ -76,6 +83,7 @@ export function registerWriteTools(server: McpServer, services: ServiceContainer
           collection: z.string(),
           record: recordShape,
           resolved_lookups: z.array(resolvedLookupNoteShape).optional(),
+          line_items_notes: lineItemsNotesShape,
         },
         annotations: meta.annotations,
       },
@@ -115,7 +123,13 @@ export function registerWriteTools(server: McpServer, services: ServiceContainer
             throw error;
           }
 
+          const line = await enrichLineItem(services, collection, resolvedData);
+          resolvedData = line.data;
           const created = await services.odataClient.createRecord(collection, resolvedData);
+          const lineNotes = [
+            ...line.notes,
+            ...(await recalcParentTotals(services, collection, line.parents)),
+          ];
 
           const summary = await recordSummary(
             services,
@@ -127,13 +141,16 @@ export function registerWriteTools(server: McpServer, services: ServiceContainer
             content: [
               {
                 type: 'text',
-                text: [...summary, lookupNotesText(notes) ?? '', coerced ?? ''].filter(Boolean).join('\n'),
+                text: [...summary, lookupNotesText(notes) ?? '', coerced ?? '', lineNotesText(lineNotes)]
+                  .filter(Boolean)
+                  .join('\n'),
               },
             ],
             structuredContent: {
               collection: collection,
               record: created as unknown as Record<string, unknown>,
               ...(notes.length ? { resolved_lookups: lookupNotesStructured(notes) } : {}),
+              ...(lineNotes.length ? { line_items_notes: lineNotes } : {}),
             },
           };
         } catch (error) {
@@ -171,6 +188,7 @@ export function registerWriteTools(server: McpServer, services: ServiceContainer
           updated_fields: z.array(z.string()),
           record: recordShape.optional().describe('Обновлённая запись, если сервер её вернул'),
           resolved_lookups: z.array(resolvedLookupNoteShape).optional(),
+          line_items_notes: lineItemsNotesShape,
         },
         annotations: meta.annotations,
       },
@@ -196,9 +214,15 @@ export function registerWriteTools(server: McpServer, services: ServiceContainer
             throw error;
           }
 
+          const line = await enrichLineItem(services, collection, resolvedData, { id });
+          resolvedData = line.data;
           const updated = await services.odataClient.updateRecord(collection, id, resolvedData, {
             returnRepresentation: true,
           });
+          const lineNotes = [
+            ...line.notes,
+            ...(await recalcParentTotals(services, collection, line.parents)),
+          ];
 
           const summary = updated
             ? await recordSummary(
@@ -219,6 +243,7 @@ export function registerWriteTools(server: McpServer, services: ServiceContainer
                   ...summary.slice(1),
                   lookupNotesText(notes) ?? '',
                   coerced ?? '',
+                  lineNotesText(lineNotes),
                 ]
                   .filter(Boolean)
                   .join('\n'),
@@ -231,6 +256,7 @@ export function registerWriteTools(server: McpServer, services: ServiceContainer
               updated_fields: Object.keys(resolvedData),
               ...(updated ? { record: updated as Record<string, unknown> } : {}),
               ...(notes.length ? { resolved_lookups: lookupNotesStructured(notes) } : {}),
+              ...(lineNotes.length ? { line_items_notes: lineNotes } : {}),
             },
           };
         } catch (error) {
@@ -265,6 +291,7 @@ export function registerWriteTools(server: McpServer, services: ServiceContainer
           id: z.string(),
           matched: z.string().optional().describe('Название, по которому найдена запись (если передано имя)'),
           deleted: z.boolean().optional(),
+          line_items_notes: lineItemsNotesShape,
         },
         annotations: meta.annotations,
       },
@@ -291,17 +318,30 @@ export function registerWriteTools(server: McpServer, services: ServiceContainer
             });
           }
 
+          // Родителя строки читаем до удаления: после него пересчитывать будет не по чему.
+          const parents = await lineParentIds(services, collection, [id]);
           await services.odataClient.deleteRecord(collection, id);
+          const lineNotes = await recalcParentTotals(services, collection, parents);
           return {
             content: [
               {
                 type: 'text',
-                text: [matchedLine(id, matched), `Запись ${collection}(${id}) успешно удалена.`]
+                text: [
+                  matchedLine(id, matched),
+                  `Запись ${collection}(${id}) успешно удалена.`,
+                  lineNotesText(lineNotes),
+                ]
                   .filter(Boolean)
                   .join('\n'),
               },
             ],
-            structuredContent: { collection: collection, id, ...matchedNote, deleted: true },
+            structuredContent: {
+              collection: collection,
+              id,
+              ...matchedNote,
+              deleted: true,
+              ...(lineNotes.length ? { line_items_notes: lineNotes } : {}),
+            },
           };
         } catch (error) {
           const toolError = formatToolError(error, params.collection);
@@ -696,6 +736,9 @@ function matchedLine(id: string, matched?: string): string {
  * Короткий вид записи для текста: заголовок с Id и названием, затем только содержательные
  * поля (`key: value`). Полная запись остаётся в structuredContent.
  */
+// Кто и когда создал/изменил — только что сделал сам вызывающий; модели это не нужно.
+const AUDIT_COLUMNS = new Set(['CreatedOn', 'CreatedById', 'ModifiedOn', 'ModifiedById']);
+
 async function recordSummary(
   services: ServiceContainer,
   collection: string,
@@ -706,7 +749,7 @@ async function recordSummary(
   const id = String(record.Id ?? record.id ?? '');
   const name = column && record[column] ? `«${String(record[column])}» ` : '';
   const fields = Object.entries(compactRecord(record))
-    .filter(([key]) => key !== 'Id' && key !== column)
+    .filter(([key]) => key !== 'Id' && key !== column && !AUDIT_COLUMNS.has(key))
     .map(([key, value]) => `  ${key}: ${String(value)}`);
   return [`${heading} ${name}(${id})`, ...fields];
 }
