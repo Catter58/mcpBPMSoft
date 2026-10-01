@@ -125,4 +125,20 @@ describe('bpm_search_unified', () => {
     expect((sc.results as unknown[]).length).toBe(1);
     expect(filters.filter((f) => f.includes('tolower'))).toHaveLength(1);
   });
+
+  it('ошибка коллекции → isError true', async () => {
+    const services = buildServices([], () => {
+      throw new Error('boom');
+    });
+    const result = await run(services, { query: 'ланит', collections: ['Account'] });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('ошибка:');
+  });
+
+  it('ничего не найдено во всех коллекциях → isError false', async () => {
+    const services = buildServices([], () => []);
+    const result = await run(services, { query: 'нетничего' });
+    expect(result.isError).toBe(false);
+    expect((result.structuredContent as Record<string, unknown>).total_found).toBe(0);
+  });
 });

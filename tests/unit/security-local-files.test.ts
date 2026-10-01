@@ -14,7 +14,7 @@ import type { ServiceContainer } from '../../src/tools/init-tool.js';
 
 vi.mock('node:fs/promises', async (orig) => {
   const actual = await orig<typeof import('node:fs/promises')>();
-  return { ...actual, readFile: vi.fn(actual.readFile) };
+  return { ...actual, readFile: vi.fn(actual.readFile), writeFile: vi.fn(actual.writeFile) };
 });
 
 interface ToolResult {
@@ -45,6 +45,9 @@ function setup(maxSize = 1024) {
       async getFieldBinary() {
         return Buffer.from('hello');
       },
+      async getRecord() {
+        return { Id: UUID, Name: 'hello.txt', MimeType: 'text/plain' };
+      },
       async createRecord() {
         return { Id: UUID };
       },
@@ -71,6 +74,7 @@ beforeEach(async () => {
   delete process.env.MCP_TRANSPORT;
   delete process.env.BPMSOFT_FILE_ROOT;
   vi.mocked(fsp.readFile).mockClear();
+  vi.mocked(fsp.writeFile).mockClear();
 });
 
 afterEach(async () => {
@@ -223,6 +227,33 @@ describe('download tools', () => {
     const b64 = Buffer.from('hello').toString('base64');
     expect(r.structuredContent?.content_base64).toBe(b64);
     expect(r.content[0].text).not.toContain(b64);
+  });
+});
+
+describe('bpm_download_file isError', () => {
+  it('failed local write → isError true with the save error in the text', async () => {
+    process.env.MCP_TRANSPORT = 'stdio';
+    const { h } = setup();
+    vi.mocked(fsp.writeFile).mockRejectedValueOnce(new Error('EACCES: permission denied'));
+    const r = await h('bpm_download_file')({ image_id: UUID, save_path: '/tmp/bpm-unwritable.bin' });
+    expect(r.isError).toBe(true);
+    expect(r.content[0].text).toContain('Ошибка сохранения');
+  });
+
+  it('successful local save → not an error', async () => {
+    process.env.MCP_TRANSPORT = 'stdio';
+    const { h } = setup();
+    const target = join(root, 'ok.bin');
+    const r = await h('bpm_download_file')({ image_id: UUID, save_path: target });
+    expect(r.isError).toBe(false);
+    expect(r.content[0].text).toContain('Сохранён');
+  });
+
+  it('download without save_path → not an error', async () => {
+    process.env.MCP_TRANSPORT = 'stdio';
+    const { h } = setup();
+    const r = await h('bpm_download_file')({ image_id: UUID, return_base64: true });
+    expect(r.isError).toBe(false);
   });
 });
 

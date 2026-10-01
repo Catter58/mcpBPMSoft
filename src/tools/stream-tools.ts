@@ -333,6 +333,7 @@ export function registerStreamTools(server: McpServer, services: ServiceContaine
             responseType: 'binary',
           });
           const data = response.data;
+          let saveFailed = false;
 
           const lines = [
             `Файл из SysImage(${params.image_id}):`,
@@ -346,6 +347,7 @@ export function registerStreamTools(server: McpServer, services: ServiceContaine
               await writeFile(savePath, data);
               lines.push(`  Сохранён: ${params.save_path}`);
             } catch (writeError) {
+              saveFailed = true;
               lines.push(
                 `  Ошибка сохранения: ${writeError instanceof Error ? writeError.message : String(writeError)}`
               );
@@ -365,6 +367,7 @@ export function registerStreamTools(server: McpServer, services: ServiceContaine
               saved_to: params.save_path,
               ...b64,
             },
+            isError: saveFailed,
           };
         } catch (error) {
           const toolError = formatToolError(error, 'SysImage');

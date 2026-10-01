@@ -103,6 +103,7 @@ describe('bpm_batch_create', () => {
     expect(r.content[0].text).toContain('#1 A → new-0');
     expect(r.content[0].text).toContain('#2 B → new-1');
     expect(r.structuredContent?.created).toEqual(['new-0', 'new-1']);
+    expect(r.isError).toBe(false);
   });
 
   it('continue_on_error skips a record whose lookup fails and reports it by index', async () => {
@@ -115,7 +116,7 @@ describe('bpm_batch_create', () => {
     expect(state.bulk[0]).toHaveLength(1);
     expect(r.structuredContent?.created).toEqual([null, 'new-0']);
     expect(r.structuredContent?.errors).toEqual([{ index: 0, reason: expect.stringContaining('BAD') }]);
-    expect(r.isError).toBe(false);
+    expect(r.isError).toBe(true);
   });
 
   it('without continue_on_error a lookup failure sends nothing', async () => {
@@ -137,6 +138,7 @@ describe('bpm_batch_create', () => {
     });
     expect(r.content[0].text).toContain('HTTP 400 — Поле Name обязательно');
     expect(r.content[0].text).not.toContain('"error"');
+    expect(r.isError).toBe(true);
   });
 
   it('match_on + skip: existing record (case-insensitive) is not created; literals are escaped', async () => {
@@ -208,6 +210,7 @@ describe('bpm_batch_update', () => {
     expect(r.structuredContent?.ids).toEqual([ALPHA, null]);
     expect(r.structuredContent?.errors).toEqual([{ index: 1, reason: expect.any(String) }]);
     expect(r.content[0].text).toContain('«Альф» → Альфа');
+    expect(r.isError).toBe(true);
   });
 
   it('without continue_on_error a miss sends nothing', async () => {
@@ -245,6 +248,7 @@ describe('bpm_batch_delete', () => {
     });
     expect(state.bulk[0]).toEqual([{ method: 'DELETE', url: `/Account(${BETA})` }]);
     expect(r.structuredContent?.errors).toEqual([{ index: 0, reason: expect.stringContaining('точное') }]);
+    expect(r.isError).toBe(true);
   });
 
   it('without continue_on_error an unknown name aborts before deleting', async () => {
@@ -252,5 +256,105 @@ describe('bpm_batch_delete', () => {
     const r = await tool('bpm_batch_delete')({ collection: 'Account', ids: ['Альф', BETA], confirm: true });
     expect(state.bulk).toHaveLength(0);
     expect(r.isError).toBe(true);
+  });
+});
+
+describe('isError отражает любую ошибку элемента, а не только полный отказ', () => {
+  it('bpm_batch_create: все записи упали → isError true', async () => {
+    const { tool } = setup();
+    const r = await tool('bpm_batch_create')({
+      collection: 'Account',
+      records: [{ Name: 'FAIL' }, { Name: 'FAIL' }],
+      continue_on_error: true,
+    });
+    expect(r.structuredContent?.failed).toBe(2);
+    expect(r.isError).toBe(true);
+  });
+
+  it('bpm_batch_create: часть записей упала → isError true', async () => {
+    const { tool } = setup();
+    const r = await tool('bpm_batch_create')({
+      collection: 'Account',
+      records: [{ Name: 'A' }, { Name: 'FAIL' }],
+      continue_on_error: true,
+    });
+    expect(r.structuredContent?.succeeded).toBe(1);
+    expect(r.structuredContent?.failed).toBe(1);
+    expect(r.isError).toBe(true);
+  });
+
+  it('bpm_batch_create: ошибок нет → isError false', async () => {
+    const { tool } = setup();
+    const r = await tool('bpm_batch_create')({
+      collection: 'Account',
+      records: [{ Name: 'A' }, { Name: 'B' }],
+      continue_on_error: true,
+    });
+    expect(r.structuredContent?.failed).toBe(0);
+    expect(r.isError).toBe(false);
+  });
+
+  it('bpm_batch_update: все обновления упали → isError true', async () => {
+    const { tool } = setup();
+    const r = await tool('bpm_batch_update')({
+      collection: 'Account',
+      updates: [
+        { id: ALPHA, data: { Name: 'FAIL' } },
+        { id: BETA, data: { Name: 'FAIL' } },
+      ],
+      continue_on_error: true,
+    });
+    expect(r.structuredContent?.failed).toBe(2);
+    expect(r.isError).toBe(true);
+  });
+
+  it('bpm_batch_update: часть обновлений упала → isError true', async () => {
+    const { tool } = setup();
+    const r = await tool('bpm_batch_update')({
+      collection: 'Account',
+      updates: [
+        { id: ALPHA, data: { Name: 'OK' } },
+        { id: BETA, data: { Name: 'FAIL' } },
+      ],
+      continue_on_error: true,
+    });
+    expect(r.structuredContent?.succeeded).toBe(1);
+    expect(r.structuredContent?.failed).toBe(1);
+    expect(r.isError).toBe(true);
+  });
+
+  it('bpm_batch_update: ошибок нет → isError false', async () => {
+    const { tool } = setup();
+    const r = await tool('bpm_batch_update')({
+      collection: 'Account',
+      updates: [{ id: ALPHA, data: { Name: 'OK' } }],
+      continue_on_error: true,
+    });
+    expect(r.structuredContent?.failed).toBe(0);
+    expect(r.isError).toBe(false);
+  });
+
+  it('bpm_batch_delete: все записи не найдены → isError true', async () => {
+    const { tool } = setup();
+    const r = await tool('bpm_batch_delete')({
+      collection: 'Account',
+      ids: ['Нет такой', 'И этой нет'],
+      confirm: true,
+      continue_on_error: true,
+    });
+    expect(r.structuredContent?.failed).toBe(2);
+    expect(r.isError).toBe(true);
+  });
+
+  it('bpm_batch_delete: ошибок нет → isError false', async () => {
+    const { tool } = setup([{ Id: BETA, Name: 'Бета' }]);
+    const r = await tool('bpm_batch_delete')({
+      collection: 'Account',
+      ids: [BETA],
+      confirm: true,
+      continue_on_error: true,
+    });
+    expect(r.structuredContent?.failed).toBe(0);
+    expect(r.isError).toBe(false);
   });
 });

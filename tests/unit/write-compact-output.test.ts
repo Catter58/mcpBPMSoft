@@ -41,7 +41,10 @@ interface Calls {
   updated: Array<{ id: string; data: Record<string, unknown> }>;
 }
 
-function setup(opts: { ambiguous?: boolean } = {}): { handler: (name: string) => Handler; calls: Calls } {
+function setup(opts: { ambiguous?: boolean; failUpdateIds?: string[]; failDeleteIds?: string[] } = {}): {
+  handler: (name: string) => Handler;
+  calls: Calls;
+} {
   const calls: Calls = { getRecords: [], deleted: [], updated: [] };
   const odataClient = {
     async createRecord(_c: string, data: Record<string, unknown>) {
@@ -49,6 +52,7 @@ function setup(opts: { ambiguous?: boolean } = {}): { handler: (name: string) =>
     },
     async updateRecord(_c: string, id: string, data: Record<string, unknown>) {
       calls.updated.push({ id, data });
+      if (opts.failUpdateIds?.includes(id)) throw new Error('update failed');
       return { ...FULL_RECORD, ...data };
     },
     async getRecord() {
@@ -60,6 +64,7 @@ function setup(opts: { ambiguous?: boolean } = {}): { handler: (name: string) =>
     },
     async deleteRecord(_c: string, id: string) {
       calls.deleted.push(id);
+      if (opts.failDeleteIds?.includes(id)) throw new Error('delete failed');
     },
   };
   const metadataManager = {
@@ -189,6 +194,45 @@ describe('bpm_update_by_filter: превью', () => {
     expect(res.content[0].text).toContain('Неоднозначное значение');
     expect(calls.getRecords).toHaveLength(0);
   });
+
+  it('все обновления упали → isError true', async () => {
+    const { handler } = setup({ failUpdateIds: FOUND.map((r) => r.Id) });
+    const res = await handler('bpm_update_by_filter')({
+      collection: 'Contact',
+      filter: "Name ne ''",
+      data: { Email: 'x@y.z' },
+      expected_count: 2,
+    });
+    expect(res.structuredContent?.succeeded).toEqual([]);
+    expect(res.structuredContent?.failed).toHaveLength(2);
+    expect(res.isError).toBe(true);
+  });
+
+  it('часть обновлений упала → isError true', async () => {
+    const { handler } = setup({ failUpdateIds: [FOUND[1].Id] });
+    const res = await handler('bpm_update_by_filter')({
+      collection: 'Contact',
+      filter: "Name ne ''",
+      data: { Email: 'x@y.z' },
+      expected_count: 2,
+    });
+    expect(res.structuredContent?.succeeded).toEqual([FOUND[0].Id]);
+    expect(res.structuredContent?.failed).toHaveLength(1);
+    expect(res.isError).toBe(true);
+  });
+
+  it('ошибок нет → isError false', async () => {
+    const { handler } = setup();
+    const res = await handler('bpm_update_by_filter')({
+      collection: 'Contact',
+      filter: "Name ne ''",
+      data: { Email: 'x@y.z' },
+      expected_count: 2,
+    });
+    expect(res.structuredContent?.succeeded).toHaveLength(2);
+    expect(res.structuredContent?.failed).toEqual([]);
+    expect(res.isError).toBe(false);
+  });
 });
 
 describe('bpm_delete_by_filter: за два вызова', () => {
@@ -216,5 +260,44 @@ describe('bpm_delete_by_filter: за два вызова', () => {
     expect(res.structuredContent?.requires_confirmation).toBe(true);
     expect(res.content[0].text).toContain('Альфа (');
     expect(calls.deleted).toHaveLength(0);
+  });
+
+  it('все удаления упали → isError true', async () => {
+    const { handler } = setup({ failDeleteIds: FOUND.map((r) => r.Id) });
+    const res = await handler('bpm_delete_by_filter')({
+      collection: 'Contact',
+      filter: "Name ne ''",
+      expected_count: 2,
+      confirm: true,
+    });
+    expect(res.structuredContent?.succeeded).toEqual([]);
+    expect(res.structuredContent?.failed).toHaveLength(2);
+    expect(res.isError).toBe(true);
+  });
+
+  it('часть удалений упала → isError true', async () => {
+    const { handler } = setup({ failDeleteIds: [FOUND[0].Id] });
+    const res = await handler('bpm_delete_by_filter')({
+      collection: 'Contact',
+      filter: "Name ne ''",
+      expected_count: 2,
+      confirm: true,
+    });
+    expect(res.structuredContent?.succeeded).toEqual([FOUND[1].Id]);
+    expect(res.structuredContent?.failed).toHaveLength(1);
+    expect(res.isError).toBe(true);
+  });
+
+  it('ошибок нет → isError false', async () => {
+    const { handler } = setup();
+    const res = await handler('bpm_delete_by_filter')({
+      collection: 'Contact',
+      filter: "Name ne ''",
+      expected_count: 2,
+      confirm: true,
+    });
+    expect(res.structuredContent?.succeeded).toHaveLength(2);
+    expect(res.structuredContent?.failed).toEqual([]);
+    expect(res.isError).toBe(false);
   });
 });

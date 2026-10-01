@@ -520,7 +520,7 @@ export function registerWriteTools(server: McpServer, services: ServiceContainer
                   .join('\n'),
               },
             ],
-            isError: failed.length > 0 && succeeded.length === 0,
+            isError: failed.length > 0,
             structuredContent: {
               collection: collection,
               succeeded,
@@ -687,7 +687,7 @@ export function registerWriteTools(server: McpServer, services: ServiceContainer
                   .join('\n'),
               },
             ],
-            isError: failed.length > 0 && succeeded.length === 0,
+            isError: failed.length > 0,
             structuredContent: {
               collection: collection,
               succeeded,

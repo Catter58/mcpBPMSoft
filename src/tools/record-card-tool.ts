@@ -106,6 +106,7 @@ export function registerRecordCardTool(server: McpServer, services: ServiceConta
         const name = String(record[displayColumn] ?? id);
         const existing = new Set((await services.metadataManager.getEntitySets()).map((s) => s.name));
         const skipped: string[] = [];
+        let hadError = false;
 
         /** Поле в `source`, ссылающееся на нашу коллекцию (в порядке `preferred`), и его навигация. */
         const linkField = async (source: string, preferred: string[]) => {
@@ -145,6 +146,7 @@ export function registerRecordCardTool(server: McpServer, services: ServiceConta
           try {
             return await run();
           } catch (error) {
+            hadError = true;
             skipped.push(`${label}: ${error instanceof Error ? error.message : String(error)}`);
             return null;
           }
@@ -249,6 +251,7 @@ export function registerRecordCardTool(server: McpServer, services: ServiceConta
             ...(feed ? { feed } : {}),
             skipped,
           },
+          isError: hadError,
         };
       } catch (error) {
         const toolError = formatToolError(error, params.collection);

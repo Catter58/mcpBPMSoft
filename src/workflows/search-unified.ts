@@ -109,6 +109,7 @@ export function registerSearchUnifiedTool(server: McpServer, services: ServiceCo
         const results: UnifiedHit[] = [];
         const countsByCollection: Record<string, number> = {};
         const skipped: string[] = [];
+        let hadError = false;
 
         for (const coll of requested) {
           if (!existingNames.has(coll)) {
@@ -144,6 +145,7 @@ export function registerSearchUnifiedTool(server: McpServer, services: ServiceCo
             countsByCollection[coll] = hits.length;
           } catch (e) {
             // Tolerate per-collection errors so a single broken entity doesn't kill the search
+            hadError = true;
             countsByCollection[coll] = 0;
             skipped.push(`${coll} (ошибка: ${e instanceof Error ? e.message : String(e)})`);
           }
@@ -177,6 +179,7 @@ export function registerSearchUnifiedTool(server: McpServer, services: ServiceCo
             counts_by_collection: countsByCollection,
             ...(skipped.length ? { skipped } : {}),
           },
+          isError: hadError,
         };
       } catch (error) {
         const toolError = formatToolError(error);

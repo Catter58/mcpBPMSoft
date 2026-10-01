@@ -414,7 +414,7 @@ export function registerBatchTools(server: McpServer, services: ServiceContainer
           const sortedErrors = [...errors].sort((a, b) => a.index - b.index);
           return {
             content: [{ type: 'text', text: lines.join('\n') }],
-            isError: errors.length > 0 && createdCount + updatedCount + skippedExisting.length === 0,
+            isError: errors.length > 0,
             structuredContent: {
               collection,
               total,
@@ -559,7 +559,7 @@ export function registerBatchTools(server: McpServer, services: ServiceContainer
           const sortedErrors = [...errors].sort((a, b) => a.index - b.index);
           return {
             content: [{ type: 'text', text: lines.join('\n') }],
-            isError: errors.length > 0 && run.ok.size === 0,
+            isError: errors.length > 0,
             structuredContent: {
               collection,
               total,
@@ -740,7 +740,7 @@ export function registerBatchTools(server: McpServer, services: ServiceContainer
           const sortedErrors = [...errors].sort((a, b) => a.index - b.index);
           return {
             content: [{ type: 'text', text: lines.join('\n') }],
-            isError: errors.length > 0 && run.ok.size === 0,
+            isError: errors.length > 0,
             structuredContent: {
               collection,
               total,

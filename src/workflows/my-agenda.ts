@@ -130,6 +130,7 @@ export function registerMyAgendaTool(server: McpServer, services: ServiceContain
       try {
         await services.authManager.ensureAuthenticated();
         const warnings: string[] = [];
+        let hadError = false;
         const version = services.config.odata_version;
         const limit = params.limit ?? 20;
         const days = params.days ?? 7;
@@ -214,6 +215,7 @@ export function registerMyAgendaTool(server: McpServer, services: ServiceContain
               modified_on: (o.ModifiedOn as string | null) ?? null,
             }));
           } catch (error) {
+            hadError = true;
             warnings.push(`Сделки не получены: ${error instanceof Error ? error.message : String(error)}`);
           }
         }
@@ -262,6 +264,7 @@ export function registerMyAgendaTool(server: McpServer, services: ServiceContain
             ...(stale ? { stale_opportunities: stale } : {}),
             warnings,
           },
+          isError: hadError,
         };
       } catch (error) {
         const toolError = formatToolError(error, 'Activity');

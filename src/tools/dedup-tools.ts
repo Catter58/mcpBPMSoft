@@ -1112,7 +1112,7 @@ function registerMergeDuplicates(server: McpServer, services: ServiceContainer):
         return {
           content: [{ type: 'text', text: lines.join('\n') }],
           structuredContent: { ...plan, result: { filled, repointed, failed, deleted, kept, snapshots } },
-          isError: total > 0 && repointed === 0,
+          isError: failed.length > 0 || countFailures.length > 0 || (total > 0 && repointed === 0),
         };
       } catch (error) {
         const toolError = formatToolError(error, params.collection);
