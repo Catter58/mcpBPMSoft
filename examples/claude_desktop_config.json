@@ -1,36 +1,17 @@
 {
-  "_comment": "Примеры подключения mcp-bpmsoft-odata к Claude Desktop. Замените путь /path/to/mcpBPMSoft/build/index.js на абсолютный путь к собранному файлу на вашей машине (после `npm run build`). В реальном claude_desktop_config.json блок _comment не нужен — оставьте только один из вариантов внутри mcpServers.",
-
   "mcpServers": {
-    "_variant_A_stdio_per_request": {
-      "_comment": "Вариант A: stdio-транспорт (локальная отладка / Claude Desktop). Авторизация per-request: BPMCSRF-заголовок и cookies (.ASPXAUTH, BPMSESSIONID, CsrfToken) передаются клиентом с каждым запросом — сервер их пробрасывает в BPMSoft. Секреты не хранятся на сервере.",
+    "bpmsoft": {
       "command": "node",
-      "args": ["/path/to/mcpBPMSoft/build/index.js"],
+      "args": ["/absolute/path/mcpBPMSoft/build/index.js"],
       "env": {
-        "BPMSOFT_URL":           "https://bpm.example.ru",
-        "MCP_TRANSPORT":         "stdio",
+        "BPMSOFT_URL": "https://bpm.example.ru",
+        "MCP_TRANSPORT": "stdio",
+        "BPMSOFT_ALLOW_ENV_CREDS": "true",
+        "BPMSOFT_USERNAME": "api-user",
+        "BPMSOFT_PASSWORD": "REPLACE_IN_LOCAL_CONFIG",
         "BPMSOFT_ODATA_VERSION": "4",
-        "BPMSOFT_PLATFORM":      "net8"
+        "BPMSOFT_PLATFORM": "net8"
       }
-    },
-
-    "_variant_B_http_launch_server": {
-      "_comment": "Вариант B1: локально ЗАПУСТИТЬ сервер в HTTP-режиме через клиент, который умеет спавнить процесс (command/args/env). Сервер слушает MCP_HTTP_PORT (default 8007). Это НЕ подключение к уже работающему серверу — см. вариант B2.",
-      "command": "node",
-      "args": ["/path/to/mcpBPMSoft/build/index.js"],
-      "env": {
-        "BPMSOFT_URL":           "https://bpm.example.ru",
-        "MCP_TRANSPORT":         "http",
-        "MCP_HTTP_PORT":         "8007",
-        "BPMSOFT_ODATA_VERSION": "4",
-        "BPMSOFT_PLATFORM":      "net8"
-      }
-    },
-
-    "_variant_B2_http_remote": {
-      "_comment": "Вариант B2: ПОДКЛЮЧЕНИЕ к уже работающему Streamable HTTP серверу. Транспорт задаётся полем type:\"http\" + url (НЕ command/args). Путь в url игнорируется сервером (принимается любой POST) — /mcp по соглашению. Заголовки авторизации (BPMCSRF + Cookie) НЕ хардкодятся: сервер извлекает их из каждого входящего запроса, а подставляет их фронтящий reverse proxy или сам клиент из живой сессии пользователя (паттерн mcp-proxy-server). Статичный токен протухнет. В production ставьте перед сервером HTTPS reverse proxy и используйте https:// url.",
-      "type": "http",
-      "url": "http://bpmsoft-mcp-host:8007/mcp"
     }
   }
 }

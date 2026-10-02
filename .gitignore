@@ -1,18 +1,17 @@
-node_modules/
+node_modules
 build/
 coverage/
 .env
-.env.local
+.env.*
+!.env.example
 *.log
+files/
 .DS_Store
-
-*.pdf
-
-*.postman_collection.json
 
 .idea/
 .vscode/
-.gitignore
 .serena/
 .claude/
+*.pdf
+*.postman_collection.json
 docs/

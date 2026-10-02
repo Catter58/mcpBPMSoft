@@ -166,12 +166,11 @@ export function registerPrompts(server: McpServer, _services: ServiceContainer):
             '',
             'Шаги:',
             `  1. bpm_count_records(collection='${a.collection}') — общий объём.`,
-            `  2. bpm_search_records(collection='${a.collection}', orderby='${field} asc', top=200)`,
-            `     — выбери подмножество и сгруппируй вручную по ${field} в памяти.`,
-            '  3. Покажи группы с count > 1 как кандидатов на дубликаты.',
+            `  2. bpm_find_duplicates(collection='${a.collection}', fields=['${field}']) — сервер сам нормализует и группирует кандидатов.`,
+            '  3. Покажи группы, исходные значения и UUID. Укажи complete и scanned_count; частичный результат не является полным аудитом.',
             '',
             'ВАЖНО: ничего не удалять автоматически. Перед любым bpm_delete_*',
-            'обязательно подтверждение пользователя в чате.',
+            'используй превью и confirmation_token для точного набора после подтверждения пользователя.',
           ].join('\n');
           return userMessage(text);
         }
@@ -201,11 +200,10 @@ export function registerPrompts(server: McpServer, _services: ServiceContainer):
             'Шаги:',
             "  1. Если поле стадии неизвестно — вызови bpm_get_schema('Opportunity')",
             '     и найди lookup-поле статуса/стадии.',
-            "  2. bpm_get_records(collection='Opportunity', select='Id,Name,Amount,<stage_field>',",
-            '     top=500) — выгрузи ключевые поля.',
-            '  3. Сгруппируй в памяти по стадии, посчитай count, sum(Amount), avg(Amount).',
-            '  4. Подай результат в виде таблицы: стадия | количество | сумма | средняя сумма.',
-            '  5. По возможности оцени конверсию между соседними стадиями.',
+            "  2. bpm_aggregate_records(collection='Opportunity', group_by=[<stage_field>],",
+            "     metrics=[{field: 'Amount', op: 'sum'}, {field: 'Amount', op: 'avg'}]).",
+            '  3. Верни готовые группы с display_dimensions, count и metrics. Не пересчитывай числа вручную.',
+            '  4. Укажи complete и scanned_count. Конверсию нельзя вывести из одного текущего снимка без истории переходов.',
           ].join('\n');
           return userMessage(text);
         }

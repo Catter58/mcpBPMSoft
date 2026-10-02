@@ -5,7 +5,7 @@
 #   docker build -f Dockerfile.dev -t mcp-bpmsoft:dev .
 #   docker run --rm -it -p 8007:8007 \
 #     -e BPMSOFT_URL=https://bpm.example.ru \
-#     -e BPMSOFT_DEBUG=true \
+#     -e MCP_ALLOWED_HOSTS=127.0.0.1:8007,localhost:8007 \
 #     -v "$PWD/src":/app/src \
 #     mcp-bpmsoft:dev
 FROM node:22-alpine
@@ -31,6 +31,5 @@ RUN npm run build
 
 EXPOSE 8007
 
-# tsc --watch rebuilds build/ on change; restart the server to pick up changes,
-# or override CMD with a watcher of your choice.
-CMD ["sh", "-c", "npm run dev & node build/index.js"]
+# Rebuild TypeScript and let native Node watch reload the compiled entry point.
+CMD ["sh", "-c", "npm run dev & node --watch build/index.js"]

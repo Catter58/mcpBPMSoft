@@ -1,5 +1,6 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import { CurrentUserService } from '../../src/user/current-user.js';
+import { HttpClient } from '../../src/client/http-client.js';
 import { MetadataManager } from '../../src/metadata/metadata-manager.js';
 import { compileFilter } from '../../src/utils/filter-compiler.js';
 import { runWithAuth } from '../../src/auth/request-context.js';
@@ -46,7 +47,7 @@ const okRow = {
   rows: [
     {
       Id: UNIT_ID,
-      Name: 'Supervisor',
+      Name: 'ApiUser',
       ContactId: CONTACT_ID,
       ContactName: 'Иванов Иван',
       ContactEmail: '',
@@ -59,6 +60,11 @@ const okRow = {
 };
 
 describe('CurrentUserService', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
   it('спрашивает BPMSoft макросом текущего пользователя, а не гадает по сессиям', async () => {
     const http = makeHttp(() => okRow);
     const service = new CurrentUserService(makeCfg(), http as never);
@@ -71,6 +77,8 @@ describe('CurrentUserService', () => {
     expect(user.culture).toBe('ru-RU');
 
     const sent = http.requests[0];
+    expect(sent.method).toBe('POST');
+    expect(sent.operation).toBe('read');
     expect(sent.url).toContain('/0/DataService/json/SyncReply/SelectQuery');
     const body = sent.body as { rootSchemaName: string; filters: Record<string, never> };
     expect(body.rootSchemaName).toBe('SysAdminUnit');
@@ -78,9 +86,55 @@ describe('CurrentUserService', () => {
     expect(JSON.stringify(body.filters)).toContain('"macrosType":1');
   });
 
+  it('сетевой сбой SELECT через POST не выдаёт предупреждение о возможной записи', async () => {
+    const fetchMock = vi.fn().mockRejectedValue(new TypeError('fetch failed'));
+    vi.stubGlobal('fetch', fetchMock);
+    const config = makeCfg();
+    const service = new CurrentUserService(config, new HttpClient(config));
+    const auth = { csrfToken: 'test-csrf', cookies: new Map([['BPMSESSIONID', 'test-session']]) };
+
+    await expect(runWithAuth(auth, () => service.get())).rejects.toMatchObject({
+      code: 'network',
+      httpStatus: 0,
+    });
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it('повторяет временный сбой чтения текущего пользователя без изменения запроса', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ error: { message: 'Temporary connection failure' } }), {
+          status: 503,
+          headers: { 'content-type': 'application/json', 'retry-after': '0' },
+        })
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(okRow), { headers: { 'content-type': 'application/json' } })
+      );
+    vi.stubGlobal('fetch', fetchMock);
+    const config = makeCfg();
+    const service = new CurrentUserService(config, new HttpClient(config));
+    const auth = { csrfToken: 'test-csrf', cookies: new Map([['BPMSESSIONID', 'test-session']]) };
+
+    const user = await runWithAuth(auth, () => service.get());
+
+    expect(user.userId).toBe(UNIT_ID);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const [firstUrl, firstOptions] = fetchMock.mock.calls[0];
+    const [secondUrl, secondOptions] = fetchMock.mock.calls[1];
+    expect(firstUrl).toBe('https://bpm.test/0/DataService/json/SyncReply/SelectQuery');
+    expect(secondUrl).toBe(firstUrl);
+    expect(firstOptions.method).toBe('POST');
+    expect(secondOptions.method).toBe('POST');
+    expect(secondOptions.body).toBe(firstOptions.body);
+    expect(JSON.parse(firstOptions.body)).toMatchObject({ rootSchemaName: 'SysAdminUnit', operationType: 0 });
+  });
+
   it('пустые ссылки BPMSoft не превращаются в мнимые значения', async () => {
     const http = makeHttp(() => ({
-      rows: [{ Id: UNIT_ID, Name: 'Supervisor', ContactId: '00000000-0000-0000-0000-000000000000' }],
+      rows: [{ Id: UNIT_ID, Name: 'ApiUser', ContactId: '00000000-0000-0000-0000-000000000000' }],
     }));
     const user = await new CurrentUserService(makeCfg(), http as never).get();
     expect(user.contactId).toBeUndefined();
@@ -120,14 +174,20 @@ describe('календарные операторы в criteria-DSL', () => {
   function makeManager(): MetadataManager {
     const client = {
       async getMetadataXml(): Promise<{ xml: string; notModified: boolean }> {
-        return { xml: SIMPLE_EDMX, notModified: false };
+        return {
+          xml: SIMPLE_EDMX.replace(
+            '<Property Name="Name" Type="Edm.String"/>',
+            '<Property Name="Name" Type="Edm.String"/><Property Name="CreatedOn" Type="Edm.DateTimeOffset"/>'
+          ),
+          notModified: false,
+        };
       },
     };
     return new MetadataManager(makeCfg(), client as never);
   }
 
   it('«сегодня» превращается в полуинтервал по границам суток пояса', async () => {
-    const result = await compileFilter([{ field: 'Name', op: 'сегодня' }], {
+    const result = await compileFilter([{ field: 'CreatedOn', op: 'сегодня' }], {
       collection: 'Contact',
       metadataManager: makeManager(),
       odataVersion: 4,
@@ -137,17 +197,17 @@ describe('календарные операторы в criteria-DSL', () => {
     const range = calendarRange('today', 'Europe/Moscow');
     const from = range.from.toISOString().replace(/\.\d{3}Z$/, 'Z');
     const to = range.to.toISOString().replace(/\.\d{3}Z$/, 'Z');
-    expect(result.filter).toBe(`Name ge ${from} and Name lt ${to}`);
+    expect(result.filter).toBe(`CreatedOn ge ${from} and CreatedOn lt ${to}`);
   });
 
   it('английские синонимы периодов работают наравне с русскими', async () => {
-    const ru = await compileFilter([{ field: 'Name', op: 'в этом месяце' }], {
+    const ru = await compileFilter([{ field: 'CreatedOn', op: 'в этом месяце' }], {
       collection: 'Contact',
       metadataManager: makeManager(),
       odataVersion: 4,
       timeZone: 'Europe/Moscow',
     });
-    const en = await compileFilter([{ field: 'Name', op: 'this_month' }], {
+    const en = await compileFilter([{ field: 'CreatedOn', op: 'this_month' }], {
       collection: 'Contact',
       metadataManager: makeManager(),
       odataVersion: 4,
@@ -158,11 +218,11 @@ describe('календарные операторы в criteria-DSL', () => {
 
   it('разные пояса дают разные границы одних и тех же суток', async () => {
     const opts = { collection: 'Contact', metadataManager: makeManager(), odataVersion: 4 as const };
-    const msk = await compileFilter([{ field: 'Name', op: 'сегодня' }], {
+    const msk = await compileFilter([{ field: 'CreatedOn', op: 'сегодня' }], {
       ...opts,
       timeZone: 'Europe/Moscow',
     });
-    const utc = await compileFilter([{ field: 'Name', op: 'сегодня' }], { ...opts, timeZone: 'UTC' });
+    const utc = await compileFilter([{ field: 'CreatedOn', op: 'сегодня' }], { ...opts, timeZone: 'UTC' });
     expect(msk.filter).not.toBe(utc.filter);
   });
 });

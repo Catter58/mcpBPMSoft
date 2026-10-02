@@ -56,13 +56,20 @@ describe('coerceValue', () => {
   });
 
   it('числа: пробелы, неразрывные пробелы и запятая', () => {
-    expect(c('1 500,50', 'Edm.Decimal').value).toBe(1500.5);
-    expect(c('1 500,50', 'Edm.Decimal').value).toBe(1500.5);
+    expect(c('1 500,50', 'Edm.Decimal').value).toBe('1500.50');
+    expect(c('1 500,50', 'Edm.Decimal').value).toBe('1500.50');
     expect(c('1 500', 'Edm.Int32').value).toBe(1500);
     expect(c('1.500,5', 'Edm.Double').value).toBe(1500.5);
     expect(c('1,500.5', 'Edm.Double').value).toBe(1500.5);
-    expect(c('-3', 'Edm.Int64').value).toBe(-3);
+    expect(c('-3', 'Edm.Int64').value).toBe('-3');
     expect(c(42, 'Edm.Int32')).toEqual({ value: 42, changed: false });
+  });
+
+  it('exact Decimal and Int64 values never round during human-input normalization', () => {
+    expect(c('9 007 199 254 740 993,123456789', 'Edm.Decimal').value).toBe('9007199254740993.123456789');
+    expect(c('9 223 372 036 854 775 807', 'Edm.Int64').value).toBe('9223372036854775807');
+    expect(() => c(9007199254740992, 'Edm.Int64')).toThrow();
+    expect(() => c('9223372036854775808', 'Edm.Int64')).toThrow();
   });
 
   it('пустая строка → null, null и неизвестные типы не трогаются', () => {
@@ -73,11 +80,13 @@ describe('coerceValue', () => {
   });
 
   it('неразбираемое → ошибка с полем, значением и форматом', () => {
-    expect(() => c('1,5', 'Edm.Int32')).toThrow(/F.*"1,5".*Edm\.Int32.*целое число/);
+    expect(() => c('1,5', 'Edm.Int32')).toThrow(/F.*Edm\.Int32.*целое число/);
     expect(() => c('может быть', 'Edm.Boolean')).toThrow(/да\/нет/);
     expect(() => c('31.02.2026', 'Edm.Date')).toThrow(/Edm\.Date/);
     expect(() => c('на следующей неделе', 'Edm.DateTimeOffset', MSK)).toThrow(/25\.09\.2026 15:00/);
     expect(() => c('2026-09-25T25:00', 'Edm.DateTimeOffset', MSK)).toThrow();
+    expect(() => c('2026-02-30T12:00:00Z', 'Edm.DateTimeOffset', MSK)).toThrow();
+    expect(() => c('2026-01-01T24:00:00Z', 'Edm.DateTimeOffset', MSK)).toThrow();
     expect(() => c(12.5, 'Edm.Int32')).toThrow();
   });
 });
@@ -121,9 +130,9 @@ describe('resolveDataLookups: приведение по типу колонки'
       CityId: 'Москва',
     });
     expect(res.data).toEqual({
-      DueDate: '2026-09-25T12:00:00Z',
+      DueDate: '2026-09-25T12:00:00.000Z',
       IsDone: false,
-      Amount: 1500.5,
+      Amount: '1500.50',
       Title: '25.09.2026',
       CityId: 'city-1',
     });
@@ -135,7 +144,7 @@ describe('resolveDataLookups: приведение по типу колонки'
         type: 'Edm.DateTimeOffset',
       },
       { field: 'IsDone', input: 'нет', output: false, type: 'Edm.Boolean' },
-      { field: 'Amount', input: '1 500,50', output: 1500.5, type: 'Edm.Decimal' },
+      { field: 'Amount', input: '1 500,50', output: '1500.50', type: 'Edm.Decimal' },
     ]);
     expect(res.notes).toHaveLength(0);
     expect(currentUser.get).toHaveBeenCalledTimes(1);

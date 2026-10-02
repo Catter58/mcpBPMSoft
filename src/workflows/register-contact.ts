@@ -1,54 +1,86 @@
-/**
- * MCP Tool: bpm_register_contact
- *
- * Composite workflow: optional Account find-or-create + Contact creation
- * with auto-detected Contact->Account lookup field.
- */
-
+/** Register a contact only after validating every supplied field and relation. */
 import * as z from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import type { ServiceContainer } from '../tools/init-tool.js';
-import { formatToolError } from '../utils/errors.js';
+import { BpmApiError, LookupResolutionError } from '../utils/errors.js';
 import { getTool } from '../tools/registry.js';
 import { notInitialized } from '../tools/_guards.js';
+import { executeFindOrCreate, prepareFindOrCreate, type FindOrCreatePlan } from './find-or-create.js';
 import { escapeODataString, guidLiteral } from '../utils/odata.js';
-import { findOrCreate } from './find-or-create.js';
+import {
+  creationRecordId,
+  validateIdempotencyKey,
+  validateRequiredCreateFields,
+  MissingRequiredFieldsError,
+  writeToolError,
+  recordId,
+  writeFailureState,
+  type WriteState,
+} from '../utils/write-safety.js';
+
+interface Step {
+  step: string;
+  collection: string;
+  id: string | null;
+  state: WriteState;
+  error?: string;
+}
+const stepShape = z.object({
+  step: z.string(),
+  collection: z.string(),
+  id: z.string().nullable(),
+  state: z.enum(['succeeded', 'failed', 'not_executed', 'outcome_unknown']),
+  error: z.string().optional(),
+});
 
 async function findExistingContact(
   services: ServiceContainer,
   filter: string
-): Promise<{ id: string; name: string } | null> {
-  const res = await services.odataClient.getRecords<Record<string, unknown>>('Contact', {
-    $filter: filter,
-    $select: 'Id,Name',
-    $top: 1,
-  });
-  const rec = res.value[0];
-  return rec ? { id: String(rec.Id ?? ''), name: String(rec.Name ?? '') } : null;
+): Promise<Record<string, unknown> | undefined> {
+  const result = await services.odataClient.getRecords<Record<string, unknown>>(
+    'Contact',
+    { $filter: filter, $top: 2, $count: true },
+    true,
+    2
+  );
+  if (
+    result['@odata.nextLink'] ||
+    result.value.length > 1 ||
+    (result['@odata.count'] !== undefined && result['@odata.count'] > 1)
+  )
+    throw new LookupResolutionError(
+      'Contact',
+      filter,
+      Math.max(result.value.length, result['@odata.count'] ?? 2),
+      result.value.map((row) => ({ id: recordId(row), displayValue: String(row.Name ?? recordId(row)) })),
+      { lookupCollection: 'Contact', displayColumn: 'Name' }
+    );
+  return result.value[0];
 }
-
-function alreadyExists(
-  existing: { id: string; name: string },
-  by: string,
+function existingContactResult(
+  record: Record<string, unknown>,
   accountId: string | null = null
 ): CallToolResult {
+  const id = recordId(record);
+  const output = {
+    contact_id: id,
+    contact_name: String(record.Name ?? id),
+    account_id: accountId,
+    account_created: false,
+    contact_created: false,
+    already_exists: true,
+    warnings: [],
+    outcomes: [{ step: 'contact', collection: 'Contact', id, state: 'succeeded' }],
+  };
   return {
     content: [
       {
         type: 'text',
-        text: `Контакт уже существует: ${existing.name} (${existing.id}), совпадение по ${by}. Новый не создан; чтобы создать всё равно, передайте force=true.`,
+        text: `Контакт уже существует: ${output.contact_name} (${id}). Новый не создан; для отдельного контакта передайте force=true.`,
       },
     ],
-    structuredContent: {
-      contact_id: existing.id,
-      contact_name: existing.name,
-      account_id: accountId,
-      account_created: false,
-      contact_created: false,
-      already_exists: true,
-      warnings: [],
-    },
+    structuredContent: output,
   };
 }
 
@@ -59,179 +91,257 @@ export function registerRegisterContactTool(server: McpServer, services: Service
     {
       title: meta.title,
       description: meta.description,
+      annotations: meta.annotations,
       inputSchema: {
-        name: z.string().describe('ФИО контакта (обязательное поле Name)'),
-        email: z.string().optional().describe('Email контакта'),
-        phone: z.string().optional().describe('Телефон контакта'),
-        account_name: z
+        name: z.string().trim().min(1),
+        email: z.string().optional(),
+        phone: z.string().optional(),
+        account_name: z.string().trim().min(1).optional(),
+        account_id: z
           .string()
+          .uuid()
           .optional()
           .describe(
-            'Название контрагента. Если указано — будет найден или создан Account и привязан к контакту.'
+            'UUID существующего контрагента, в том числе из результата частично выполненного вызова.'
           ),
-        position: z
-          .string()
-          .optional()
-          .describe(
-            'Должность контакта. Ищется в справочнике Job; если такой должности нет — сохраняется текстом в JobTitle.'
-          ),
+        position: z.string().optional(),
         force: z
           .boolean()
           .optional()
-          .describe(
-            'Создать контакт, даже если уже есть контакт с тем же Email (или, без email, с тем же ФИО и контрагентом).'
-          ),
-        extra: z
-          .record(z.string(), z.unknown())
+          .describe('Разрешить отдельную запись при совпадении Email или ФИО и контрагента.'),
+        extra: z.record(z.string(), z.unknown()).optional(),
+        idempotency_key: z
+          .string()
+          .min(1)
+          .max(200)
           .optional()
           .describe(
-            'Дополнительные поля контакта. Имена полей могут быть на русском (caption) или латинице.'
+            'Ключ одного намерения регистрации. Повтор использует те же UUID; при ошибке сначала проверьте outcomes.'
           ),
       },
       outputSchema: {
-        contact_id: z.string(),
+        contact_id: z.string().nullable(),
         account_id: z.string().nullable(),
-        account_created: z.boolean(),
-        contact_created: z.boolean(),
+        account_created: z
+          .boolean()
+          .nullable()
+          .describe(
+            'true — создан этим вызовом, false — использован существующий; null — запись подтверждена после неопределённого ответа, факт создания этим вызовом неизвестен. При ошибке смотрите outcomes.'
+          ),
+        contact_created: z
+          .boolean()
+          .nullable()
+          .describe(
+            'true — создан этим вызовом, false — использован существующий или создание не выполнено; null — факт создания неизвестен. Состояние записи уточняется в outcomes.'
+          ),
+        warnings: z.array(z.string()),
         already_exists: z.boolean().optional(),
         contact_name: z.string().optional(),
-        warnings: z.array(z.string()),
+        outcomes: z.array(stepShape),
       },
-      annotations: meta.annotations,
     },
     async (params): Promise<CallToolResult> => {
       if (!services.initialized) return notInitialized();
+      let accountId: string | null = null;
+      let accountCreated: boolean | null = false;
+      let contactCreated: boolean | null = false;
+      let contactId: string | null = null;
+      const outcomes: Step[] = [];
+      let current: Step | undefined;
+      let accountPlan: FindOrCreatePlan | undefined;
       try {
         await services.authManager.ensureAuthenticated();
+        validateIdempotencyKey(params.idempotency_key);
+        const contactMeta = await services.metadataManager.getEntityMetadata('Contact');
         const warnings: string[] = [];
-
-        // Дубль по Email (сортировка БД регистронезависима) проверяем до find-or-create
-        // контрагента, чтобы не создать лишний Account под уже существующий контакт.
+        if (typeof params.name !== 'string' || !params.name.trim()) {
+          const field = contactMeta.properties.find((property) => property.name === 'Name');
+          throw new MissingRequiredFieldsError('Contact', [
+            { name: 'Name', caption: field?.caption ?? 'Name', type: field?.type ?? 'Edm.String' },
+          ]);
+        }
+        if (params.account_name && params.account_id)
+          throw new BpmApiError('Передайте account_name или account_id.', 400, 'Contact');
         if (params.email && !params.force) {
           const existing = await findExistingContact(
             services,
             `Email eq '${escapeODataString(params.email)}'`
           );
-          if (existing) return alreadyExists(existing, `Email "${params.email}"`);
+          if (existing) return existingContactResult(existing);
         }
-
-        let accountId: string | null = null;
-        let accountCreated = false;
-        if (params.account_name) {
-          const accountResult = await findOrCreate(
-            services,
-            'Account',
-            { field: 'Name', value: params.account_name },
-            { Name: params.account_name }
-          );
-          accountId = accountResult.id;
-          accountCreated = accountResult.created;
-        }
-
-        let accountField: string | null = null;
-        if (accountId) {
-          const contactMeta = await services.metadataManager.getEntityMetadata('Contact');
-          const accountLookup = contactMeta.properties.find(
-            (p) => p.isLookup && p.lookupCollection === 'Account'
-          );
-          if (accountLookup) {
-            accountField = accountLookup.name;
-          } else {
-            warnings.push(
-              'Не найдено связи Contact -> Account в метаданных; контакт создан без привязки к контрагенту.'
+        let accountField: string | undefined;
+        if (params.account_name || params.account_id) {
+          const fields = contactMeta.properties.filter((p) => p.isLookup && p.lookupCollection === 'Account');
+          const primary = fields.find((field) => field.name === 'AccountId' || field.name === 'Account');
+          if (!primary && fields.length !== 1)
+            throw new BpmApiError(
+              `Невозможно однозначно определить связь Contact → Account (${fields.length} полей). Ничего не создано.`,
+              400,
+              'Contact'
             );
+          accountField = (primary ?? fields[0]).name;
+          if (params.account_id) {
+            await services.odataClient.getRecord('Account', params.account_id);
+            accountId = params.account_id;
+          } else {
+            accountPlan = await prepareFindOrCreate(
+              services,
+              'Account',
+              { field: 'Name', value: params.account_name! },
+              { Name: params.account_name! },
+              params.idempotency_key ? `${params.idempotency_key}:account` : undefined
+            );
+            accountId = accountPlan.id;
           }
         }
-
-        // Без email дубль ищем по ФИО (+ контрагент). Только что созданный контрагент
-        // контактов иметь не может — проверку пропускаем.
-        if (!params.email && !params.force && !accountCreated) {
-          let filter = `Name eq '${escapeODataString(params.name)}'`;
-          if (accountField && accountId) {
-            filter += ` and ${accountField} eq ${guidLiteral(accountId, services.config.odata_version)}`;
-          }
+        if (!params.email && !params.force && !accountPlan?.created) {
+          const filter = `Name eq '${escapeODataString(params.name)}'${accountField && accountId ? ` and ${accountField} eq ${guidLiteral(accountId, services.config.odata_version)}` : ''}`;
           const existing = await findExistingContact(services, filter);
-          if (existing) {
-            return alreadyExists(existing, accountField ? 'ФИО и контрагенту' : 'ФИО', accountId);
-          }
+          if (existing) return existingContactResult(existing, accountId);
         }
-
-        const contactData: Record<string, unknown> = { Name: params.name };
-        if (params.email !== undefined) contactData.Email = params.email;
-        if (params.phone !== undefined) contactData.Phone = params.phone;
+        // Resolve extras first so alias collisions cannot silently override explicit intent.
+        const extras = params.extra
+          ? (await services.lookupResolver.resolveDataLookups('Contact', params.extra)).data
+          : {};
+        const explicit: Record<string, unknown> = { Name: params.name };
+        if (params.email !== undefined) explicit.Email = params.email;
+        if (params.phone !== undefined) explicit.Phone = params.phone;
         if (params.position !== undefined) {
-          contactData.Job = params.position;
-          const jobRef = await services.metadataManager.resolveFieldReference('Contact', 'Job');
-          const jobLookup = jobRef.name
-            ? await services.metadataManager.getLookupInfo('Contact', jobRef.name)
-            : null;
-          const contactMeta = await services.metadataManager.getEntityMetadata('Contact');
-          if (jobLookup && contactMeta.properties.some((p) => p.name === 'JobTitle')) {
+          explicit.Job = params.position;
+          const jobField = contactMeta.properties.find(
+            (field) => field.name === 'Job' || field.name === 'JobId'
+          );
+          if (
+            jobField?.isLookup &&
+            jobField.lookupCollection &&
+            contactMeta.properties.some((field) => field.name === 'JobTitle')
+          ) {
             const job = await services.lookupResolver.resolve(
-              jobLookup.lookupCollection,
+              jobField.lookupCollection,
               params.position,
-              jobLookup.displayColumn,
+              jobField.lookupDisplayColumn ?? 'Name',
               { fuzzy: true }
             );
-            // Должности нет в справочнике — сохраняем текстом, а не падаем.
-            // Неоднозначность (несколько кандидатов) остаётся ошибкой в resolveDataLookups.
             if (job.matchCount === 0) {
-              delete contactData.Job;
-              contactData.JobTitle = params.position;
+              delete explicit.Job;
+              explicit.JobTitle = params.position;
               warnings.push(
-                `Должность "${params.position}" не найдена в справочнике ${jobLookup.lookupCollection} — сохранена текстом в JobTitle.`
+                `Должность «${params.position}» не найдена в ${jobField.lookupCollection}; сохранена в JobTitle.`
               );
             }
           }
         }
-        if (accountField && accountId) contactData[accountField] = accountId;
-        if (params.extra) {
-          for (const [k, v] of Object.entries(params.extra)) {
-            // explicit fields take precedence over `extra`
-            if (k in contactData) continue;
-            contactData[k] = v;
-          }
+        const base = await services.lookupResolver.resolveDataLookups('Contact', explicit);
+        for (const [field, value] of Object.entries(extras)) {
+          if (field in base.data && base.data[field] !== value)
+            throw new BpmApiError(
+              `Поле ${field} задано противоречиво через extra и явный параметр.`,
+              400,
+              'Contact'
+            );
         }
-
-        const resolved = await services.lookupResolver.resolveDataLookups('Contact', contactData);
-        for (const n of resolved.notes) {
-          warnings.push(`Поле ${n.field}: "${n.input}" разрешено неточно как "${n.matchedValue}"`);
+        const contactData = { ...extras, ...base.data };
+        if (accountField && accountId) {
+          if (accountField in contactData && contactData[accountField] !== accountId)
+            throw new BpmApiError(
+              'Контрагент в extra конфликтует с account_name/account_id.',
+              400,
+              'Contact'
+            );
+          contactData[accountField] = accountId;
         }
-        const created = await services.odataClient.createRecord<Record<string, unknown>>(
+        await validateRequiredCreateFields(services, 'Contact', contactData);
+        contactId = creationRecordId(
+          services,
+          contactData,
+          params.idempotency_key,
+          'register-contact:contact'
+        );
+        if (accountPlan) {
+          current = { step: 'account', collection: 'Account', id: accountPlan.id, state: 'not_executed' };
+          const account = await executeFindOrCreate(services, accountPlan);
+          accountId = account.id;
+          accountCreated = account.created;
+          outcomes.push({ ...current, state: 'succeeded' });
+          current = undefined;
+        } else if (accountId)
+          outcomes.push({ step: 'account', collection: 'Account', id: accountId, state: 'succeeded' });
+        current = { step: 'contact', collection: 'Contact', id: contactId, state: 'not_executed' };
+        const result = await services.odataClient.createRecordWithOutcome<Record<string, unknown>>(
           'Contact',
-          resolved.data
+          contactData,
+          { id: contactId }
         );
-        const contactId = String(
-          (created as { Id?: unknown; id?: unknown }).Id ?? (created as { id?: unknown }).id ?? ''
-        );
-
+        contactId = recordId(result.record);
+        contactCreated = result.created;
+        outcomes.push({ ...current, id: contactId, state: 'succeeded' });
+        current = undefined;
+        const output = {
+          contact_id: contactId,
+          account_id: accountId,
+          account_created: accountCreated,
+          contact_created: contactCreated,
+          warnings: [
+            ...warnings,
+            ...(accountCreated === null
+              ? ['Контрагент подтверждён по UUID, но неизвестно, создан ли он этим вызовом или ранее.']
+              : []),
+            ...(contactCreated === null
+              ? ['Контакт подтверждён по UUID, но неизвестно, создан ли он этим вызовом или ранее.']
+              : []),
+          ],
+          outcomes,
+        };
         return {
           content: [
             {
               type: 'text',
-              text: [
-                `Контакт зарегистрирован: ${params.name} (${contactId})`,
-                accountId
-                  ? `Контрагент: ${params.account_name} (${accountId})${accountCreated ? ' — создан' : ' — найден'}`
-                  : '',
-                warnings.length ? `Предупреждения: ${warnings.join('; ')}` : '',
-              ]
-                .filter(Boolean)
-                .join('\n'),
+              text: `Контакт зарегистрирован: ${params.name} (${contactId})${contactCreated === false ? ' — использован существующий' : contactCreated === null ? ' — запись подтверждена; факт создания неизвестен' : ' — создан'}${accountId ? `\nКонтрагент: ${accountId}${accountCreated === true ? ' — создан' : accountCreated === false ? ' — найден' : ' — запись подтверждена; факт создания неизвестен'}` : ''}`,
             },
           ],
-          structuredContent: {
-            contact_id: contactId,
-            account_id: accountId,
-            account_created: accountCreated,
-            contact_created: true,
-            warnings,
-          },
+          structuredContent: output,
         };
       } catch (error) {
-        const toolError = formatToolError(error, 'Contact');
+        if (current) {
+          if (writeFailureState(error) === 'outcome_unknown') {
+            if (current.step === 'account') accountCreated = null;
+            if (current.step === 'contact') contactCreated = null;
+          }
+          outcomes.push({
+            ...current,
+            state: writeFailureState(error),
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+        if (accountId && !outcomes.some((o) => o.step === 'account')) {
+          outcomes.unshift({
+            step: 'account',
+            collection: 'Account',
+            id: accountId,
+            state: accountPlan?.created ? 'not_executed' : 'succeeded',
+          });
+        }
+        if (!outcomes.some((o) => o.step === 'contact'))
+          outcomes.push({ step: 'contact', collection: 'Contact', id: contactId, state: 'not_executed' });
+        const formatted = writeToolError(error, 'Contact');
+        const output = {
+          ...formatted,
+          contact_id: contactId,
+          account_id: accountId,
+          account_created: accountCreated,
+          contact_created: contactCreated,
+          warnings: [],
+          outcomes,
+          next_steps: outcomes.some((outcome) => outcome.step === 'account' && outcome.state === 'succeeded')
+            ? [
+                'Контрагент уже подтверждён. Используйте account_id из результата для продолжения; не создавайте его повторно.',
+                'При неопределённом исходе создания контакта сначала проверьте contact_id. Повтор с тем же idempotency_key безопасен.',
+              ]
+            : formatted.next_steps,
+        };
         return {
-          content: [{ type: 'text', text: JSON.stringify(toolError, null, 2) }],
+          content: [{ type: 'text', text: JSON.stringify(output, null, 2) }],
+          structuredContent: output,
           isError: true,
         };
       }

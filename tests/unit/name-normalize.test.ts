@@ -67,8 +67,8 @@ describe('pickConfidentIndex', () => {
     expect(pickConfidentIndex([30])).toBeNull();
     expect(pickConfidentIndex([])).toBeNull();
   });
-  it('один кандидат ≥ 40 — лидер', () => {
-    expect(pickConfidentIndex([40])).toBe(0);
+  it('одна подстрока не является доказанным совпадением', () => {
+    expect(pickConfidentIndex([40])).toBeNull();
   });
   it('лидер не на нулевой позиции', () => {
     expect(pickConfidentIndex([0, 40, 90])).toBe(2);

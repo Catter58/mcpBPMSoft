@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "bpmsoft": {
+      "type": "http",
+      "url": "https://mcp.example.ru/mcp"
+    }
+  }
+}

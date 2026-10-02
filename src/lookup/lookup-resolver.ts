@@ -8,14 +8,25 @@
 import type { BpmConfig, LookupResult, LookupCandidate } from '../types/index.js';
 import { ODataClient } from '../client/odata-client.js';
 import { MetadataManager } from '../metadata/metadata-manager.js';
-import { LookupResolutionError, UnknownFieldError, isQueryUnsupportedError } from '../utils/errors.js';
+import {
+  BpmApiError,
+  LookupResolutionError,
+  UnknownFieldError,
+  isQueryUnsupportedError,
+} from '../utils/errors.js';
 import { assertSafeIdentifier, escapeODataString, containsExpression } from '../utils/odata.js';
 import { normalizeName, scoreCandidate, pickConfidentIndex } from '../utils/name-normalize.js';
-import { isTolowerSupported, markTolowerUnsupported } from '../utils/server-capabilities.js';
 import { getAuthCacheScope } from '../auth/request-context.js';
 import type { CurrentUserService } from '../user/current-user.js';
 import { isMeMacro, meIdFor } from '../utils/me-macro.js';
 import { coerceValue, needsTimeZone, type CoercedValueNote } from '../utils/coerce.js';
+import { isTolowerSupported, markTolowerUnsupported } from '../utils/server-capabilities.js';
+import { coerceFieldValue, UUID_RE } from '../utils/field-values.js';
+
+interface CandidatePage {
+  candidates: LookupCandidate[];
+  complete: boolean;
+}
 
 interface CacheEntry {
   result: LookupResult;
@@ -34,7 +45,6 @@ export interface ResolvedLookupNote {
 export interface ResolvedData {
   data: Record<string, unknown>;
   notes: ResolvedLookupNote[];
-  /** Значения, приведённые к типу колонки («25.09.2026» → «2026-09-25» и т. п.). */
   coerced: CoercedValueNote[];
 }
 
@@ -45,6 +55,7 @@ export class LookupResolver {
   private cache = new Map<string, CacheEntry>();
   private readonly maxCacheSize: number;
   private readonly currentUser?: CurrentUserService;
+
   constructor(
     private config: BpmConfig,
     private odataClient: ODataClient,
@@ -74,18 +85,23 @@ export class LookupResolver {
       return cached.result;
     }
 
+    if (!displayValue.trim())
+      throw new BpmApiError('Значение справочника не может быть пустым.', 400, lookupCollection);
     const escaped = escapeODataString(displayValue);
     const filter = `${displayColumn} eq '${escaped}'`;
-    let candidates = await this.queryCandidates(lookupCollection, displayColumn, filter);
+    let page = await this.queryCandidates(lookupCollection, displayColumn, filter, 2);
+    let candidates = page.candidates;
     let matchType: 'exact' | 'contains' | 'core' = 'exact';
 
-    if (candidates.length === 0 && options.fuzzy) {
+    if (candidates.length === 0 && page.complete && options.fuzzy) {
       const query = normalizeName(displayValue);
       matchType = 'contains';
-      candidates = await this.queryContains(lookupCollection, displayColumn, query.normalized);
+      page = await this.queryContains(lookupCollection, displayColumn, query.normalized);
+      candidates = page.candidates;
       if (candidates.length === 0 && query.core !== query.normalized) {
         matchType = 'core';
-        candidates = await this.queryContains(lookupCollection, displayColumn, query.core);
+        page = await this.queryContains(lookupCollection, displayColumn, query.core);
+        candidates = page.candidates;
       }
       if (candidates.length > 0) {
         const scores = candidates.map((c) => scoreCandidate(query, normalizeName(c.displayValue)));
@@ -93,7 +109,7 @@ export class LookupResolver {
           .map((c, i) => ({ ...c, score: scores[i] }))
           .sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
         const confident = pickConfidentIndex(scores);
-        if (confident !== null) {
+        if (confident !== null && page.complete) {
           const winner = candidates[0];
           const result: LookupResult = {
             resolved: true,
@@ -104,6 +120,8 @@ export class LookupResolver {
             fuzzy: true,
             matchType,
             matchedValue: winner.displayValue,
+            has_more: false,
+            match_count_is_exact: true,
           };
           this.cacheSet(cacheKey, { result, timestamp: Date.now() });
           return result;
@@ -122,7 +140,7 @@ export class LookupResolver {
         candidates: [],
         error: `Значение "${displayValue}" не найдено в ${lookupCollection}.${displayColumn}`,
       };
-    } else if (candidates.length === 1 && !usedFuzzy) {
+    } else if (candidates.length === 1 && !usedFuzzy && page.complete) {
       result = {
         resolved: true,
         id: candidates[0].id,
@@ -137,11 +155,16 @@ export class LookupResolver {
         searchValue: displayValue,
         matchCount: candidates.length,
         candidates,
-        error: usedFuzzy
-          ? `Точное совпадение для "${displayValue}" не найдено; предложены ${candidates.length} нечёткое(их) совпадение(ий) — уточните выбор.`
-          : `Найдено ${candidates.length} совпадений для "${displayValue}" в ${lookupCollection}.${displayColumn}. Уточните значение.`,
+        error: !page.complete
+          ? `Выборка совпадений для "${displayValue}" неполна. Автоматический выбор запрещён; уточните запись по UUID или более точному признаку.`
+          : usedFuzzy
+            ? `Точное совпадение для "${displayValue}" не найдено; предложены ${candidates.length} нечёткое(их) совпадение(ий) — уточните выбор.`
+            : `Найдено ${candidates.length} совпадений для "${displayValue}" в ${lookupCollection}.${displayColumn}. Уточните значение.`,
       };
     }
+
+    result.has_more = !page.complete;
+    result.match_count_is_exact = page.complete;
 
     this.cacheSet(cacheKey, { result, timestamp: Date.now() });
     return result;
@@ -149,25 +172,25 @@ export class LookupResolver {
 
   /**
    * Substring-этап каскада: contains/substringof по нормализованному значению.
-   * Первый отказ на tolower() переводит весь процесс в case-sensitive режим.
+   * Первый 4xx на tolower() переключает резолвер в case-sensitive режим навсегда.
    */
   private async queryContains(
     lookupCollection: string,
     displayColumn: string,
     loweredValue: string
-  ): Promise<LookupCandidate[]> {
+  ): Promise<CandidatePage> {
     const version = this.config.odata_version;
     if (isTolowerSupported()) {
       try {
         const filter = containsExpression(displayColumn, loweredValue, version, { caseInsensitive: true });
-        return await this.queryCandidates(lookupCollection, displayColumn, filter, 50);
+        return await this.queryCandidates(lookupCollection, displayColumn, filter, 51);
       } catch (error) {
         if (!isQueryUnsupportedError(error)) throw error;
         markTolowerUnsupported();
       }
     }
     const filter = containsExpression(displayColumn, loweredValue, version);
-    return this.queryCandidates(lookupCollection, displayColumn, filter, 50);
+    return this.queryCandidates(lookupCollection, displayColumn, filter, 51);
   }
 
   /**
@@ -184,6 +207,24 @@ export class LookupResolver {
     // первом же поле, и дальше все резолвы полей идут по прогретому кэшу.
     const entityMeta = await this.metadataManager.getEntityMetadata(collection);
     const propTypes = new Map((entityMeta?.properties ?? []).map((p) => [p.name, p]));
+
+    const keys = new Set<string>();
+    const normalized = await Promise.all(
+      Object.entries(data).map(async ([rawKey, value]) => {
+        const field = await this.metadataManager.resolveFieldReference(collection, rawKey);
+        if (field.name === null) throw new UnknownFieldError(rawKey, collection, field.suggestions);
+        if (keys.has(field.name))
+          throw new BpmApiError(
+            `Поле "${field.name}" передано несколько раз под разными именами.`,
+            400,
+            collection
+          );
+        keys.add(field.name);
+        const property = propTypes.get(field.name);
+        if (!property) throw new UnknownFieldError(rawKey, collection, []);
+        return { rawKey, value, normalizedKey: field.name, prop: property };
+      })
+    );
 
     // Пояс пользователя — один раз на вызов и только если его требует хоть одна дата.
     let timeZonePromise: Promise<string | undefined> | undefined;
@@ -203,35 +244,30 @@ export class LookupResolver {
     // bpm_batch_create из сотни записей последовательный обход давал сотни
     // запросов друг за другом; кэш спасал только со второй записи.
     const entries = await Promise.all(
-      Object.entries(data).map(async ([rawKey, value]) => {
-        const fieldRef = await this.metadataManager.resolveFieldReference(collection, rawKey);
-
-        // Неизвестный ключ раньше молча уходил в BPMSoft и возвращался сырым
-        // 400. Сервер знает схему — пусть скажет сам, с подсказками.
-        if (fieldRef.name === null) {
-          throw new UnknownFieldError(rawKey, collection, fieldRef.suggestions);
-        }
-        const normalizedKey = fieldRef.name;
-
+      normalized.map(async ({ rawKey, value, normalizedKey, prop }) => {
         // Не-lookup колонка с известным типом: приводим значение («да», «25.09.2026 15:00»).
-        const prop = propTypes.get(normalizedKey);
-        if (prop && !prop.isLookup) {
+        if (!prop.isLookup) {
           const tz = needsTimeZone(value, prop.type) ? await userTimeZone() : undefined;
           const c = coerceValue(normalizedKey, value, prop.type, tz);
           // Неизменённое значение (строка, Guid, уже верный тип) идёт обычным путём ниже.
           if (c.changed) {
             const coerced = { field: normalizedKey, input: value, output: c.value, type: prop.type };
-            return { key: normalizedKey, value: c.value, note: null, coerced };
+            return {
+              key: normalizedKey,
+              value: coerceFieldValue(c.value, prop, collection),
+              note: null,
+              coerced,
+            };
           }
         }
 
-        if (typeof value !== 'string' || this.isUuid(value)) {
-          return { key: normalizedKey, value, note: null };
+        if (typeof value !== 'string' || UUID_RE.test(value.trim())) {
+          return { key: normalizedKey, value: coerceFieldValue(value, prop, collection), note: null };
         }
 
         const lookupInfo = await this.metadataManager.getLookupInfo(collection, normalizedKey);
         if (!lookupInfo) {
-          return { key: normalizedKey, value, note: null };
+          return { key: normalizedKey, value: coerceFieldValue(value, prop, collection), note: null };
         }
 
         // «я» / @me в Owner, Author и т. п. — текущий пользователь, без поиска по имени.
@@ -242,7 +278,7 @@ export class LookupResolver {
 
         // Пустая строка в lookup-поле — это «очистить связь», а не значение для поиска.
         if (value.trim() === '') {
-          return { key: normalizedKey, value: null, note: null };
+          return { key: normalizedKey, value: coerceFieldValue(null, prop, collection), note: null };
         }
 
         const lookupResult = await this.resolve(
@@ -324,17 +360,33 @@ export class LookupResolver {
     lookupCollection: string,
     displayColumn: string,
     filter: string,
-    top: number = 10
-  ): Promise<LookupCandidate[]> {
-    const response = await this.odataClient.getRecords<Record<string, unknown>>(lookupCollection, {
-      $filter: filter,
-      $select: `Id,${displayColumn}`,
-      $top: top,
+    top: number
+  ): Promise<CandidatePage> {
+    const response = await this.odataClient.getRecords<Record<string, unknown>>(
+      lookupCollection,
+      {
+        $filter: filter,
+        $select: `Id,${displayColumn}`,
+        $top: top,
+        $count: true,
+      },
+      true,
+      top
+    );
+    const candidates = response.value.map((record) => {
+      const id = record.Id ?? record.id;
+      if (typeof id !== 'string' || !id)
+        throw new BpmApiError('Справочник вернул запись без идентификатора.', 502, lookupCollection);
+      return { id, displayValue: String(record[displayColumn] ?? '') };
     });
-    return response.value.map((record) => ({
-      id: String(record.Id || record.id),
-      displayValue: String(record[displayColumn] || ''),
-    }));
+    return {
+      candidates: Array.from(new Map(candidates.map((candidate) => [candidate.id, candidate])).values()),
+      complete:
+        !response['@odata.nextLink'] &&
+        (response['@odata.count'] === undefined
+          ? response.value.length < top
+          : response['@odata.count'] === response.value.length),
+    };
   }
 
   private cacheSet(key: string, entry: CacheEntry): void {
@@ -346,9 +398,5 @@ export class LookupResolver {
       if (oldestKey !== undefined) this.cache.delete(oldestKey);
     }
     this.cache.set(key, entry);
-  }
-
-  private isUuid(value: string): boolean {
-    return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
   }
 }

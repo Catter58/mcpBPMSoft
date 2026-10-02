@@ -14,6 +14,7 @@ import { getRequestAuth, hasRequestAuth } from './request-context.js';
 
 export class AuthManager {
   private authUrl: string;
+  private loginPromise: Promise<void> | null = null;
 
   constructor(
     private config: BpmConfig,
@@ -30,6 +31,18 @@ export class AuthManager {
    * Must be called before any OData requests.
    */
   async login(): Promise<void> {
+    if (!this.allowEnvCreds) throw new AuthRequiredError();
+    if (!this.config.username || !this.config.password)
+      throw new AuthenticationError('Для режима env-creds необходимы BPMSOFT_USERNAME и BPMSOFT_PASSWORD.');
+    if (!this.loginPromise) {
+      this.loginPromise = this.performLogin().finally(() => {
+        this.loginPromise = null;
+      });
+    }
+    return this.loginPromise;
+  }
+
+  private async performLogin(): Promise<void> {
     console.error('[AuthManager] Authenticating...');
 
     const response = await this.httpClient.request<LoginResponse>({
@@ -41,6 +54,7 @@ export class AuthManager {
       },
       skipAuth: true, // Don't try to inject CSRF for the login request itself
       contentKind: 'auth',
+      operation: 'mutation',
     });
 
     // BPMSoft returns HTTP 200 even on login failure — must inspect Code in body

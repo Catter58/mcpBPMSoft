@@ -32,10 +32,14 @@ function meta(collection: string): EntityMetadata {
       nullable: true,
       isLookup,
       lookupCollection: isLookup ? kind : undefined,
+      navigationProperty: isLookup ? name.replace(/Id$/, '') : undefined,
+      lookupNavProperty: isLookup ? name.replace(/Id$/, '') : undefined,
     };
   });
+  properties.unshift({ name: 'Id', type: 'Edm.Guid', nullable: false, isLookup: false });
   return {
     name: collection,
+    keyFields: ['Id'],
     collectionName: collection,
     properties,
     lookupFields: properties.filter((p) => p.isLookup).map((p) => p.name),
@@ -50,7 +54,11 @@ const META = {
   async getLookupInfo(collection: string, field: string) {
     const prop = meta(collection).properties.find((p) => p.name === field);
     return prop?.isLookup
-      ? { lookupCollection: prop.lookupCollection as string, displayColumn: 'Name' }
+      ? {
+          lookupCollection: prop.lookupCollection as string,
+          displayColumn: 'Name',
+          navigationProperty: prop.navigationProperty,
+        }
       : null;
   },
   async resolveFieldReference(collection: string, query: string) {
@@ -82,7 +90,7 @@ describe('state operators', () => {
   it('Case: IsFinal + IsResolved, поле определяется само', async () => {
     const r = await compile('Case', [{ field: 'состояние', op: 'закрытые' }]);
     expect(r.filter).toBe('Status/IsFinal eq true');
-    const won = await compile('Case', [{ op: 'успешно' } as Criterion]);
+    const won = await compile('Case', [{ op: 'успешно' }]);
     expect(won.filter).toBe('(Status/IsFinal eq true and Status/IsResolved eq true)');
   });
 

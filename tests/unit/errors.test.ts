@@ -51,7 +51,7 @@ describe('formatToolError', () => {
     expect(out.details).toBe('cause');
   });
 
-  it('handles LookupResolutionError with a single candidate (no details)', () => {
+  it('handles LookupResolutionError with no candidates (no details)', () => {
     const e = new LookupResolutionError('CityId', 'Moscow', 0, []);
     const out = formatToolError(e, 'Contact');
     expect(out.success).toBe(false);
@@ -125,4 +125,14 @@ describe('ToolError.code', () => {
       expect(out.next_steps && out.next_steps.length).toBeGreaterThan(0);
     }
   });
+});
+
+it('returns unresolved single approximate lookup candidates as ambiguity, rather than not found', () => {
+  const result = formatToolError(
+    new LookupResolutionError('AccountId', 'Partial', 1, [
+      { id: 'candidate', displayValue: 'Partial Company' },
+    ])
+  );
+  expect(result.code).toBe('lookup_ambiguous');
+  expect(result.details).toContain('Partial Company');
 });

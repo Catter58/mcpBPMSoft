@@ -1,9 +1,9 @@
 /**
  * Возможности конкретного инстанса BPMSoft, выясняемые в бою.
  *
- * Сервер пришпилен к одному BPMSOFT_URL, поэтому «умеет / не умеет» — свойство
- * процесса, а не отдельного вызова: узнали один раз и больше не тратим на это
- * round-trip.
+ * Проверенные возможности повторно используются, чтобы не тратить запросы
+ * на заведомо неподдерживаемые конструкции. Поддержка batch ограничена сроком
+ * жизни и контекстом подключения, пользователя и коллекции.
  *
  * Пока здесь один флаг — `tolower()` в $filter. На тестовом стенде такой фильтр не
  * отклоняется кодом ответа: сервер отдаёт 200 и обрывает тело (см.
@@ -30,23 +30,30 @@ export function markTolowerUnsupported(): void {
 /** Сброс — только для тестов. */
 export function resetServerCapabilities(): void {
   tolowerUnsupported = false;
-  batchSupported = undefined;
+  batchSupport.clear();
 }
 
 /**
- * Поддержка $batch. undefined — ещё не проверяли. Проверка делается один раз
- * безвредным GET внутри $batch (см. ODataClient.executeBulk); при отказе пакетные
+ * Поддержка $batch. undefined — ещё не проверяли или результат истёк. Проверка
+ * выполняется безвредным GET внутри $batch (см. ODataClient.executeBulk); при отказе пакетные
  * инструменты шлют запросы по одному, и модель не тратит вызовы на заведомо
  * падающий путь.
  */
-let batchSupported: boolean | undefined;
+const BATCH_CAPABILITY_TTL_MS = 5 * 60 * 1000;
+const MAX_BATCH_SCOPES = 1000;
+const batchSupport = new Map<string, { supported: boolean; expires: number }>();
 
-export function getBatchSupport(): boolean | undefined {
-  return batchSupported;
+export function getBatchSupport(scope = ''): boolean | undefined {
+  const known = batchSupport.get(scope);
+  if (known && known.expires > Date.now()) return known.supported;
+  batchSupport.delete(scope);
+  return undefined;
 }
 
-export function setBatchSupport(supported: boolean, reason?: string): void {
-  if (batchSupported === supported) return;
-  batchSupported = supported;
+export function setBatchSupport(supported: boolean, reason?: string, scope = ''): void {
+  const now = Date.now();
+  for (const [key, value] of batchSupport) if (value.expires <= now) batchSupport.delete(key);
+  if (!batchSupport.has(scope) && batchSupport.size >= MAX_BATCH_SCOPES) return;
+  batchSupport.set(scope, { supported, expires: now + BATCH_CAPABILITY_TTL_MS });
   if (!supported) console.error(`[capabilities] $batch не работает на инстансе (${reason}), шлю по одному`);
 }

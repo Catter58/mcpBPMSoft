@@ -26,6 +26,8 @@ export interface BpmConfig {
   request_timeout: number;
   /** Max file upload size in bytes (default: 10MB) */
   max_file_size: number;
+  /** Allowed server-side file directory for HTTP callers (default: ./files). */
+  file_root?: string;
 }
 
 export interface AuthState {
@@ -52,6 +54,9 @@ export interface ODataCollectionResponse<T = Record<string, unknown>> {
   '@odata.count'?: number;
   '@odata.nextLink'?: string;
   value: T[];
+  /** Compatibility notes from the transport, independent of data completeness. */
+  warnings?: string[];
+  matching?: 'platform_collation';
 }
 
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
@@ -73,13 +78,23 @@ export interface EntityProperty {
   name: string;
   type: string;
   nullable: boolean;
+  /** Platform schema requirement; unknown when its descriptor is unavailable. */
+  required?: boolean;
+  requirementSource?: 'entity_schema_designer';
+  /** Descriptive only: runtime defaults must be evaluated by BPMSoft itself. */
+  defaultHint?: {
+    source: 'none' | 'constant' | 'system_setting' | 'runtime' | 'unknown';
+    providedByServer?: boolean;
+    value?: string | number | boolean | null;
+  };
   isLookup: boolean;
   /** For lookup fields: the target collection name */
   lookupCollection?: string;
   /** For lookup fields: display column in target collection */
   lookupDisplayColumn?: string;
-  /** For lookup fields: navigation property name for $expand (v4: FK without 'Id') */
+  /** Actual OData navigation name, as published by EDMX. */
   lookupNavProperty?: string;
+  navigationProperty?: string;
   /** Localized display caption (e.g. Russian name from SysEntitySchemaColumn) */
   caption?: string;
 }
@@ -99,6 +114,8 @@ export interface ColumnCaption {
 
 export interface EntityMetadata {
   name: string;
+  /** Actual EDMX primary-key fields, when published by the platform. */
+  keyFields?: string[];
   /** Collection endpoint name (e.g. "Contact" for OData 4, "ContactCollection" for OData 3) */
   collectionName: string;
   properties: EntityProperty[];
@@ -125,6 +142,10 @@ export interface LookupResult {
   searchValue: string;
   /** Number of matches found */
   matchCount: number;
+  /** More candidates exist beyond the bounded response. */
+  has_more?: boolean;
+  /** Whether matchCount is a total, rather than a lower bound. */
+  match_count_is_exact?: boolean;
   /** Candidates when multiple matches (or 0) */
   candidates: LookupCandidate[];
   /** Error message if resolution failed */
@@ -171,6 +192,10 @@ export interface HttpRequestOptions {
   contentKind?: ContentKind;
   /** Forces response decoding mode (default: 'auto') */
   responseType?: ResponseType;
+  /** Read requests may be repeated; mutations (including side-effect GET) must never be replayed automatically. */
+  operation?: 'read' | 'mutation';
+  /** Caller cancellation; the timeout covers all attempts and retry delays. */
+  signal?: AbortSignal;
 }
 
 export interface HttpResponse<T = unknown> {
@@ -199,6 +224,10 @@ export type ToolErrorCode =
   | 'odata_error'
   | 'validation'
   | 'network'
+  | 'outcome_unknown'
+  | 'concurrency_conflict'
+  | 'concurrency_unsupported'
+  | 'idempotency_conflict'
   | 'not_initialized'
   | 'unknown';
 
@@ -214,6 +243,8 @@ export interface ToolError {
   suggestions?: string[];
   /** Подсказки агенту, что попробовать дальше */
   next_steps?: string[];
+  /** False when replaying could duplicate a side effect. */
+  safe_to_retry?: boolean;
 }
 
 export type ToolResult = ToolSuccess | ToolError;

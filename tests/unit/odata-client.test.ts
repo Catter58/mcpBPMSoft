@@ -116,7 +116,11 @@ describe('ODataClient.executeBulk', () => {
     const http = new MockHttpClient();
     http.setFallback((opts) => ({
       data: {
-        responses: (opts.body as { requests: unknown[] }).requests.map(() => ({ status: 200, body: {} })),
+        responses: (opts.body as { requests: Array<{ id: string }> }).requests.map(({ id }) => ({
+          id,
+          status: 200,
+          body: {},
+        })),
       },
     }));
     const client = new ODataClient(makeCfg(), http as unknown as never);
@@ -157,10 +161,15 @@ describe('ODataClient.executeBulk', () => {
       makeCfg({ odata_version: 3, platform: 'netframework' }),
       http as unknown as never
     );
-    const stopped = await client.executeBulk(posts, false, coll);
-    expect(stopped.responses.map((r) => r.status)).toEqual([400]);
+    const nativePath = client.buildCollectionPath('Contact');
+    const nativePosts = posts.map((request) => ({ ...request, url: nativePath }));
+    const stopped = await client.executeBulk(nativePosts, false, nativePath);
+    expect(stopped.responses.map((r) => [r.status, r.state])).toEqual([
+      [400, 'failed'],
+      [0, 'not_executed'],
+    ]);
     n = 0;
-    const all = await client.executeBulk(posts, true, coll);
+    const all = await client.executeBulk(nativePosts, true, nativePath);
     expect(all.responses.map((r) => r.status)).toEqual([400, 201]);
   });
 
@@ -173,7 +182,11 @@ describe('ODataClient.executeBulk', () => {
     await expect(client.executeBulk(posts, false, coll)).rejects.toBeInstanceOf(BpmApiError);
     http.setFallback((opts) => ({
       data: {
-        responses: (opts.body as { requests: unknown[] }).requests.map(() => ({ status: 200, body: {} })),
+        responses: (opts.body as { requests: Array<{ id: string }> }).requests.map(({ id }) => ({
+          id,
+          status: 200,
+          body: {},
+        })),
       },
     }));
     expect((await client.executeBulk(posts, false, coll)).mode).toBe('batch');

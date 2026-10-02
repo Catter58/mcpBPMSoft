@@ -59,19 +59,59 @@ export const CHARACTER_LIMIT = 25_000;
  * с ближайшим допустимым именем.
  */
 export function strictInputSchema(schema: unknown): unknown {
-  if (!schema || typeof schema !== 'object' || schema instanceof z.ZodType) return schema;
+  if (!schema || typeof schema !== 'object') return schema;
+  if (schema instanceof z.ZodObject) {
+    // .strict() клонирует объект с его checks: существующие refinements не теряются.
+    const strict = schema.strict();
+    const previousError = strict.def.error;
+    const hints = inputErrorHints(Object.keys(strict.shape));
+    return strict.clone({
+      ...strict.def,
+      error: (issue) => hints(issue) ?? previousError?.(issue),
+    });
+  }
+  if (schema instanceof z.ZodType) return schema;
   const shape = schema as z.ZodRawShape;
-  const known = Object.keys(shape);
-  return z.strictObject(shape, {
-    error: (issue) => {
-      if (issue.code !== 'unrecognized_keys') return undefined;
-      const hints = issue.keys.map((key: string) => {
-        const [best] = suggest(key, known, { maxResults: 1 });
-        return best ? `«${key}» — возможно, «${best}»` : `«${key}»`;
-      });
-      return `Неизвестные параметры: ${hints.join(', ')}. Допустимые: ${known.join(', ')}.`;
-    },
-  });
+  return z.strictObject(shape, { error: inputErrorHints(Object.keys(shape)) });
+}
+
+function inputErrorHints(known: string[]): z.core.$ZodErrorMap {
+  return (issue) => {
+    if (issue.code !== 'unrecognized_keys') return undefined;
+    const hints = issue.keys.map((key) => {
+      const [best] = suggest(key, known, { maxResults: 1 });
+      return best ? `«${key}» — возможно, «${best}»` : `«${key}»`;
+    });
+    return `Неизвестные параметры: ${hints.join(', ')}. Допустимые: ${known.join(', ')}.`;
+  };
+}
+
+/** Общий контракт ошибок; дополнительные поля сохраняют диагностику конкретного инструмента. */
+const toolErrorSchema = z.looseObject({
+  success: z.literal(false),
+  error: z.string(),
+  code: z.string().optional(),
+  httpStatus: z.number().optional(),
+  collection: z.string().optional(),
+  details: z.string().optional(),
+  suggestions: z.array(z.string()).optional(),
+  next_steps: z.array(z.string()).optional(),
+  safe_to_retry: z.boolean().optional(),
+});
+
+function outputSchemaWithErrors(schema: unknown) {
+  const success = schema instanceof z.ZodType ? schema : z.strictObject(schema as z.ZodRawShape);
+  const outcomes = z.union([success, toolErrorSchema]);
+  // SDK принимает в outputSchema только object, но клиент проверяет structuredContent
+  // даже при isError=true. Один union описывает обе ветки и для Zod, и для tools/list.
+  const published = z
+    .looseObject({})
+    .superRefine(async (value, context) => {
+      const parsed = await outcomes.safeParseAsync(value);
+      if (!parsed.success) context.addIssue({ code: 'custom', message: parsed.error.message });
+    })
+    .meta({ ...z.toJSONSchema(outcomes, { target: 'draft-7', io: 'output' }), type: 'object' });
+  return { success, published };
 }
 
 /** Обрезает текстовые части ответа до CHARACTER_LIMIT с пояснением для модели. */
@@ -154,12 +194,22 @@ export function instrumentTools(server: McpServer): McpServer {
   const original = target.registerTool.bind(target);
 
   target.registerTool = (name: string, config: unknown, handler: ToolHandler) => {
+    const cfg = config as { inputSchema?: unknown; outputSchema?: unknown } | undefined;
+    const output = cfg?.outputSchema ? outputSchemaWithErrors(cfg.outputSchema) : undefined;
     const wrapped = async (...args: unknown[]) => {
       const started = Date.now();
       try {
         const result = await handler(...args);
-        const ms = Date.now() - started;
         const isError = Boolean((result as { isError?: boolean } | undefined)?.isError);
+        if (output && !isError) {
+          // Ветка ошибки не должна принимать повреждённый успешный ответ.
+          const parsed = await output.success.safeParseAsync(
+            (result as { structuredContent?: unknown } | undefined)?.structuredContent
+          );
+          if (!parsed.success)
+            throw new Error(`Output validation error: Tool ${name}: ${parsed.error.message}`);
+        }
+        const ms = Date.now() - started;
         record(name, ms, isError);
         console.error(`[tool] ${name} ${ms}ms ${isError ? `error ${describeToolError(result)}` : 'ok'}`);
         return limitResultText(result);
@@ -170,9 +220,12 @@ export function instrumentTools(server: McpServer): McpServer {
         throw error;
       }
     };
-    const cfg = config as { inputSchema?: unknown } | undefined;
-    const strictConfig = cfg?.inputSchema
-      ? { ...cfg, inputSchema: strictInputSchema(cfg.inputSchema) }
+    const strictConfig = cfg
+      ? {
+          ...cfg,
+          ...(cfg.inputSchema ? { inputSchema: strictInputSchema(cfg.inputSchema) } : {}),
+          ...(output ? { outputSchema: output.published } : {}),
+        }
       : config;
     return original(name, strictConfig, wrapped);
   };

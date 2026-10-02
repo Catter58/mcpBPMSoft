@@ -129,6 +129,7 @@ export class CurrentUserService {
       url: `${this.config.bpmsoft_url}/0/DataService/json/SyncReply/SelectQuery`,
       body,
       contentKind: 'crud',
+      operation: 'read', // DataService SELECT передаётся через POST, но ничего не изменяет.
     });
 
     const data = response.data;

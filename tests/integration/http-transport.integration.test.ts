@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll, afterEach } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, afterEach, vi } from 'vitest';
 import { setupServer } from 'msw/node';
 import { http, HttpResponse } from 'msw';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -30,19 +30,39 @@ function cfg(): BpmConfig {
 const mock = setupServer();
 beforeAll(() => mock.listen({ onUnhandledRequest: 'bypass' }));
 afterAll(() => mock.close());
-afterEach(() => mock.resetHandlers());
+afterEach(() => {
+  mock.resetHandlers();
+  vi.restoreAllMocks();
+});
 
 describe('HTTP transport forwards per-request auth', () => {
   it('forwards caller BPMCSRF to the outgoing OData request', async () => {
     let capturedCsrf: string | null = null;
+    let capturedCookie: string | null = null;
+    let forceSession: string | null = null;
     mock.use(
       http.get(`${ORIGIN}/odata/Contact`, ({ request }) => {
         capturedCsrf = request.headers.get('bpmcsrf');
+        capturedCookie = request.headers.get('cookie');
+        forceSession = request.headers.get('forceusesession');
         return HttpResponse.json({ value: [{ Id: '1' }] });
       })
     );
 
     const services = initializeServices(cfg(), false);
+    // Metadata discovery is a separate network concern. Keep the real read
+    // handler, HTTP transport, request context and outgoing HTTP client here.
+    vi.spyOn(services.metadataManager, 'resolveCollectionReference').mockResolvedValue({ name: 'Contact' });
+    vi.spyOn(services.metadataManager, 'getEntityMetadata').mockResolvedValue({
+      name: 'Contact',
+      collectionName: 'Contact',
+      cachedAt: Date.now(),
+      lookupFields: [],
+      properties: [
+        { name: 'Id', type: 'Edm.Guid', nullable: false, isLookup: false },
+        { name: 'Name', type: 'Edm.String', nullable: true, isLookup: false, caption: 'Имя' },
+      ],
+    });
     const makeServer = () => {
       const mcp = new McpServer({ name: 'test', version: '0.0.0' });
       registerReadTools(mcp, services);
@@ -71,17 +91,20 @@ describe('HTTP transport forwards per-request auth', () => {
         });
       },
     });
-    await client.connect(transport);
-
-    const res = await client.callTool({
-      name: 'bpm_get_records',
-      arguments: { collection: 'Contact', top: 1 },
-    });
-
-    expect(res.isError).toBeFalsy();
-    expect(capturedCsrf).toBe('caller-csrf');
-
-    await client.close();
-    httpServer.close();
+    try {
+      await client.connect(transport);
+      const res = await client.callTool({
+        name: 'bpm_get_records',
+        arguments: { collection: 'Contact', top: 1 },
+      });
+      expect(res.isError).toBeFalsy();
+      expect(capturedCsrf).toBe('caller-csrf');
+      expect(capturedCookie).toContain('BPMSESSIONID=s');
+      expect(capturedCookie).toContain('CsrfToken=t');
+      expect(forceSession).toBe('true');
+    } finally {
+      await client.close();
+      await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+    }
   });
 });

@@ -263,7 +263,7 @@ export function registerAggregateTool(server: McpServer, services: ServiceContai
           let truncated = false;
           while (scanned < maxRecords) {
             const pageSize = Math.min(PAGE_SIZE, maxRecords - scanned);
-            const { records } = await getRecordsWithLookupNames(
+            const { records, response } = await getRecordsWithLookupNames(
               deps,
               collection,
               {
@@ -273,14 +273,42 @@ export function registerAggregateTool(server: McpServer, services: ServiceContai
                 $skip: scanned,
                 $orderby: 'Id',
               },
-              { resolveLookups: Boolean(groupField) }
+              { resolveLookups: Boolean(groupField), maxRecords: pageSize }
             );
-            for (const record of records) {
+            const accepted = records.slice(0, pageSize);
+            for (const record of accepted) {
               accumulate(groups, record, groupField, labelKey, metrics, bucketOf(record));
             }
-            scanned += records.length;
-            if (records.length < pageSize) break;
-            if (scanned >= maxRecords) truncated = true;
+            scanned += accepted.length;
+            const hasMore =
+              records.length > accepted.length ||
+              Boolean(response['@odata.nextLink']) ||
+              (response['@odata.count'] !== undefined && response['@odata.count'] > scanned);
+            if (scanned >= maxRecords) {
+              if (hasMore) truncated = true;
+              else {
+                // Ровно max_records ещё не означает неполный итог: проверяем наличие следующей строки.
+                const probe = await services.odataClient.getRecords(
+                  collection,
+                  {
+                    $filter: pageFilter,
+                    $select: 'Id',
+                    $top: 1,
+                    $skip: scanned,
+                    $orderby: 'Id',
+                  },
+                  false,
+                  1
+                );
+                truncated = probe.value.length > 0 || Boolean(probe['@odata.nextLink']);
+              }
+              break;
+            }
+            if (accepted.length === 0) {
+              truncated = hasMore;
+              break;
+            }
+            if (records.length < pageSize && !hasMore) break;
           }
           return { groups, scanned, truncated };
         };
@@ -378,7 +406,8 @@ function describeRange(range: DateRange, timeZone: string): string {
   return `${day(range.from)} — ${day(new Date(range.to.getTime() - 1))}`;
 }
 
-const groupMapKey = (bucket: string | undefined, key: string | null) => `${bucket ?? ''} ${key ?? ' empty'}`;
+const groupMapKey = (bucket: string | undefined, key: string | null) =>
+  `${bucket ?? ''}\u0000${key ?? ' empty'}`;
 
 /** Добавляет запись в её группу (интервал × значение group_by) и копит метрики; нечисловые и пустые пропускаются. */
 export function accumulate(

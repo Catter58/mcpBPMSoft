@@ -41,6 +41,8 @@ function buildContactMeta(): EntityMetadata {
         nullable: false,
         isLookup: false,
         caption: 'ФИО',
+        required: true,
+        requirementSource: 'entity_schema_designer',
       },
       {
         name: 'AccountId',
@@ -94,6 +96,7 @@ describe('registerResources', () => {
     ]);
     const services = {
       initialized: true,
+      authManager: { ensureAuthenticated: vi.fn(async () => undefined) },
       metadataManager: { getEntitySets },
     } as unknown as ServiceContainer;
 
@@ -131,6 +134,7 @@ describe('registerResources', () => {
     const getCount = vi.fn().mockResolvedValue(42);
     const services = {
       initialized: true,
+      authManager: { ensureAuthenticated: vi.fn(async () => undefined) },
       metadataManager: { getEntityMetadata, resolveCollectionReference: vi.fn() },
       odataClient: { getCount },
     } as unknown as ServiceContainer;
@@ -170,6 +174,7 @@ describe('registerResources', () => {
     });
     const services = {
       initialized: true,
+      authManager: { ensureAuthenticated: vi.fn(async () => undefined) },
       metadataManager: { getEntityMetadata, resolveCollectionReference },
       odataClient: { getCount: vi.fn() },
     } as unknown as ServiceContainer;

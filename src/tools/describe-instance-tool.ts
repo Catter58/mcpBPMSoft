@@ -19,6 +19,8 @@ import type { EntityMetadata } from '../types/index.js';
 import { formatToolError } from '../utils/errors.js';
 import { getTool } from './registry.js';
 import { notInitialized } from './_guards.js';
+import { getAuthCacheScope } from '../auth/request-context.js';
+import { SERVER_VERSION } from '../version.js';
 
 const MAIN_ENTITY_CANDIDATES = [
   'Contact',
@@ -57,16 +59,22 @@ interface CacheEntry {
   createdAt: number;
 }
 
+const connectionCaches = new WeakMap<ServiceContainer, Map<string, CacheEntry>>();
+
 export function registerDescribeInstanceTool(server: McpServer, services: ServiceContainer): void {
   const meta = getTool('bpm_describe_instance');
-  let cache: CacheEntry | null = null;
+  let cache = connectionCaches.get(services);
+  if (!cache) {
+    cache = new Map<string, CacheEntry>();
+    connectionCaches.set(services, cache);
+  }
 
   server.registerTool(
     meta.name,
     {
       title: meta.title,
       description: meta.description,
-      inputSchema: {},
+      inputSchema: { refresh: z.boolean().optional().describe('Обновить сводку без кэша') },
       outputSchema: {
         collections_total: z.number().int(),
         custom_collections_total: z.number().int(),
@@ -84,18 +92,22 @@ export function registerDescribeInstanceTool(server: McpServer, services: Servic
         ),
         generated_at: z.number(),
         from_cache: z.boolean(),
+        server_version: z.string(),
+        odata_version: z.number(),
+        platform: z.string(),
       },
       annotations: meta.annotations,
     },
-    async (): Promise<CallToolResult> => {
+    async (params): Promise<CallToolResult> => {
       if (!services.initialized) return notInitialized();
       try {
-        const now = Date.now();
-        if (cache && now - cache.createdAt <= CACHE_TTL_MS) {
-          return buildResult(cache.summary, true);
-        }
-
         await services.authManager.ensureAuthenticated();
+        const now = Date.now();
+        const key = `${services.config.bpmsoft_url}:${getAuthCacheScope() || services.config.username || ''}`;
+        const cached = cache.get(key);
+        if (!params.refresh && cached && now - cached.createdAt <= CACHE_TTL_MS) {
+          return buildResult(cached.summary, true, services);
+        }
 
         const entitySets = await services.metadataManager.getEntitySets();
         const setNames = new Set(entitySets.map((s) => s.name));
@@ -116,12 +128,15 @@ export function registerDescribeInstanceTool(server: McpServer, services: Servic
           generated_at: now,
         };
 
-        cache = { summary, createdAt: now };
-        return buildResult(summary, false);
+        for (const [scope, entry] of cache) if (now - entry.createdAt > CACHE_TTL_MS) cache.delete(scope);
+        if (cache.size >= 64) cache.delete(cache.keys().next().value!);
+        cache.set(key, { summary, createdAt: now });
+        return buildResult(summary, false, services);
       } catch (error) {
         const toolError = formatToolError(error);
         return {
           content: [{ type: 'text', text: JSON.stringify(toolError, null, 2) }],
+          structuredContent: toolError as unknown as Record<string, unknown>,
           isError: true,
         };
       }
@@ -173,7 +188,11 @@ async function buildMainEntitySummary(services: ServiceContainer, name: string):
   };
 }
 
-function buildResult(summary: InstanceSummary, fromCache: boolean): CallToolResult {
+function buildResult(
+  summary: InstanceSummary,
+  fromCache: boolean,
+  services: ServiceContainer
+): CallToolResult {
   const lines: string[] = [];
   lines.push('Инстанс');
   lines.push(`  Всего коллекций: ${summary.collections_total}`);
@@ -222,6 +241,9 @@ function buildResult(summary: InstanceSummary, fromCache: boolean): CallToolResu
       main_entities: summary.main_entities,
       generated_at: summary.generated_at,
       from_cache: fromCache,
+      server_version: SERVER_VERSION,
+      odata_version: services.config.odata_version,
+      platform: services.config.platform,
     },
   };
 }

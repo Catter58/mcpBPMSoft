@@ -81,13 +81,16 @@ export function hasRequestAuth(auth: RequestAuth | undefined): auth is RequestAu
 /**
  * Stable cache-scope token for the current request, used to isolate per-user
  * cached data (e.g. lookup results) so one caller's data is never served to
- * another. Derived (hashed) from the session cookie; empty string when there
+ * another. Derived (hashed) from the complete forwarded auth context; empty string when there
  * is no per-request auth (env-creds / stdio mode → a single shared identity).
  */
 export function getAuthCacheScope(): string {
   const auth = getRequestAuth();
   if (!auth) return '';
-  const token = auth.cookies.get('BPMSESSIONID') || auth.cookies.get('.ASPXAUTH') || auth.csrfToken || '';
-  if (!token) return '';
-  return createHash('sha256').update(token).digest('hex').slice(0, 16);
+  if (!hasRequestAuth(auth)) return '';
+  const context = JSON.stringify({
+    csrf: auth.csrfToken ?? '',
+    cookies: [...auth.cookies.entries()].sort(([left], [right]) => left.localeCompare(right)),
+  });
+  return createHash('sha256').update(context).digest('hex');
 }

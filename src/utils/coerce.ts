@@ -7,6 +7,7 @@
  * неразбираемые — понятная ошибка с именем поля и ожидаемым форматом.
  */
 
+import { coerceFieldValue } from './field-values.js';
 import { BpmApiError } from './errors.js';
 import { calendarRange, resolveTimeZone, zoneOffsetMinutes } from './datetime.js';
 
@@ -44,7 +45,7 @@ const RELATIVE_RE = /^(\S+)(?:\s+(?:в\s+)?(\d{1,2}):(\d{2}))?$/i;
 export function needsTimeZone(value: unknown, edmType: string): boolean {
   return (
     typeof value === 'string' &&
-    (edmType === DATETIME_TYPE || edmType === DATE_TYPE) &&
+    (edmType === DATETIME_TYPE || edmType === 'Edm.DateTime' || edmType === DATE_TYPE) &&
     !ISO_WITH_OFFSET_RE.test(value.trim())
   );
 }
@@ -62,6 +63,7 @@ export function coerceValue(
   if (value === null || value === undefined) return { value, changed: false };
   const known =
     edmType === DATETIME_TYPE ||
+    edmType === 'Edm.DateTime' ||
     edmType === DATE_TYPE ||
     edmType === BOOL_TYPE ||
     INT_TYPES.has(edmType) ||
@@ -73,9 +75,16 @@ export function coerceValue(
 
   let out: unknown;
   if (edmType === BOOL_TYPE) out = toBoolean(value);
-  else if (INT_TYPES.has(edmType)) out = toNumber(value, true);
-  else if (FLOAT_TYPES.has(edmType)) out = toNumber(value, false);
-  else if (edmType === DATE_TYPE) out = toDate(value, timeZone);
+  else if (INT_TYPES.has(edmType) || FLOAT_TYPES.has(edmType)) {
+    const normalized = normalizeNumber(value);
+    if (normalized !== undefined)
+      out = coerceFieldValue(normalized, {
+        name: field,
+        type: edmType,
+        nullable: true,
+        isLookup: false,
+      });
+  } else if (edmType === DATE_TYPE) out = toDate(value, timeZone);
   else out = toDateTimeOffset(value, timeZone);
 
   if (out === undefined) throw coercionError(field, value, edmType);
@@ -90,25 +99,15 @@ function toBoolean(value: unknown): boolean | undefined {
   return undefined;
 }
 
-function toNumber(value: unknown, integral: boolean): number | undefined {
-  let n: number;
-  if (typeof value === 'number') {
-    n = value;
-  } else if (typeof value === 'string') {
-    // \s в JS покрывает и неразрывные пробелы (U+00A0, U+202F) — разделители тысяч.
-    let s = value.replace(/[\s']/g, '');
-    const comma = s.lastIndexOf(',');
-    const dot = s.lastIndexOf('.');
-    // Десятичный — последний из разделителей, второй считается разделителем тысяч.
-    if (comma > dot) s = s.replace(/\./g, '').replace(',', '.');
-    else if (dot > comma && comma !== -1) s = s.replace(/,/g, '');
-    if (!/^[+-]?\d+(\.\d+)?$/.test(s)) return undefined;
-    n = Number(s);
-  } else {
-    return undefined;
-  }
-  if (!Number.isFinite(n) || (integral && !Number.isInteger(n))) return undefined;
-  return n;
+function normalizeNumber(value: unknown): string | number | undefined {
+  if (typeof value === 'number') return value;
+  if (typeof value !== 'string') return undefined;
+  let text = value.replace(/[\s']/g, '');
+  const comma = text.lastIndexOf(',');
+  const dot = text.lastIndexOf('.');
+  if (comma > dot) text = text.replace(/\./g, '').replace(',', '.');
+  else if (dot > comma && comma !== -1) text = text.replace(/,/g, '');
+  return /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/.test(text) ? text : undefined;
 }
 
 function toDate(value: unknown, timeZone?: string): string | undefined {
@@ -127,7 +126,14 @@ function toDateTimeOffset(value: unknown, timeZone?: string): string | undefined
   if (value instanceof Date) return Number.isNaN(value.getTime()) ? undefined : isoZ(value);
   if (typeof value !== 'string') return undefined;
   const s = value.trim();
-  if (ISO_WITH_OFFSET_RE.test(s)) return Number.isNaN(Date.parse(s)) ? undefined : value;
+  if (ISO_WITH_OFFSET_RE.test(s)) {
+    try {
+      coerceFieldValue(s, { name: 'date', type: 'Edm.DateTimeOffset', nullable: false, isLookup: false });
+    } catch {
+      return undefined;
+    }
+    return value;
+  }
 
   const tz = resolveTimeZone(timeZone);
   const iso = s.match(ISO_LOCAL_RE);

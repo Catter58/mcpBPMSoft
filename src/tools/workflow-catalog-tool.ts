@@ -31,7 +31,7 @@ const SCENARIOS: WorkflowScenario[] = [
       'Пользователь говорит «добавь контакт», «создай Иванова из Ромашки», «нужен новый человек в CRM».',
     recommended_tools: ['bpm_register_contact'],
     notes:
-      'Один вызов вместо create_record(Account)+create_record(Contact). Account будет найден или создан автоматически.',
+      'Один вызов вместо create_record(Account)+create_record(Contact). Account будет найден или создан автоматически. account_created/contact_created: true — создан этим вызовом, false — существующий или не выполнено (см. outcomes), null — факт создания неизвестен; при успешном результате сама запись подтверждена по UUID.',
   },
   {
     id: 'log-activity',
@@ -274,6 +274,12 @@ export function registerWorkflowCatalogTool(server: McpServer, _services: Servic
               },
             ],
             isError: true,
+            structuredContent: {
+              success: false,
+              code: 'not_found',
+              error: `Сценарий ${params.scenario_id} не найден`,
+              suggestions: SCENARIOS.map((scenario) => scenario.id),
+            },
           };
         }
         return {

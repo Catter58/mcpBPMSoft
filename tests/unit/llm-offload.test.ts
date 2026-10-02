@@ -9,7 +9,7 @@ import type { MetadataManager } from '../../src/metadata/metadata-manager.js';
 import type { EntityProperty } from '../../src/types/index.js';
 
 const ME = '410006e1-ca4e-4502-a9ec-e54d922d2c00';
-const user = { userId: 'u-1', userName: 'Supervisor', contactId: ME };
+const user = { userId: 'u-1', userName: 'ApiUser', contactId: ME };
 
 function prop(name: string, type = 'Edm.String', lookupCollection?: string): EntityProperty {
   return {

@@ -1,10 +1,14 @@
 import { describe, it, expect, afterEach } from 'vitest';
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   buildConfig,
   getODataBaseUrl,
   getAuthUrl,
   tryLoadConfigFromEnv,
   isEnvCredsAllowed,
+  loadLocalEnvironment,
 } from '../../src/config.js';
 import type { BpmConfig } from '../../src/types/index.js';
 
@@ -151,4 +155,69 @@ describe('tryLoadConfigFromEnv', () => {
     expect(cfg!.username).toBe('u');
     expect(cfg!.password).toBe('p');
   });
+});
+
+describe('strict runtime configuration', () => {
+  const saved = { ...process.env };
+  afterEach(() => {
+    process.env = { ...saved };
+  });
+  it('rejects credentials, queries and non-HTTP protocols in the target URL', () => {
+    for (const url of [
+      'file:///etc/passwd',
+      'https://u:p@bpm.test',
+      'https://bpm.test?token=1',
+      'https://bpm.test#fragment',
+      'not a URL',
+    ]) {
+      expect(() => buildConfig(url)).toThrow();
+    }
+  });
+  it('rejects partial numbers and fractional limits instead of silently accepting them', () => {
+    process.env.BPMSOFT_REQUEST_TIMEOUT = '100ms';
+    expect(() => buildConfig('https://bpm.test')).toThrow();
+    process.env.BPMSOFT_REQUEST_TIMEOUT = '1.5';
+    expect(() => buildConfig('https://bpm.test')).toThrow();
+    expect(() => buildConfig('https://bpm.test', undefined, undefined, { odata_version: '4bad' })).toThrow();
+  });
+  it('caps batch size at the platform maximum', () => {
+    process.env.BPMSOFT_MAX_BATCH_SIZE = '1000';
+    expect(buildConfig('https://bpm.test').max_batch_size).toBe(100);
+  });
+});
+
+it('loads an optional .env without replacing existing process configuration', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'mcp-config-'));
+  const prior = process.env.MCP_TEST_DOTENV_PRIORITY;
+  try {
+    const file = join(directory, '.env');
+    writeFileSync(file, 'MCP_TEST_DOTENV_PRIORITY=from-file\nMCP_TEST_DOTENV_NEW=loaded\n');
+    process.env.MCP_TEST_DOTENV_PRIORITY = 'from-runtime';
+    loadLocalEnvironment(file);
+    expect(process.env.MCP_TEST_DOTENV_PRIORITY).toBe('from-runtime');
+    expect(process.env.MCP_TEST_DOTENV_NEW).toBe('loaded');
+    expect(() => loadLocalEnvironment(join(directory, 'absent'))).not.toThrow();
+  } finally {
+    if (prior === undefined) delete process.env.MCP_TEST_DOTENV_PRIORITY;
+    else process.env.MCP_TEST_DOTENV_PRIORITY = prior;
+    delete process.env.MCP_TEST_DOTENV_NEW;
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+it('uses a dedicated HTTP file directory and rejects an unrestricted filesystem root', () => {
+  const saved = process.env.BPMSOFT_FILE_ROOT;
+  try {
+    delete process.env.BPMSOFT_FILE_ROOT;
+    expect(buildConfig('https://bpm.test').file_root).toBe('./files');
+    process.env.BPMSOFT_FILE_ROOT = './uploads';
+    expect(buildConfig('https://bpm.test').file_root).toBe('./uploads');
+    process.env.BPMSOFT_FILE_ROOT = '/';
+    expect(() => buildConfig('https://bpm.test')).toThrow('BPMSOFT_FILE_ROOT');
+    process.env.BPMSOFT_FILE_ROOT = '';
+    expect(() => buildConfig('https://bpm.test')).toThrow('BPMSOFT_FILE_ROOT');
+  } finally {
+    if (saved === undefined) delete process.env.BPMSOFT_FILE_ROOT;
+    else process.env.BPMSOFT_FILE_ROOT = saved;
+  }
 });

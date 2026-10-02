@@ -10,22 +10,21 @@ import { LookupResolutionError, UnknownCollectionError } from '../utils/errors.j
 import { getDisplayColumn, fieldCorrectionNote } from '../utils/display.js';
 import { compileFilter, type CompileResult, type Criterion } from '../utils/filter-compiler.js';
 
+const initializationError = {
+  success: false,
+  code: 'not_initialized',
+  error: 'Подключение к BPMSoft не настроено.',
+  next_steps: ['Настройте подключение при запуске сервера. Если доступен bpm_init, можно использовать его.'],
+};
+
 export const NOT_INITIALIZED_RESULT: CallToolResult = {
   content: [
     {
       type: 'text',
-      text: JSON.stringify(
-        {
-          success: false,
-          code: 'not_initialized',
-          error: 'Сервер не инициализирован. Сначала вызовите bpm_init с параметрами подключения.',
-          next_steps: ['Вызовите bpm_init с URL, логином и паролем BPMSoft.'],
-        },
-        null,
-        2
-      ),
+      text: JSON.stringify(initializationError, null, 2),
     },
   ],
+  structuredContent: initializationError,
   isError: true,
 };
 
@@ -161,13 +160,16 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 export async function resolveRecordId(
   services: ServiceContainer,
   collection: string,
-  idOrName: string
+  idOrName: string,
+  options: { fuzzy?: boolean } = {}
 ): Promise<{ id: string; matched?: string }> {
   const value = idOrName.trim();
   if (UUID_RE.test(value)) return { id: value };
 
   const column = (await getDisplayColumn(services.metadataManager, collection)) ?? 'Name';
-  const result = await services.lookupResolver.resolve(collection, value, column, { fuzzy: true });
+  const result = await services.lookupResolver.resolve(collection, value, column, {
+    fuzzy: options.fuzzy ?? true,
+  });
   if (result.resolved && result.id) return { id: result.id, matched: result.matchedValue ?? value };
   throw new LookupResolutionError(column, value, result.matchCount, result.candidates, {
     lookupCollection: collection,
@@ -202,6 +204,7 @@ export async function compileCriteria(
     join,
     timeZone,
     currentUser: services.currentUser,
+    lookupResolver: services.lookupResolver,
   });
   compiled.warnings.unshift(...new Set(notes));
   return compiled;

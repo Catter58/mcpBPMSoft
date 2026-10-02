@@ -7,11 +7,12 @@
  *   - actionable next steps for the LLM agent (`next_steps`)
  */
 
-import type { ToolError, ToolErrorCode, ODataErrorResponse } from '../types/index.js';
+import type { ToolError, ToolErrorCode } from '../types/index.js';
 import { isEnvCredsAllowed } from '../config.js';
 
 function codeFromStatus(httpStatus: number): ToolErrorCode {
   if (httpStatus === 401 || httpStatus === 403) return 'auth_required';
+  if (httpStatus === 412) return 'concurrency_conflict';
   if (httpStatus === 404) return 'not_found';
   if (httpStatus === 400) return 'validation';
   return 'odata_error';
@@ -44,6 +45,7 @@ export class BpmApiError extends Error {
       details: this.details,
       suggestions: this.suggestions,
       next_steps: this.nextSteps ?? defaultNextSteps(this.httpStatus, this.collection),
+      ...(this.code === 'outcome_unknown' ? { safe_to_retry: false } : {}),
     };
   }
 
@@ -194,29 +196,20 @@ export class UnknownCollectionError extends BpmApiError {
 }
 
 export function parseODataError(body: unknown): string | undefined {
-  // BPMSoft отдаёт ошибку строкой JSON при text-ответах ($count) — пробуем распарсить.
+  if (body instanceof Uint8Array) return parseODataError(Buffer.from(body).toString('utf8'));
   if (typeof body === 'string') {
-    const trimmed = body.trim();
-    if (!trimmed.startsWith('{')) return undefined;
     try {
-      return parseODataError(JSON.parse(trimmed));
+      return parseODataError(JSON.parse(body));
     } catch {
       return undefined;
     }
   }
-  if (body && typeof body === 'object' && 'error' in body) {
-    const errorBody = body as ODataErrorResponse;
-    const message = errorBody.error?.message as unknown;
-    if (typeof message === 'string') return message;
-    // v3-форма: { message: { lang, value } }
-    if (
-      message &&
-      typeof message === 'object' &&
-      typeof (message as { value?: unknown }).value === 'string'
-    ) {
-      return (message as { value: string }).value;
-    }
-  }
+  if (!body || typeof body !== 'object') return undefined;
+  const envelope = body as { error?: { message?: unknown }; 'odata.error'?: { message?: unknown } };
+  const message = (envelope.error ?? envelope['odata.error'])?.message;
+  if (typeof message === 'string') return message;
+  if (message && typeof message === 'object' && 'value' in message && typeof message.value === 'string')
+    return message.value;
   return undefined;
 }
 
@@ -236,11 +229,11 @@ export function formatToolError(error: unknown, collection?: string): ToolError 
   if (error instanceof LookupResolutionError) {
     return {
       success: false,
-      code: error.matchCount > 1 ? 'lookup_ambiguous' : 'not_found',
+      code: error.matchCount > 0 ? 'lookup_ambiguous' : 'not_found',
       error: error.message,
       collection,
       details:
-        error.matchCount > 1
+        error.matchCount > 0
           ? `Кандидаты: ${error.candidates.map((c) => `"${c.displayValue}" (${c.id})`).join(', ')}`
           : undefined,
       suggestions: error.suggestions,
@@ -286,7 +279,9 @@ function defaultNextSteps(httpStatus?: number, collection?: string): string[] {
     ];
   }
   if (httpStatus === 412) {
-    return ['Сервер отклонил предусловие. Проверьте обязательные поля и совместимость значений.'];
+    return [
+      'Запись изменилась после чтения. Получите актуальную запись и проверьте изменения перед повтором операции.',
+    ];
   }
   if (httpStatus === 429 || httpStatus === 503) {
     return ['Сервер сообщил о перегрузке. Подождите несколько секунд и повторите запрос.'];

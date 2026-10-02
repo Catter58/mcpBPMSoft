@@ -40,6 +40,43 @@ function makeStubODataClient(
 }
 
 describe('LookupResolver.resolve', () => {
+  it('never selects a unique record from an incomplete server page', async () => {
+    const od = {
+      async getRecords() {
+        return { value: [{ Id: 'a', Name: 'Moscow' }], '@odata.nextLink': 'City?$skip=1' };
+      },
+    };
+    expect(
+      (await new LookupResolver(makeCfg(), od as never, {} as never).resolve('City', 'Moscow')).resolved
+    ).toBe(false);
+  });
+  it('uses count evidence when a backend returns a truncated page without a link', async () => {
+    const od = {
+      async getRecords() {
+        return { value: [{ Id: 'a', Name: 'Moscow' }], '@odata.count': 2 };
+      },
+    };
+    const result = await new LookupResolver(makeCfg(), od as never, {} as never).resolve('City', 'Moscow');
+    expect(result.resolved).toBe(false);
+    expect(result.has_more).toBe(true);
+    expect(result.match_count_is_exact).toBe(false);
+  });
+  it('refuses automatic normalized-name selection from a truncated fuzzy candidate set', async () => {
+    const od = {
+      async getRecords(_collection: string, query: { $filter: string }) {
+        return query.$filter.includes(' eq ')
+          ? { value: [] }
+          : { value: [{ Id: 'a', Name: 'АО «ЛАНИТ»' }], '@odata.count': 100 };
+      },
+    };
+    const result = await new LookupResolver(makeCfg(), od as never, {} as never).resolve(
+      'Account',
+      'Ланит',
+      'Name',
+      { fuzzy: true }
+    );
+    expect(result.resolved).toBe(false);
+  });
   it('returns resolved=true with a single match', async () => {
     const od = makeStubODataClient(() => [{ Id: 'guid-1', Name: 'Moscow' }]);
     const resolver = new LookupResolver(makeCfg(), od as never, {} as never, { maxCacheSize: 10 });
@@ -63,7 +100,7 @@ describe('LookupResolver.resolve', () => {
     expect(r.candidates).toHaveLength(2);
   });
 
-  it('falls back to fuzzy contains() and resolves a single confident candidate', async () => {
+  it('returns a substring candidate as a suggestion without choosing it', async () => {
     let call = 0;
     const od = makeStubODataClient((filter) => {
       call += 1;
@@ -78,10 +115,9 @@ describe('LookupResolver.resolve', () => {
     const resolver = new LookupResolver(makeCfg(), od as never, {} as never);
 
     const r = await resolver.resolve('City', 'Mos', 'Name', { fuzzy: true });
-    expect(r.resolved).toBe(true);
-    expect(r.id).toBe('a');
-    expect(r.fuzzy).toBe(true);
-    expect(r.matchedValue).toBe('Moscow');
+    expect(r.resolved).toBe(false);
+    expect(r.id).toBeUndefined();
+    expect(r.candidates).toMatchObject([{ id: 'a', displayValue: 'Moscow' }]);
     expect(od.calls).toHaveLength(2);
   });
 });

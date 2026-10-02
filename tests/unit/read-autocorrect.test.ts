@@ -134,7 +134,7 @@ function readTools(odataClient: Record<string, unknown>) {
 }
 
 describe('read-tools: запись целиком и заметки об исправлениях', () => {
-  it('bpm_get_record без select берёт все колонки с именами lookup, текст — без пустых полей', async () => {
+  it('bpm_get_record без select берёт все небинарные колонки с именами lookup, текст — без пустых полей', async () => {
     const calls: Array<Record<string, unknown>> = [];
     const handlers = readTools({
       getRecord: async (_c: string, _id: string, query: Record<string, unknown>) => {
@@ -144,7 +144,7 @@ describe('read-tools: запись целиком и заметки об исп�
     });
     const result = await handlers.get('bpm_get_record')!({ collection: 'ContactCollection', id: ID });
 
-    expect(calls[0].$select).toBeUndefined();
+    expect(calls[0].$select).toBe('Id,Name,CityId');
     expect(calls[0].$expand).toBe('City($select=Name)');
     const text = result.content[0].text;
     expect(text).toContain('Коллекция «ContactCollection» → Contact');

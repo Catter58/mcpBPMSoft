@@ -210,3 +210,22 @@ describe('bpm_describe_instance', () => {
     expect(result.content[0].text).toContain('count: n/a');
   });
 });
+
+it('invalidates registration caches when the same services container changes connection or env identity', async () => {
+  const { services, getEntitySets } = buildServices();
+  services.config = { ...services.config, bpmsoft_url: 'https://one.test', username: 'identity-one' };
+  const { server, getHandler } = buildServer();
+  registerDescribeInstanceTool(server as never, services);
+  const handler = getHandler();
+  const first = (await handler({})) as { structuredContent: { from_cache: boolean } };
+  expect(first.structuredContent.from_cache).toBe(false);
+  const cached = (await handler({})) as { structuredContent: { from_cache: boolean } };
+  expect(cached.structuredContent.from_cache).toBe(true);
+  services.config = { ...services.config, username: 'identity-two' };
+  const otherIdentity = (await handler({})) as { structuredContent: { from_cache: boolean } };
+  expect(otherIdentity.structuredContent.from_cache).toBe(false);
+  services.config = { ...services.config, bpmsoft_url: 'https://two.test' };
+  const otherInstance = (await handler({})) as { structuredContent: { from_cache: boolean } };
+  expect(otherInstance.structuredContent.from_cache).toBe(false);
+  expect(getEntitySets).toHaveBeenCalledTimes(3);
+});

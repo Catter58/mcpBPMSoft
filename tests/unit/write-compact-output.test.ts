@@ -1,6 +1,6 @@
 /**
  * Текстовые ответы write-инструментов: компактная запись вместо полного JSON, «найдено по имени»,
- * превью массовых операций с названиями и удаление по фильтру за два вызова.
+ * превью массовых операций с названиями и удаление по подтверждённому плану.
  */
 
 import { describe, it, expect } from 'vitest';
@@ -50,6 +50,9 @@ function setup(opts: { ambiguous?: boolean; failUpdateIds?: string[]; failDelete
     async createRecord(_c: string, data: Record<string, unknown>) {
       return { ...FULL_RECORD, ...data };
     },
+    async createRecordWithOutcome(_c: string, data: Record<string, unknown>) {
+      return { record: await this.createRecord(_c, data), created: true };
+    },
     async updateRecord(_c: string, id: string, data: Record<string, unknown>) {
       calls.updated.push({ id, data });
       if (opts.failUpdateIds?.includes(id)) throw new Error('update failed');
@@ -96,6 +99,7 @@ function setup(opts: { ambiguous?: boolean; failUpdateIds?: string[]; failDelete
     },
   };
   const services = {
+    config: { bpmsoft_url: 'https://crm.example.test', username: 'tester' },
     initialized: true,
     authManager: { async ensureAuthenticated() {} },
     odataClient,
@@ -108,7 +112,23 @@ function setup(opts: { ambiguous?: boolean; failUpdateIds?: string[]; failDelete
     { registerTool: (name: string, _m: unknown, h: Handler) => registered.set(name, h) } as never,
     services
   );
-  return { handler: (name) => registered.get(name)!, calls };
+  return {
+    handler: (name) => async (args) => {
+      const handler = registered.get(name)!;
+      const execute =
+        (name === 'bpm_update_by_filter' && args.expected_count !== undefined) ||
+        (name === 'bpm_delete_by_filter' && args.confirm === true);
+      const preview = await handler(execute ? { ...args, confirm: false } : args);
+      if (execute && preview.structuredContent?.requires_confirmation)
+        return handler({
+          ...args,
+          confirm: true,
+          confirmation_token: preview.structuredContent.confirmation_token,
+        });
+      return preview;
+    },
+    calls,
+  };
 }
 
 describe('bpm_create_record / bpm_update_record: компактный текст', () => {
@@ -191,7 +211,10 @@ describe('bpm_update_by_filter: превью', () => {
       data: { Owner: 'Иван' },
     });
     expect(res.isError).toBe(true);
-    expect(res.content[0].text).toContain('Неоднозначное значение');
+    expect(res.structuredContent).toMatchObject({
+      code: 'lookup_ambiguous',
+      candidates: expect.arrayContaining([{ id: 'o1', displayValue: 'Иван А' }]),
+    });
     expect(calls.getRecords).toHaveLength(0);
   });
 
@@ -204,7 +227,11 @@ describe('bpm_update_by_filter: превью', () => {
       expected_count: 2,
     });
     expect(res.structuredContent?.succeeded).toEqual([]);
-    expect(res.structuredContent?.failed).toHaveLength(2);
+    expect(res.structuredContent?.failed).toHaveLength(1);
+    expect(res.structuredContent?.outcomes).toEqual([
+      expect.objectContaining({ state: 'failed' }),
+      expect.objectContaining({ state: 'not_executed' }),
+    ]);
     expect(res.isError).toBe(true);
   });
 
@@ -235,12 +262,14 @@ describe('bpm_update_by_filter: превью', () => {
   });
 });
 
-describe('bpm_delete_by_filter: за два вызова', () => {
-  it('первое превью называет оба условия; второй вызов с ними удаляет сразу', async () => {
+describe('bpm_delete_by_filter: подтверждение плана', () => {
+  it('первое превью объясняет точный план и подтверждение; помощник теста подтверждает его', async () => {
     const { handler, calls } = setup();
     const del = handler('bpm_delete_by_filter');
     const preview = await del({ collection: 'Contact', filter: "Name ne ''" });
-    expect(preview.content[0].text).toContain('expected_count=2 и confirm=true');
+    expect(preview.content[0].text).toContain(
+      'expected_count=2 для точного плана, затем confirm=true и confirmation_token'
+    );
     expect(preview.content[0].text).toContain('Бета (aaaaaaaa-0000-0000-0000-000000000002)');
     expect(preview.structuredContent?.names).toEqual(['Альфа', 'Бета']);
     expect(calls.deleted).toHaveLength(0);
@@ -271,7 +300,11 @@ describe('bpm_delete_by_filter: за два вызова', () => {
       confirm: true,
     });
     expect(res.structuredContent?.succeeded).toEqual([]);
-    expect(res.structuredContent?.failed).toHaveLength(2);
+    expect(res.structuredContent?.failed).toHaveLength(1);
+    expect(res.structuredContent?.outcomes).toEqual([
+      expect.objectContaining({ state: 'failed' }),
+      expect.objectContaining({ state: 'not_executed' }),
+    ]);
     expect(res.isError).toBe(true);
   });
 
@@ -283,7 +316,11 @@ describe('bpm_delete_by_filter: за два вызова', () => {
       expected_count: 2,
       confirm: true,
     });
-    expect(res.structuredContent?.succeeded).toEqual([FOUND[1].Id]);
+    expect(res.structuredContent?.succeeded).toEqual([]);
+    expect(res.structuredContent?.outcomes).toEqual([
+      expect.objectContaining({ state: 'failed' }),
+      expect.objectContaining({ state: 'not_executed' }),
+    ]);
     expect(res.structuredContent?.failed).toHaveLength(1);
     expect(res.isError).toBe(true);
   });

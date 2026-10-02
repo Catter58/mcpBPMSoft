@@ -1,3 +1,4 @@
+import { duplicateFieldsOutputShape, findDuplicatesByFields } from './analytics-tools.js';
 /**
  * MCP Tools: дедупликация
  *
@@ -16,7 +17,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import type { ServiceContainer } from './init-tool.js';
 import type { EntityMetadata } from '../types/index.js';
-import { formatToolError, isQueryUnsupportedError } from '../utils/errors.js';
+import { BpmApiError, formatToolError, isQueryUnsupportedError } from '../utils/errors.js';
 import { getTool } from './registry.js';
 import {
   notInitialized,
@@ -29,7 +30,22 @@ import { criterionSchema } from './_schemas.js';
 import { getDisplayColumn } from '../utils/display.js';
 import { containsExpression, escapeODataString, guidLiteral, isSafeIdentifier } from '../utils/odata.js';
 import { isTolowerSupported, markTolowerUnsupported } from '../utils/server-capabilities.js';
-import { confirmParam, confirmationRequired } from '../utils/confirm.js';
+import {
+  confirmParam,
+  confirmationTokenParam,
+  confirmationResponse,
+  createConfirmationPlan,
+  consumeConfirmationPlan,
+  operationFingerprint,
+} from '../utils/confirm.js';
+import {
+  recordId,
+  recordEtag,
+  previewRecordSummary,
+  concurrencyProtection,
+  writeFailureState,
+  writeToolError,
+} from '../utils/write-safety.js';
 import type { Criterion } from '../utils/filter-compiler.js';
 import type { DedupKind, DedupRecord, DuplicateLevel, DuplicatePair } from '../dedup/types.js';
 import {
@@ -401,6 +417,159 @@ async function countReferences(
   return { counts: results.filter((r) => r.count > 0), failed: [...failed] };
 }
 
+/** OData transport annotations differ between collection rows and entity responses. Keep the record version. */
+function mergeSnapshot(record: Record<string, unknown>): Record<string, unknown> {
+  const snapshot = Object.fromEntries(
+    Object.entries(record).filter(
+      ([key]) => key !== '__metadata' && (!key.includes('@odata.') || key === '@odata.etag')
+    )
+  );
+  const etag = recordEtag(record);
+  if (etag !== undefined) snapshot['@odata.etag'] = etag;
+  return snapshot;
+}
+
+interface MergeReference {
+  source: ReferenceSource;
+  duplicateId: string;
+  record: Record<string, unknown>;
+  writable: boolean;
+}
+interface MergeOutcome {
+  step: 'fill' | 'repoint' | 'delete';
+  collection: string;
+  id: string;
+  fields?: string[];
+  state: 'succeeded' | 'failed' | 'not_executed' | 'outcome_unknown';
+  error?: string;
+}
+
+/** Read-only discovery may run concurrently; mutations use the confirmed snapshots sequentially. */
+async function collectMergeReferences(
+  services: ServiceContainer,
+  collection: string,
+  duplicateIds: string[],
+  maxReferences: number
+): Promise<{ rows: MergeReference[]; failed: string[]; skipped: string[] }> {
+  const { sources, skipped } = await referenceSources(services, collection, false);
+  const skippedKeys = new Set(skipped);
+  const graph = await services.metadataManager.getLookupGraph();
+  const blocked = (graph.incoming.get(collection) ?? [])
+    .filter((edge) => skippedKeys.has(`${edge.from}.${edge.field}`))
+    .map((edge) => ({ collection: edge.from, field: edge.field, nav: edge.nav }));
+  const jobs = [
+    ...sources.map((source) => ({ source, writable: true })),
+    ...blocked.map((source) => ({ source, writable: false })),
+  ]
+    .flatMap((job) => duplicateIds.map((duplicateId) => ({ ...job, duplicateId })))
+    .sort((a, b) =>
+      `${a.source.collection}.${a.source.field}.${a.duplicateId}`.localeCompare(
+        `${b.source.collection}.${b.source.field}.${b.duplicateId}`
+      )
+    );
+  const pages = await mapLimit(jobs, 8, async (job) => {
+    const label = `${job.source.collection}.${job.source.field}`;
+    try {
+      const query = {
+        $filter: referenceFilter(job.source, job.duplicateId, services.config.odata_version),
+        $orderby: 'Id',
+        $top: maxReferences + 1,
+      };
+      const read = (count: boolean) =>
+        services.odataClient.getRecords<Record<string, unknown>>(
+          job.source.collection,
+          { ...query, ...(count ? { $count: true } : {}) },
+          true,
+          maxReferences + 1
+        );
+      // Some BPMSoft sources support paginated reads but reject inline count. Both attempts are reads.
+      const page = await read(true).catch(() => read(false));
+      const ids = page.value.map(recordId);
+      if (
+        page.value.length > maxReferences ||
+        page['@odata.nextLink'] ||
+        (page as unknown as { __next?: string }).__next ||
+        (page['@odata.count'] !== undefined && page['@odata.count'] !== page.value.length) ||
+        new Set(ids.map((id) => id.toLowerCase())).size !== ids.length
+      ) {
+        throw new BpmApiError(
+          `Нельзя доказать полный состав ссылок ${label}; уточните предел или доступ.`,
+          400,
+          collection,
+          undefined,
+          undefined,
+          undefined,
+          'validation'
+        );
+      }
+      for (const record of page.value) {
+        if (
+          typeof record[job.source.field] !== 'string' ||
+          String(record[job.source.field]).toLowerCase() !== job.duplicateId.toLowerCase()
+        ) {
+          throw new BpmApiError(
+            `Ссылка ${label} не соответствует выбранному дублю.`,
+            409,
+            collection,
+            undefined,
+            undefined,
+            undefined,
+            'validation'
+          );
+        }
+      }
+      return {
+        rows: page.value
+          .sort((a, b) => recordId(a).localeCompare(recordId(b)))
+          .map((record) => ({ ...job, record })),
+        failed: [] as string[],
+      };
+    } catch (error) {
+      return { rows: [] as MergeReference[], failed: [`${label}: ${errorText(error)}`] };
+    }
+  });
+  return {
+    rows: pages.flatMap((page) => page.rows),
+    failed: [...new Set(pages.flatMap((page) => page.failed))],
+    skipped,
+  };
+}
+
+function groupedMergeWrites(
+  references: MergeReference[]
+): Array<{ collection: string; id: string; record: Record<string, unknown>; fields: string[] }> {
+  const grouped = new Map<
+    string,
+    { collection: string; id: string; record: Record<string, unknown>; fields: string[] }
+  >();
+  for (const reference of references.filter((reference) => reference.writable)) {
+    const id = recordId(reference.record);
+    const key = `${reference.source.collection}:${id.toLowerCase()}`;
+    const existing = grouped.get(key);
+    if (existing) {
+      if (
+        operationFingerprint(mergeSnapshot(existing.record)) !==
+        operationFingerprint(mergeSnapshot(reference.record))
+      )
+        throw new BpmApiError(
+          'Связанная запись изменилась во время построения плана. Получите план заново.',
+          409,
+          reference.source.collection
+        );
+      if (!existing.fields.includes(reference.source.field)) existing.fields.push(reference.source.field);
+    } else
+      grouped.set(key, {
+        collection: reference.source.collection,
+        id,
+        record: reference.record,
+        fields: [reference.source.field],
+      });
+  }
+  return [...grouped.values()]
+    .map((write) => ({ ...write, fields: write.fields.sort() }))
+    .sort((a, b) => `${a.collection}:${a.id}`.localeCompare(`${b.collection}:${b.id}`));
+}
+
 const levelAtLeast = (level: DuplicateLevel, min: DuplicateLevel) =>
   LEVELS.indexOf(level) <= LEVELS.indexOf(min);
 
@@ -444,6 +613,14 @@ function registerFindDuplicates(server: McpServer, services: ServiceContainer): 
       title: meta.title,
       description: meta.description,
       inputSchema: {
+        fields: z
+          .array(z.string().min(1).max(256))
+          .min(1)
+          .max(8)
+          .optional()
+          .describe(
+            'Явные поля совместного нормализованного ключа. Без fields — профильный анализ email, телефонов, ИНН и названия.'
+          ),
         collection: z
           .string()
           .describe('Коллекция: Contact, Account, Lead или любая другая (имя или название)'),
@@ -483,26 +660,55 @@ function registerFindDuplicates(server: McpServer, services: ServiceContainer): 
       },
       outputSchema: {
         collection: z.string(),
-        kind: z.string(),
-        compared_by: z.array(z.string()),
-        scanned: z.number().int(),
-        truncated: z.boolean(),
-        counts: z.object({ exact: z.number().int(), likely: z.number().int(), possible: z.number().int() }),
-        groups: z.array(
-          z.object({
-            level: z.enum(LEVELS),
-            score: z.number(),
-            master_id: z.string(),
-            reasons: z.array(z.string()),
-            conflicts: z.array(z.string()),
-            records: z.array(groupRecordShape),
-          })
-        ),
-        notes: z.array(z.string()),
+        success: z.boolean().optional(),
+        fields: z.array(z.string()).optional(),
+        complete: z.boolean().optional(),
+        scanned_count: z.number().int().optional(),
+        total_count: z.number().int().optional(),
+        has_more: z.boolean().optional(),
+        truncated_groups: z.boolean().optional(),
+        observed_group_count: z.number().int().optional(),
+        observed_duplicate_records: z.number().int().optional(),
+        warnings: z.array(z.string()).optional(),
+        field_labels: z.record(z.string(), z.string()).optional(),
+        kind: z.string().optional(),
+        compared_by: z.array(z.string()).optional(),
+        scanned: z.number().int().optional(),
+        truncated: z.boolean().optional(),
+        counts: z
+          .object({ exact: z.number().int(), likely: z.number().int(), possible: z.number().int() })
+          .optional(),
+        groups: z.union([
+          duplicateFieldsOutputShape.groups,
+          z.array(
+            z.object({
+              level: z.enum(LEVELS),
+              score: z.number(),
+              master_id: z.string(),
+              reasons: z.array(z.string()),
+              conflicts: z.array(z.string()),
+              records: z.array(groupRecordShape),
+            })
+          ),
+        ]),
+        notes: z.array(z.string()).optional(),
       },
       annotations: meta.annotations,
     },
     async (params): Promise<CallToolResult> => {
+      if (params.fields) {
+        if (params.filter || params.min_level || params.related_counts !== undefined)
+          return {
+            isError: true,
+            content: [
+              {
+                type: 'text',
+                text: 'fields задаёт точный ключ; filter, min_level и related_counts относятся к профильному анализу. Для ключа передайте criteria.',
+              },
+            ],
+          };
+        return findDuplicatesByFields(services, params);
+      }
       if (!services.initialized) return notInitialized();
       try {
         await services.authManager.ensureAuthenticated();
@@ -879,7 +1085,7 @@ function registerMergeDuplicates(server: McpServer, services: ServiceContainer):
           .boolean()
           .optional()
           .describe(
-            'Удалять дубли, даже если часть таблиц со ссылками на стенде не читается (СУБД сама не даст удалить, если ссылки там есть). По умолчанию false'
+            'Совместимый параметр. Неполный обзор ссылок больше не разрешает удаление; keep_duplicates=true позволяет перепривязать проверенные читаемые ссылки.'
           ),
         expected_references: z
           .number()
@@ -891,11 +1097,31 @@ function registerMergeDuplicates(server: McpServer, services: ServiceContainer):
           .number()
           .int()
           .positive()
+          .max(MAX_RECORDS_CAP)
           .optional()
           .describe('Предохранитель: если ссылок больше — отказ (по умолчанию 1000)'),
         confirm: confirmParam,
+        confirmation_token: confirmationTokenParam,
       },
       outputSchema: {
+        confirmation_token: z.string().optional(),
+        concurrency_protection: z.enum(['etag', 'snapshot_only']).optional(),
+        records: z.array(z.object({ id: z.string(), display_value: z.string() })).optional(),
+        reference_records: z
+          .array(z.object({ collection: z.string(), id: z.string(), fields: z.array(z.string()) }))
+          .optional(),
+        outcomes: z
+          .array(
+            z.object({
+              step: z.enum(['fill', 'repoint', 'delete']),
+              collection: z.string(),
+              id: z.string(),
+              fields: z.array(z.string()).optional(),
+              state: z.enum(['succeeded', 'failed', 'not_executed', 'outcome_unknown']),
+              error: z.string().optional(),
+            })
+          )
+          .optional(),
         code: z.string().optional(),
         requires_confirmation: z.boolean().optional(),
         collection: z.string(),
@@ -928,18 +1154,23 @@ function registerMergeDuplicates(server: McpServer, services: ServiceContainer):
     },
     async (params): Promise<CallToolResult> => {
       if (!services.initialized) return notInitialized();
+      let mergeOutcomes: MergeOutcome[] = [];
       try {
         await services.authManager.ensureAuthenticated();
         const collection = await resolveCollectionName(services, params.collection);
-        const version = services.config.odata_version;
-        const master = await resolveRecordId(services, collection, params.master_id);
+        const master = await resolveRecordId(services, collection, params.master_id, { fuzzy: false });
         const duplicateIds: string[] = [];
         for (const raw of params.duplicate_ids) {
-          const { id } = await resolveRecordId(services, collection, raw);
-          if (id === master.id) throw new Error('Основная запись не может быть в списке дублей.');
-          if (!duplicateIds.includes(id)) duplicateIds.push(id);
+          const { id } = await resolveRecordId(services, collection, raw, { fuzzy: false });
+          if (id.toLowerCase() === master.id.toLowerCase())
+            throw new Error('Основная запись не может быть в списке дублей.');
+          if (!duplicateIds.some((existing) => existing.toLowerCase() === id.toLowerCase()))
+            duplicateIds.push(id);
         }
 
+        if (!duplicateIds.length || duplicateIds.length > 20)
+          throw new BpmApiError('Передайте от 1 до 20 UUID дублей.', 400, collection);
+        duplicateIds.sort();
         const entityMeta = await services.metadataManager.getEntityMetadata(collection);
         const masterRecord = await services.odataClient.getRecord<Record<string, unknown>>(
           collection,
@@ -951,16 +1182,40 @@ function registerMergeDuplicates(server: McpServer, services: ServiceContainer):
         const fillFields =
           params.fill_empty_fields === false ? {} : planFillFields(entityMeta, masterRecord, duplicates);
 
-        const { sources, skipped } = await referenceSources(services, collection, false);
-        const { counts, failed: countFailures } = await countReferences(services, sources, duplicateIds);
-        const references = counts.map((c) => ({
-          collection: c.source.collection,
-          field: c.source.field,
-          duplicate_id: c.id,
-          count: c.count,
-        }));
-        const total = references.reduce((sum, r) => sum + r.count, 0);
         const maxReferences = params.max_references ?? 1000;
+        if (!Number.isInteger(maxReferences) || maxReferences < 1 || maxReferences > MAX_RECORDS_CAP)
+          throw new BpmApiError(`max_references должен быть от 1 до ${MAX_RECORDS_CAP}.`, 400, collection);
+        if (
+          recordId(masterRecord).toLowerCase() !== master.id.toLowerCase() ||
+          duplicates.some(
+            (record, index) => recordId(record).toLowerCase() !== duplicateIds[index].toLowerCase()
+          )
+        )
+          throw new BpmApiError('Ответ сервера не соответствует выбранным UUID.', 409, collection);
+        const selection = await collectMergeReferences(services, collection, duplicateIds, maxReferences);
+        const countFailures = selection.failed;
+        const skipped = selection.skipped;
+        const blocked = selection.rows.filter((reference) => !reference.writable);
+        const writable = selection.rows.filter((reference) => reference.writable);
+        const writes = groupedMergeWrites(writable);
+        const referenceCounts = new Map<
+          string,
+          { collection: string; field: string; duplicate_id: string; count: number }
+        >();
+        for (const reference of writable) {
+          const key = `${reference.source.collection}.${reference.source.field}.${reference.duplicateId}`;
+          const existing = referenceCounts.get(key);
+          if (existing) existing.count += 1;
+          else
+            referenceCounts.set(key, {
+              collection: reference.source.collection,
+              field: reference.source.field,
+              duplicate_id: reference.duplicateId,
+              count: 1,
+            });
+        }
+        const references = [...referenceCounts.values()];
+        const total = writable.length;
 
         const plan = {
           collection,
@@ -971,6 +1226,13 @@ function registerMergeDuplicates(server: McpServer, services: ServiceContainer):
           expected_references: total,
           count_failures: countFailures,
           not_repointed: skipped,
+          records: previewRecordSummary([masterRecord, ...duplicates]),
+          concurrency_protection: concurrencyProtection([
+            masterRecord,
+            ...duplicates,
+            ...selection.rows.map((reference) => reference.record),
+          ]),
+          reference_records: writes.map(({ collection, id, fields }) => ({ collection, id, fields })),
         };
         const planLines = [
           `План слияния ${collection}: основная ${master.id}${master.matched ? ` («${master.matched}»)` : ''}; дубли: ${duplicateIds.join(', ')}`,
@@ -985,16 +1247,19 @@ function registerMergeDuplicates(server: McpServer, services: ServiceContainer):
           ...references.map((r) => `  - ${r.collection}.${r.field} (дубль ${r.duplicate_id}): ${r.count}`),
           ...(countFailures.length
             ? [
-                `Не читаются таблицы со ссылками: ${countFailures.length} (${countFailures.slice(0, 5).join('; ')}).`,
-                params.allow_unreadable_sources
-                  ? 'Дубли всё равно будут удалены (allow_unreadable_sources=true); если ссылки там есть, СУБД удаление отклонит.'
-                  : 'Без allow_unreadable_sources=true дубли после перепривязки останутся.',
+                `Неполный или недоступный обзор источников ссылок: ${countFailures.length} (${countFailures.slice(0, 5).join('; ')}).`,
+                'Удаление при неполном обзоре запрещено. keep_duplicates=true позволяет выполнить только проверенные перепривязки.',
               ]
             : []),
           ...(skipped.length
             ? [`Системные ссылки и представления не перепривязываются: ${skipped.length}`]
             : []),
-          params.keep_duplicates ? 'Дубли останутся.' : 'После перепривязки дубли будут удалены.',
+          ...(blocked.length
+            ? [`Непереносимых системных ссылок: ${blocked.length}; удаление дублей запрещено.`]
+            : []),
+          params.keep_duplicates
+            ? 'Дубли останутся.'
+            : 'После перепривязки и контрольного чтения дубли будут удалены.',
         ];
 
         if (total > maxReferences) {
@@ -1014,109 +1279,220 @@ function registerMergeDuplicates(server: McpServer, services: ServiceContainer):
           };
         }
 
-        if (confirmationRequired(params)) {
+        if (!params.keep_duplicates && (countFailures.length || blocked.length)) {
           return {
             content: [
               {
                 type: 'text',
                 text: [
                   ...planLines,
-                  '',
-                  `Ничего не изменено. Для выполнения повторите с confirm=true и expected_references=${total}.`,
+                  'Слияние с удалением не подготовлено: полный безопасный обзор ссылок отсутствует. Можно получить отдельный план с keep_duplicates=true.',
                 ].join('\n'),
               },
             ],
-            structuredContent: { ...plan, code: 'confirm_required', requires_confirmation: true },
+            structuredContent: { ...plan, code: 'reference_selection_incomplete' },
+            isError: true,
           };
         }
-        if (params.expected_references !== total) {
+        const operation = {
+          tool: meta.name,
+          collection,
+          input_master: params.master_id,
+          input_duplicates: params.duplicate_ids,
+          master: mergeSnapshot(masterRecord),
+          duplicates: duplicates.map(mergeSnapshot),
+          fill_fields: fillFields,
+          reference_snapshots: selection.rows.map((reference) => ({
+            ...reference,
+            record: mergeSnapshot(reference.record),
+          })),
+          failed_sources: countFailures,
+          skipped,
+          fill_empty_fields: params.fill_empty_fields !== false,
+          keep_duplicates: params.keep_duplicates === true,
+          allow_unreadable_sources: params.allow_unreadable_sources === true,
+          max_references: maxReferences,
+          expected_references: total,
+        };
+        if (params.confirm !== true)
+          return confirmationResponse(meta.name, planLines, {
+            ...plan,
+            confirmation_token: createConfirmationPlan(services, operation),
+          });
+        if (params.expected_references !== total)
           return {
             content: [
               {
                 type: 'text',
-                text: `Ссылок сейчас ${total}, ожидалось ${params.expected_references ?? 'не указано'}. Слияние отменено: запросите план заново.`,
+                text: `Ссылок сейчас ${total}, ожидалось ${params.expected_references ?? 'не указано'}. Получите новый план.`,
               },
             ],
             structuredContent: { ...plan, code: 'expected_count_mismatch' },
             isError: true,
           };
-        }
+        consumeConfirmationPlan(services, params.confirmation_token, operation);
 
-        // 1. Поля основной записи.
-        const filled = Object.keys(fillFields);
-        if (filled.length) await services.odataClient.updateRecord(collection, master.id, fillFields);
-
-        // 2. Перепривязка: Id ссылающихся записей, затем PATCH каждой.
+        const filled: string[] = [];
         const failed: Array<{ collection: string; id: string; error: string }> = [];
-        let repointed = 0;
-        const sourceByKey = new Map(sources.map((s) => [`${s.collection}.${s.field}`, s]));
-        for (const ref of references) {
-          const source = sourceByKey.get(`${ref.collection}.${ref.field}`) as ReferenceSource;
-          const { rows } = await pageAll(
-            services,
-            ref.collection,
-            { $filter: referenceFilter(source, ref.duplicate_id, version), $select: 'Id' },
-            maxReferences
-          );
-          await mapLimit(rows, 5, async (row) => {
-            try {
-              await services.odataClient.updateRecord(ref.collection, String(row.Id), {
-                [ref.field]: master.id,
-              });
-              repointed += 1;
-            } catch (error) {
-              failed.push({ collection: ref.collection, id: String(row.Id), error: errorText(error) });
-            }
-          });
-        }
-
-        // 3. Удаление дублей — только если всё перепривязано и все ссылки были посчитаны.
         const deleted: string[] = [];
-        const kept: string[] = [];
-        const snapshots: Array<Record<string, unknown>> = [];
-        const safeToDelete =
-          !params.keep_duplicates &&
-          failed.length === 0 &&
-          (countFailures.length === 0 || params.allow_unreadable_sources === true);
-        for (const [index, id] of duplicateIds.entries()) {
-          if (!safeToDelete) {
-            kept.push(id);
-            continue;
+        const snapshots: Record<string, unknown>[] = [];
+        let repointed = 0;
+        let stopped = false;
+        const mutations: Array<{
+          outcome: MergeOutcome;
+          record: Record<string, unknown>;
+          data?: Record<string, unknown>;
+        }> = [];
+        if (Object.keys(fillFields).length)
+          mutations.push({
+            outcome: {
+              step: 'fill',
+              collection,
+              id: master.id,
+              fields: Object.keys(fillFields),
+              state: 'not_executed',
+            },
+            record: masterRecord,
+            data: fillFields,
+          });
+        for (const write of writes)
+          mutations.push({
+            outcome: {
+              step: 'repoint',
+              collection: write.collection,
+              id: write.id,
+              fields: write.fields,
+              state: 'not_executed',
+            },
+            record: write.record,
+            data: Object.fromEntries(write.fields.map((field) => [field, master.id])),
+          });
+        if (!params.keep_duplicates)
+          duplicateIds.forEach((id, index) =>
+            mutations.push({
+              outcome: { step: 'delete', collection, id, state: 'not_executed' },
+              record: duplicates[index],
+            })
+          );
+        mergeOutcomes = mutations.map((mutation) => mutation.outcome);
+        for (const mutation of mutations) {
+          if (stopped) break;
+          const outcome = mutation.outcome;
+          if (outcome.step === 'delete') {
+            // A reference may have been added since confirmation. Do not delete on incomplete or nonempty readback.
+            const remaining = await collectMergeReferences(services, collection, [outcome.id], maxReferences);
+            if (
+              remaining.failed.length ||
+              remaining.rows.length ||
+              remaining.skipped.slice().sort().join('\n') !== skipped.slice().sort().join('\n')
+            ) {
+              const message =
+                'Контрольное чтение обнаружило оставшиеся/новые ссылки или неполный обзор. Дубли не удалены; проверьте результаты и получите новый план.';
+              failed.push({ collection, id: outcome.id, error: message });
+              stopped = true;
+              break;
+            }
+            // Deletion is allowed only while every duplicate still matches the confirmed snapshot.
+            try {
+              const current = await services.odataClient.getRecord<Record<string, unknown>>(
+                collection,
+                outcome.id
+              );
+              if (
+                operationFingerprint(mergeSnapshot(current)) !==
+                operationFingerprint(mergeSnapshot(mutation.record))
+              )
+                throw new BpmApiError(
+                  'Дубли изменились во время слияния. Удаление отменено.',
+                  409,
+                  collection
+                );
+            } catch (error) {
+              failed.push({ collection, id: outcome.id, error: errorText(error) });
+              stopped = true;
+              break;
+            }
           }
           try {
-            await services.odataClient.deleteRecord(collection, id);
-            deleted.push(id);
-            snapshots.push(duplicates[index]);
+            if (recordEtag(mutation.record) === undefined) {
+              const current = await services.odataClient.getRecord<Record<string, unknown>>(
+                outcome.collection,
+                outcome.id
+              );
+              if (
+                operationFingerprint(mergeSnapshot(current)) !==
+                operationFingerprint(mergeSnapshot(mutation.record))
+              )
+                throw new BpmApiError(
+                  'Запись изменилась перед выполнением шага слияния.',
+                  409,
+                  outcome.collection
+                );
+            }
+            if (outcome.step === 'delete') {
+              await services.odataClient.deleteRecord(outcome.collection, outcome.id, {
+                expectedEtag: recordEtag(mutation.record),
+              });
+              deleted.push(outcome.id);
+              snapshots.push(mutation.record);
+            } else {
+              await services.odataClient.updateRecord(outcome.collection, outcome.id, mutation.data!, {
+                expectedEtag: recordEtag(mutation.record),
+              });
+              if (outcome.step === 'fill') filled.push(...(outcome.fields ?? []));
+              else repointed += (outcome.fields ?? []).length;
+            }
+            outcome.state = 'succeeded';
           } catch (error) {
-            kept.push(id);
-            failed.push({ collection, id, error: `удаление: ${errorText(error)}` });
+            outcome.state = writeFailureState(error);
+            outcome.error = errorText(error);
+            failed.push({ collection: outcome.collection, id: outcome.id, error: outcome.error });
+            stopped = true;
           }
         }
-
+        const kept = duplicateIds.filter((id) => !deleted.includes(id));
         const lines = [
           `Слияние ${collection} → ${master.id}: заполнено полей ${filled.length}, перепривязано ${repointed} из ${total}, удалено дублей ${deleted.length}.`,
           ...(kept.length
             ? [
-                `Оставлены: ${kept.join(', ')}` +
-                  (params.keep_duplicates
-                    ? '.'
-                    : ' — были ошибки перепривязки, подсчёта или удаления; дубли не тронуты ради сохранности данных.'),
+                `Оставлены: ${kept.join(', ')}${params.keep_duplicates ? ' (keep_duplicates=true).' : '; удаление не завершено — проверьте outcomes перед новым планом.'}`,
               ]
             : []),
-          ...failed.slice(0, 20).map((f) => `  ! ${f.collection}(${f.id}): ${f.error}`),
-          ...(snapshots.length
-            ? ['', 'Снимки удалённых записей — в structuredContent.result.snapshots.']
+          ...(countFailures.length
+            ? [
+                `Обзор ссылок остаётся неполным: ${countFailures.length} (${countFailures.slice(0, 5).join('; ')}).`,
+                'Выполнение ограничено проверенными ссылками; дубли сохранены. Непроверенные источники перечислены в count_failures.',
+              ]
             : []),
+          ...(mergeOutcomes.some((outcome) => outcome.state === 'outcome_unknown')
+            ? [
+                'Исход одной операции неопределён. Зависимые изменения остановлены; сначала прочитайте соответствующую запись по UUID.',
+              ]
+            : []),
+          ...failed
+            .slice(0, 20)
+            .map((failure) => `  ! ${failure.collection}(${failure.id}): ${failure.error}`),
+          ...(snapshots.length ? ['Снимки удалённых записей — в structuredContent.result.snapshots.'] : []),
         ];
-
         return {
           content: [{ type: 'text', text: lines.join('\n') }],
-          structuredContent: { ...plan, result: { filled, repointed, failed, deleted, kept, snapshots } },
-          isError: failed.length > 0 || countFailures.length > 0 || (total > 0 && repointed === 0),
+          structuredContent: {
+            ...plan,
+            outcomes: mergeOutcomes,
+            result: { filled, repointed, failed, deleted, kept, snapshots },
+          },
+          isError: failed.length > 0 || mergeOutcomes.some((outcome) => outcome.state !== 'succeeded'),
         };
       } catch (error) {
-        const toolError = formatToolError(error, params.collection);
-        return { content: [{ type: 'text', text: JSON.stringify(toolError, null, 2) }], isError: true };
+        const toolError = {
+          ...writeToolError(error, params.collection),
+          ...(mergeOutcomes.length ? { outcomes: mergeOutcomes } : {}),
+        };
+        return {
+          content: [{ type: 'text', text: JSON.stringify(toolError, null, 2) }],
+          structuredContent: toolError,
+          isError: true,
+        };
       }
     }
   );

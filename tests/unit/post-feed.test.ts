@@ -41,6 +41,13 @@ interface StubState {
 
 function buildStubServices(state: StubState): ServiceContainer {
   const odataClient = {
+    async getRecord(_collection: string, id: string) {
+      return {
+        Id: id,
+        EntityId: '11111111-2222-3333-4444-555555555555',
+        EntitySchemaUId: '16be3651-8fe2-4159-8dd0-a803d4683dd3',
+      };
+    },
     async createRecord(collection: string, data: Record<string, unknown>) {
       state.createCalls.push({ collection, data });
       return { Id: 'feed-1', ...data };
@@ -48,6 +55,9 @@ function buildStubServices(state: StubState): ServiceContainer {
   };
 
   const metadataManager = {
+    async getEntityMetadata() {
+      return { properties: [] };
+    },
     async resolveCollectionReference(query: string) {
       return { name: query };
     },
@@ -64,7 +74,9 @@ function buildStubServices(state: StubState): ServiceContainer {
     authManager: authManager as unknown as ServiceContainer['authManager'],
     odataClient: odataClient as unknown as ServiceContainer['odataClient'],
     metadataManager: metadataManager as unknown as ServiceContainer['metadataManager'],
-    lookupResolver: null! as ServiceContainer['lookupResolver'],
+    lookupResolver: {
+      resolveDataLookups: async (_collection: string, data: Record<string, unknown>) => ({ data, notes: [] }),
+    } as unknown as ServiceContainer['lookupResolver'],
     processEngine: null! as ServiceContainer['processEngine'],
     initialized: true,
   };

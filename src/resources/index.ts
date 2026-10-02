@@ -16,7 +16,8 @@ import { ResourceTemplate } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { ReadResourceResult } from '@modelcontextprotocol/sdk/types.js';
 import type { ServiceContainer } from '../tools/init-tool.js';
 import type { EntityMetadata, EntityProperty } from '../types/index.js';
-import { enrichLookups } from '../utils/display.js';
+import { canonicalCollection, presentRecords, readSelect } from '../read/record-presentation.js';
+import { renderRecordsText } from '../utils/render.js';
 
 const NOT_INITIALIZED_MSG = 'Сервер не инициализирован, вызовите bpm_init';
 
@@ -46,7 +47,10 @@ function summarizeProperty(p: EntityProperty): Record<string, unknown> {
   const out: Record<string, unknown> = {
     name: p.name,
     type: p.type,
-    required: !p.nullable,
+    required: p.required ?? null,
+    nullable: p.nullable,
+    requirement_source: p.requirementSource ?? null,
+    default_hint: p.defaultHint ?? null,
     isLookup: p.isLookup,
   };
   if (p.caption) out.caption = p.caption;
@@ -67,33 +71,6 @@ function buildSchemaCard(metadata: EntityMetadata): Record<string, unknown> {
   };
 }
 
-function buildEntityMarkdown(collection: string, id: string, record: Record<string, unknown>): string {
-  const lines: string[] = [];
-  lines.push(`# ${collection} ${id}`);
-  lines.push('');
-  const name = (record['Name'] ?? record['Title'] ?? record['Subject']) as string | undefined;
-  if (name) lines.push(`**${name}**`);
-  lines.push('');
-  lines.push('| Поле | Значение |');
-  lines.push('| --- | --- |');
-  const keys = Object.keys(record).filter((k) => !k.startsWith('@odata.'));
-  for (const key of keys.slice(0, 30)) {
-    const value = record[key];
-    const display =
-      value === null || value === undefined
-        ? '—'
-        : typeof value === 'object'
-          ? JSON.stringify(value)
-          : String(value);
-    lines.push(`| ${key} | ${display} |`);
-  }
-  if (keys.length > 30) {
-    lines.push('');
-    lines.push(`_... и ещё ${keys.length - 30} полей в JSON-content._`);
-  }
-  return lines.join('\n');
-}
-
 export function registerResources(server: McpServer, services: ServiceContainer): void {
   // bpmsoft://collections — static
   server.registerResource(
@@ -107,6 +84,7 @@ export function registerResources(server: McpServer, services: ServiceContainer)
     },
     async (uri) => {
       ensureInit(services);
+      await services.authManager.ensureAuthenticated();
       const sets = await services.metadataManager.getEntitySets();
       const payload = {
         count: sets.length,
@@ -130,6 +108,7 @@ export function registerResources(server: McpServer, services: ServiceContainer)
     },
     async (uri, variables) => {
       ensureInit(services);
+      await services.authManager.ensureAuthenticated();
       const rawName = variables.name;
       const name = Array.isArray(rawName) ? rawName[0] : rawName;
       if (!name) {
@@ -184,6 +163,7 @@ export function registerResources(server: McpServer, services: ServiceContainer)
     },
     async (uri, variables) => {
       ensureInit(services);
+      await services.authManager.ensureAuthenticated();
       const rawName = variables.name;
       const name = Array.isArray(rawName) ? rawName[0] : rawName;
       if (!name) {
@@ -203,11 +183,12 @@ export function registerResources(server: McpServer, services: ServiceContainer)
     {
       title: 'Запись BPMSoft',
       description:
-        'Полная запись по UUID. Возвращает JSON-содержимое и markdown-карточку с ключевыми полями.',
+        'Запись по UUID. Возвращает основные исходные поля и карточку с подписями и названиями связей. Дополнительные поля доступны через bpm_get_record.',
       mimeType: 'application/json',
     },
     async (uri, variables) => {
       ensureInit(services);
+      await services.authManager.ensureAuthenticated();
       const rawCollection = variables.collection;
       const rawId = variables.id;
       const collection = Array.isArray(rawCollection) ? rawCollection[0] : rawCollection;
@@ -215,16 +196,25 @@ export function registerResources(server: McpServer, services: ServiceContainer)
       if (!collection || !id) {
         throw new Error('В URI bpmsoft://entity/{collection}/{id} не указаны collection и/или id');
       }
-      const raw = await services.odataClient.getRecord<Record<string, unknown>>(collection, id);
-      const [record] = await enrichLookups([raw], collection, {
-        metadataManager: services.metadataManager,
-        odataClient: services.odataClient,
-        odataVersion: services.config.odata_version,
+      const canonical = await canonicalCollection(services, collection);
+      const record = await services.odataClient.getRecord<Record<string, unknown>>(canonical, id, {
+        $select: await readSelect(services, canonical),
       });
+      const presentation = await presentRecords(services, canonical, [record]);
       return {
         contents: [
-          jsonContent(uri.href, record),
-          markdownContent(uri.href, buildEntityMarkdown(collection, id, record)),
+          jsonContent(uri.href, {
+            collection: canonical,
+            id,
+            record,
+            display_record: presentation.displayRecords[0],
+            field_labels: presentation.fieldLabels,
+            warnings: presentation.warnings,
+          }),
+          markdownContent(
+            uri.href,
+            renderRecordsText(presentation.displayRecords, { collection: canonical, format: 'markdown' })
+          ),
         ],
       };
     }

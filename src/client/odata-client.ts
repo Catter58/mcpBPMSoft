@@ -7,13 +7,14 @@
  */
 
 import type {
-  BpmConfig,
-  HttpRequestOptions,
   HttpResponse,
+  HttpRequestOptions,
+  BpmConfig,
   ODataCollectionResponse,
   ODataVersion,
 } from '../types/index.js';
 import { HttpClient } from './http-client.js';
+import { getAuthCacheScope } from '../auth/request-context.js';
 import { getODataBaseUrl } from '../config.js';
 import { BpmApiError, isQueryUnsupportedError } from '../utils/errors.js';
 import { getBatchSupport, setBatchSupport } from '../utils/server-capabilities.js';
@@ -43,10 +44,40 @@ export interface NormalizedCollection<T> {
   count?: number;
 }
 
+export interface WriteOptions {
+  expectedEtag?: string;
+  returnRepresentation?: boolean;
+}
+export interface CreateOptions {
+  id?: string;
+}
+export interface CreateOutcome<T> {
+  record: T;
+  created: boolean | null;
+}
+export interface BinaryFieldOptions {
+  fieldType?: 'Edm.Binary' | 'Edm.Stream';
+}
+export interface ClientBatchResponse {
+  id: string;
+  status: number;
+  body: unknown;
+  state: 'completed' | 'failed' | 'not_executed' | 'outcome_unknown';
+}
+export interface ClientBatchRequest {
+  method: string;
+  url: string;
+  headers?: Record<string, string>;
+  body?: Record<string, unknown>;
+  /** Metadata-known Decimal/Int64 fields requiring lossless numeric JSON in native batch bodies. */
+  numericFields?: readonly string[];
+}
+
 export class ODataClient {
   private baseUrl: string;
   private origin: string;
   private odataVersion: ODataVersion;
+  private nativeCollationScopes = new Map<string, number>();
 
   constructor(
     private config: BpmConfig,
@@ -70,63 +101,102 @@ export class ODataClient {
     autoPaginate: boolean = false,
     maxRecords?: number
   ): Promise<ODataCollectionResponse<T>> {
-    let response: HttpResponse<ODataCollectionResponse<T>>;
+    const limit = validateLimit(maxRecords);
+    const stableQuery = { ...query, $orderby: stableOrder(query?.$orderby) };
+    if (Number.isFinite(limit)) stableQuery.$top = Math.min(query?.$top ?? this.config.page_size, limit + 1);
+    else if (stableQuery.$top === undefined) stableQuery.$top = this.config.page_size;
+    const initialUrl = this.buildCollectionUrl(collection, stableQuery);
+    const result = await this.readPage<T>(initialUrl);
+    let delivered = 0;
+    let page = result;
+    const values: T[] = [];
+    const visited = new Set<string>([initialUrl]);
+    while (true) {
+      const remaining = limit - delivered;
+      const accepted = page.value.slice(0, remaining);
+      values.push(...accepted);
+      delivered += accepted.length;
+      let continuation = page['@odata.nextLink'];
+      if (accepted.length < page.value.length) {
+        // A backend may ignore $top. Advance from the original stable query,
+        // rather than skipping the unreturned tail of this server page.
+        continuation = offsetContinuation(initialUrl, (query?.$skip ?? 0) + delivered);
+      }
+      result['@odata.nextLink'] = continuation;
+      if (!autoPaginate || !continuation || delivered >= limit) break;
+      const nextUrl = this.validateNextLink(collection, continuation);
+      if (visited.has(nextUrl))
+        throw new BpmApiError('Сервер вернул повторяющуюся ссылку пагинации.', 502, collection);
+      visited.add(nextUrl);
+      page = await this.readPage<T>(nextUrl);
+      if (page.warnings?.length)
+        result.warnings = [...new Set([...(result.warnings ?? []), ...page.warnings])];
+      if (page.matching) result.matching = page.matching;
+    }
+    result.value = values;
+    if (!result['@odata.nextLink']) delete result['@odata.nextLink'];
+    return result;
+  }
+
+  /** Resume the server-owned continuation, restricted to the same collection. */
+  async getNextPage<T = Record<string, unknown>>(
+    collection: string,
+    nextLink: string,
+    maxRecords?: number
+  ): Promise<ODataCollectionResponse<T>> {
+    const limit = validateLimit(maxRecords);
+    const url = this.validateNextLink(collection, nextLink);
+    const result = await this.readPage<T>(url);
+    if (result.value.length > limit) {
+      const parsed = new URL(url);
+      const skip = Number(parsed.searchParams.get('$skip') ?? 0);
+      if (parsed.searchParams.has('$skiptoken')) {
+        // Re-fetch this token page and retain its in-page position in a private
+        // fragment. The fragment is never sent to the backend.
+        result['@odata.nextLink'] = withPageOffset(url, limit);
+      } else result['@odata.nextLink'] = offsetContinuation(url, skip + limit);
+      result.value = result.value.slice(0, limit);
+    }
+    return result;
+  }
+
+  private async readPage<T>(url: string): Promise<ODataCollectionResponse<T>> {
+    const parsed = new URL(url);
+    const fragmentOffset = parsed.hash.startsWith('#mcp-offset=') ? Number(parsed.hash.slice(12)) : 0;
+    parsed.hash = '';
+    let read: { response: HttpResponse<unknown>; fallback: boolean };
+    let countDetails: Awaited<ReturnType<ODataClient['getCountWithDetails']>> | undefined;
+    let countWarning: string | undefined;
     try {
-      response = await this.httpClient.request<ODataCollectionResponse<T>>({
-        method: 'GET',
-        url: this.buildCollectionUrl(collection, query),
-        contentKind: 'crud',
-      });
+      read = await this.readCompatible<unknown>(parsed.toString(), 'crud');
     } catch (error) {
-      if (query?.$count !== true || !isQueryUnsupportedError(error)) throw error;
-      // Тестовый стенд: $count=true вместе с $filter по guid-колонке рвёт поток (200, 0 байт).
-      // Берём страницу без $count, а итог — отдельным /$count, если сервер его осилит.
-      response = await this.httpClient.request<ODataCollectionResponse<T>>({
-        method: 'GET',
-        url: this.buildCollectionUrl(collection, { ...query, $count: undefined }),
-        contentKind: 'crud',
-      });
-      let countNote: string;
+      if (parsed.searchParams.get('$count') !== 'true' || !isQueryUnsupportedError(error)) throw error;
+      // Retry a read without the unsupported inline count; never replay a write.
+      parsed.searchParams.delete('$count');
+      read = await this.readCompatible<unknown>(parsed.toString(), 'crud');
+      const collection = decodeURIComponent(parsed.pathname.split('/').at(-1)!);
       try {
-        const total = await this.getCount(collection, query.$filter);
-        response.data['@odata.count'] = total;
-        countNote = `итог получен через /$count: ${total}`;
-      } catch (countError) {
-        countNote = `/$count тоже не сработал (${countError instanceof Error ? countError.message : String(countError)}), итог не указан`;
-      }
-      console.error(
-        `[ODataClient] ${collection}: $count=true отвергнут (${error instanceof Error ? error.message : String(error)}), страница получена без $count; ${countNote}`
-      );
-    }
-
-    const result = response.data;
-    const limit = maxRecords ?? Infinity;
-
-    if (autoPaginate) {
-      let nextLink = pickNextLink(result);
-      while (nextLink && result.value.length < limit) {
-        const nextUrl = this.resolveNextLink(nextLink);
-        const next: HttpResponse<ODataCollectionResponse<T>> = await this.httpClient.request<
-          ODataCollectionResponse<T>
-        >({
-          method: 'GET',
-          url: nextUrl,
-          contentKind: 'crud',
-        });
-        result.value.push(...next.data.value);
-        nextLink = pickNextLink(next.data);
-        if (nextLink) {
-          // expose latest nextLink so callers can continue if hit maxRecords
-          result['@odata.nextLink'] = nextLink;
-        } else {
-          delete result['@odata.nextLink'];
-        }
-      }
-      if (result.value.length > limit) {
-        result.value = result.value.slice(0, limit);
+        countDetails = await this.getCountWithDetails(
+          collection,
+          parsed.searchParams.get('$filter') ?? undefined
+        );
+        countWarning = 'Встроенный $count=true не поддержан; итог получен отдельным запросом /$count.';
+      } catch {
+        countWarning = 'Встроенный $count=true и отдельный /$count недоступны; общий итог не указан.';
       }
     }
-
+    const result = normalizeCollection<T>(read.response.data);
+    if (read.fallback) {
+      result.warnings = [COLLATION_WARNING];
+      result.matching = 'platform_collation';
+    }
+    if (countDetails) {
+      result['@odata.count'] = countDetails.count;
+      result.warnings = [...new Set([...(result.warnings ?? []), ...countDetails.warnings])];
+      if (countDetails.matching) result.matching = countDetails.matching;
+    }
+    if (countWarning) result.warnings = [...(result.warnings ?? []), countWarning];
+    if (fragmentOffset) result.value = result.value.slice(fragmentOffset);
     return result;
   }
 
@@ -142,39 +212,190 @@ export class ODataClient {
       url,
       contentKind: 'crud',
     });
-    return response.data;
+    const record = unwrapSingle<T>(response.data);
+    if (record && typeof record === 'object' && response.headers.etag) {
+      return { ...record, '@odata.etag': response.headers.etag };
+    }
+    return record;
   }
 
   /** Get record count */
-  async getCount(collection: string, filter?: string): Promise<number> {
+  async getCount(collection: string, filter?: string, warnings?: string[]): Promise<number> {
+    const result = await this.getCountWithDetails(collection, filter);
+    warnings?.push(...result.warnings);
+    return result.count;
+  }
+
+  async getCountWithDetails(
+    collection: string,
+    filter?: string
+  ): Promise<{ count: number; warnings: string[]; matching?: 'platform_collation' }> {
     const params = new URLSearchParams();
     if (filter) params.set('$filter', filter);
     const url = `${this.buildCollectionPath(collection)}/$count${params.toString() ? '?' + params.toString() : ''}`;
-    const response = await this.httpClient.request<string>({
-      method: 'GET',
-      url,
-      contentKind: 'count',
-      responseType: 'text',
-    });
-    const count = parseInt(String(response.data).trim(), 10);
-    if (isNaN(count)) {
-      throw new BpmApiError(`Невалидный ответ $count: ${response.data}`, response.status, collection);
+    const { response, fallback } = await this.readCompatible<string>(url, 'count', 'text');
+    const count = normalizeCount(response.data, response.status, collection);
+    return {
+      count,
+      warnings: fallback ? [COLLATION_WARNING] : [],
+      ...(fallback ? { matching: 'platform_collation' as const } : {}),
+    };
+  }
+
+  private async readCompatible<T>(
+    url: string,
+    contentKind: 'crud' | 'count',
+    responseType?: 'text'
+  ): Promise<{ response: HttpResponse<T>; fallback: boolean }> {
+    const parsed = new URL(url);
+    const filter = parsed.searchParams.get('$filter');
+    const plain = filter ? removeLowercaseFunctions(filter) : undefined;
+    const eligible = !!filter && plain !== undefined && plain !== filter;
+    const scope = `${parsed.origin}${parsed.pathname.replace(/\/\$count$/, '')}:${getAuthCacheScope() || this.config.username || ''}`;
+    const now = Date.now();
+    for (const [key, expires] of this.nativeCollationScopes)
+      if (expires <= now) this.nativeCollationScopes.delete(key);
+    const request = (target: string) =>
+      this.httpClient.request<T>({ method: 'GET', url: target, contentKind, responseType });
+    const verified = (response: HttpResponse<T>) => {
+      if (contentKind === 'crud') normalizeCollection(response.data);
+      else normalizeCount(response.data, response.status);
+      return response;
+    };
+    if (eligible && this.nativeCollationScopes.has(scope)) {
+      parsed.searchParams.set('$filter', plain!);
+      try {
+        return { response: verified(await request(parsed.toString())), fallback: true };
+      } catch (error) {
+        this.nativeCollationScopes.delete(scope);
+        throw error;
+      }
     }
-    return count;
+    try {
+      return { response: await request(url), fallback: false };
+    } catch (error) {
+      if (!eligible || !isLowercaseCompatibilityError(error)) throw error;
+      parsed.searchParams.set('$filter', plain!);
+      try {
+        const response = verified(await request(parsed.toString()));
+        if (this.nativeCollationScopes.size < 1000)
+          this.nativeCollationScopes.set(scope, now + this.config.lookup_cache_ttl * 1000);
+        return { response, fallback: true };
+      } catch {
+        throw error;
+      }
+    }
   }
 
   async createRecord<T = Record<string, unknown>>(
     collection: string,
-    data: Record<string, unknown>
+    data: Record<string, unknown>,
+    options?: CreateOptions
   ): Promise<T> {
-    const url = this.buildCollectionPath(collection);
-    const response = await this.httpClient.request<T>({
-      method: 'POST',
-      url,
-      body: data,
-      contentKind: 'crud',
-    });
-    return response.data;
+    return (await this.createRecordWithOutcome<T>(collection, data, options)).record;
+  }
+
+  async createRecordWithOutcome<T = Record<string, unknown>>(
+    collection: string,
+    data: Record<string, unknown>,
+    options?: CreateOptions
+  ): Promise<CreateOutcome<T>> {
+    const id = options?.id;
+    if (id) {
+      assertGuid(id, 'id');
+      if (data.Id !== undefined && String(data.Id).toLowerCase() !== id.toLowerCase()) {
+        throw new BpmApiError(
+          'Id не соответствует идентификатору повторяемой операции.',
+          400,
+          collection,
+          undefined,
+          undefined,
+          undefined,
+          'idempotency_conflict'
+        );
+      }
+      const existing = await this.findCreation<T>(collection, id, data);
+      if (existing) return { record: existing, created: false };
+    }
+    const payload = id ? { ...data, Id: id } : data;
+    try {
+      const response = await this.httpClient.request<T>({
+        method: 'POST',
+        url: this.buildCollectionPath(collection),
+        body: payload,
+        contentKind: 'crud',
+        operation: 'mutation',
+      });
+      const record = unwrapSingle<T>(response.data);
+      if (
+        id &&
+        record &&
+        typeof record === 'object' &&
+        'Id' in record &&
+        String(record.Id).toLowerCase() !== id.toLowerCase()
+      ) {
+        throw new BpmApiError(
+          'Сервер не сохранил переданный UUID. Проверьте созданную запись до повтора.',
+          502,
+          collection,
+          `Полученный UUID: ${String(record.Id)}`,
+          undefined,
+          ['Найдите созданную запись по полученному UUID; повтор может создать дубль.'],
+          'outcome_unknown'
+        );
+      }
+      return {
+        record:
+          id && record && typeof record === 'object'
+            ? { ...record, Id: (record as Record<string, unknown>).Id ?? id }
+            : record,
+        created: true,
+      };
+    } catch (error) {
+      if (
+        id &&
+        error instanceof BpmApiError &&
+        (error.code === 'outcome_unknown' || [400, 409, 412].includes(error.httpStatus))
+      ) {
+        try {
+          const existing = await this.findCreation<T>(collection, id, data);
+          if (existing) return { record: existing, created: null };
+        } catch (reconciliationError) {
+          if (
+            reconciliationError instanceof BpmApiError &&
+            reconciliationError.code === 'idempotency_conflict'
+          )
+            throw reconciliationError;
+        }
+      }
+      throw error;
+    }
+  }
+
+  private async findCreation<T>(
+    collection: string,
+    id: string,
+    data: Record<string, unknown>
+  ): Promise<T | undefined> {
+    try {
+      const record = await this.getRecord<T>(collection, id);
+      const actual = record as Record<string, unknown>;
+      if (!Object.entries(data).every(([field, value]) => equivalentValue(actual[field], value))) {
+        throw new BpmApiError(
+          'Этот idempotency_key уже использован для записи с другими значениями.',
+          409,
+          collection,
+          'Повтор операции допустим только с теми же данными.',
+          undefined,
+          ['Проверьте существующую запись. Для нового намерения используйте новый ключ.'],
+          'idempotency_conflict'
+        );
+      }
+      return record;
+    } catch (error) {
+      if (error instanceof BpmApiError && error.httpStatus === 404) return undefined;
+      throw error;
+    }
   }
 
   /**
@@ -188,30 +409,63 @@ export class ODataClient {
     collection: string,
     id: string,
     data: Record<string, unknown>,
-    options: { returnRepresentation?: boolean } = {}
+    options?: WriteOptions
   ): Promise<T | null> {
-    const url = this.buildRecordPath(collection, id);
+    await this.verifyEtag(collection, id, options);
     const response = await this.httpClient.request<T>({
       method: 'PATCH',
-      url,
+      url: this.buildRecordPath(collection, id),
       body: data,
       contentKind: 'crud',
-      headers: options.returnRepresentation ? { Prefer: 'return=representation' } : undefined,
+      operation: 'mutation',
+      headers: {
+        ...conditionalHeaders(options),
+        ...(options?.returnRepresentation ? { Prefer: 'return=representation' } : {}),
+      },
     });
 
     if (response.status === 204) return null;
     const body = response.data as unknown;
     if (!body || typeof body !== 'object' || Array.isArray(body)) return null;
-    return body as T;
+    return unwrapSingle(body) as T;
   }
 
-  async deleteRecord(collection: string, id: string): Promise<void> {
-    const url = this.buildRecordPath(collection, id);
+  async deleteRecord(collection: string, id: string, options?: WriteOptions): Promise<void> {
+    await this.verifyEtag(collection, id, options);
     await this.httpClient.request({
       method: 'DELETE',
-      url,
+      url: this.buildRecordPath(collection, id),
       contentKind: 'crud',
+      operation: 'mutation',
+      headers: conditionalHeaders(options),
     });
+  }
+
+  /** Verify platform support and the current version before assembling a batch mutation. */
+  async assertExpectedEtag(collection: string, id: string, expectedEtag: string): Promise<void> {
+    return this.verifyEtag(collection, id, { expectedEtag });
+  }
+
+  private async verifyEtag(collection: string, id: string, options?: WriteOptions): Promise<void> {
+    if (options?.expectedEtag === undefined) return;
+    conditionalHeaders(options);
+    const current = await this.getRecord<Record<string, unknown>>(collection, id, { $select: 'Id' });
+    if (typeof current['@odata.etag'] !== 'string') {
+      throw new BpmApiError(
+        'Этот сервер BPMSoft не предоставляет ETag; условное изменение не поддерживается.',
+        400,
+        collection,
+        undefined,
+        undefined,
+        [
+          'Получите актуальную запись и проверьте изменения. Не передавайте expected_etag, если осознанно допускаете обычную запись.',
+        ],
+        'concurrency_unsupported'
+      );
+    }
+    if (current['@odata.etag'] !== options.expectedEtag) {
+      throw new BpmApiError('Запись изменилась после чтения.', 412, collection);
+    }
   }
 
   /**
@@ -223,14 +477,9 @@ export class ODataClient {
    * than silently 404-ing.
    */
   async executeBatch(
-    requests: Array<{
-      method: string;
-      url: string;
-      headers?: Record<string, string>;
-      body?: Record<string, unknown>;
-    }>,
+    requests: ClientBatchRequest[],
     continueOnError: boolean = false
-  ): Promise<{ responses: Array<{ id?: string; status: number; body: unknown }> }> {
+  ): Promise<{ responses: ClientBatchResponse[] }> {
     if (this.odataVersion === 3) {
       throw new BpmApiError(
         'Пакетные запросы ($batch) не поддерживаются в режиме OData 3 для BPMSoft 1.8. Используйте OData 4 или выполните операции последовательно.',
@@ -246,43 +495,95 @@ export class ODataClient {
       );
     }
 
-    const batchUrl = `${this.baseUrl}/$batch`;
-    const chunks = chunkArray(requests, this.config.max_batch_size);
-    const allResponses: Array<{ id?: string; status: number; body: unknown }> = [];
-
+    this.validateBulkRequests(requests);
+    const wireRequests = requests.map((request) => ({
+      ...request,
+      body: nativeBatchBody(request.body, request.numericFields),
+    }));
+    const allResponses: ClientBatchResponse[] = [];
+    let stopped = false;
     let globalIndex = 0;
-    for (const chunk of chunks) {
-      const batchBody = {
-        requests: chunk.map((req) => ({
-          id: String(++globalIndex),
-          method: req.method,
-          url: req.url,
-          // Без IEEE754Compatible: с ним Edm.Decimal ждут строкой, а числом подзапрос падает 500
-          // (проверено на тестовом стенде) — одиночные запросы идут так же, без этого флага.
-          headers: {
-            'Content-Type': 'application/json; odata=verbose',
-            ...req.headers,
-          },
-          body: req.body,
-        })),
-      };
-
-      const headers: Record<string, string> = {};
-      if (continueOnError) headers['Prefer'] = 'continue-on-error';
-
-      const response = await this.httpClient.request<{
-        responses: Array<{ id?: string; status: number; body: unknown }>;
-      }>({
-        method: 'POST',
-        url: batchUrl,
-        body: batchBody,
-        contentKind: 'batch',
-        headers,
-      });
-
-      allResponses.push(...(response.data.responses || []));
+    for (const chunk of chunkArray(wireRequests, this.config.max_batch_size)) {
+      const batchRequests = chunk.map((request) => ({
+        id: String(++globalIndex),
+        method: request.method,
+        url: request.url,
+        headers: { 'Content-Type': 'application/json', ...request.headers },
+        body: request.body,
+      }));
+      if (stopped) {
+        allResponses.push(
+          ...batchRequests.map(
+            (request): ClientBatchResponse => ({
+              id: request.id,
+              status: 0,
+              body: null,
+              state: 'not_executed',
+            })
+          )
+        );
+        continue;
+      }
+      try {
+        const response = await this.httpClient.request<{
+          responses?: Array<{ id?: string; status: number; body?: unknown }>;
+        }>({
+          method: 'POST',
+          url: `${this.baseUrl}/$batch`,
+          body: { requests: batchRequests },
+          contentKind: 'batch',
+          operation: batchRequests.every((request) => request.method === 'GET') ? 'read' : 'mutation',
+          headers: continueOnError ? { Prefer: 'continue-on-error' } : {},
+        });
+        const byId = new Map<string, { status: number; body?: unknown }>();
+        const duplicateIds = new Set<string>();
+        for (const item of response.data.responses ?? []) {
+          if (item.id && byId.has(item.id)) duplicateIds.add(item.id);
+          if (item.id) byId.set(item.id, item);
+        }
+        const results = batchRequests.map((request): ClientBatchResponse => {
+          const item = byId.get(request.id);
+          if (!item || duplicateIds.has(request.id) || !Number.isInteger(item.status))
+            return { id: request.id, status: 0, body: null, state: 'outcome_unknown' };
+          return {
+            id: request.id,
+            status: item.status,
+            body: item.body ?? null,
+            state:
+              item.status === 424
+                ? 'not_executed'
+                : item.status >= 200 && item.status < 300
+                  ? 'completed'
+                  : item.status >= 500 || item.status === 408
+                    ? 'outcome_unknown'
+                    : 'failed',
+          };
+        });
+        allResponses.push(...results);
+        if (
+          results.some((item) => item.state === 'outcome_unknown') ||
+          (!continueOnError && results.some((item) => item.state !== 'completed'))
+        )
+          stopped = true;
+      } catch (error) {
+        const state =
+          error instanceof BpmApiError && error.code !== 'outcome_unknown' ? 'failed' : 'outcome_unknown';
+        allResponses.push(
+          ...batchRequests.map(
+            (request): ClientBatchResponse => ({
+              id: request.id,
+              status: error instanceof BpmApiError ? error.httpStatus : 0,
+              body:
+                error instanceof BpmApiError
+                  ? error.toToolError()
+                  : { error: error instanceof Error ? error.message : String(error) },
+              state,
+            })
+          )
+        );
+        stopped = true;
+      }
     }
-
     return { responses: allResponses };
   }
 
@@ -291,36 +592,67 @@ export class ODataClient {
    *
    * Модель передаёт массив, а как его отправить — решает сервер: одним $batch,
    * если инстанс его переваривает, иначе по одному запросу. Поддержка $batch
-   * проверяется один раз на процесс безвредным GET внутри $batch по той же
+   * проверяется безвредным GET внутри $batch по той же
    * коллекции — до того, как в пакет попадут записи: при неудачном пакете с
    * POST неизвестно, что успело создаться, а повтор по одному дал бы дубли.
+   * Результат пробы временно кэшируется по подключению, пользователю и коллекции.
    */
   async executeBulk(
-    requests: Array<{ method: HttpRequestOptions['method']; url: string; body?: Record<string, unknown> }>,
+    requests: ClientBatchRequest[],
     continueOnError: boolean,
     probeCollectionPath: string
-  ): Promise<{ responses: Array<{ id?: string; status: number; body: unknown }>; mode: 'batch' | 'single' }> {
+  ): Promise<{ responses: ClientBatchResponse[]; mode: 'batch' | 'single' }> {
+    this.validateBulkRequests(requests);
     if (this.odataVersion === 4 && (await this.probeBatch(probeCollectionPath))) {
       return { ...(await this.executeBatch(requests, continueOnError)), mode: 'batch' };
     }
     return { responses: await this.executeOneByOne(requests, continueOnError), mode: 'single' };
   }
 
+  private validateBulkRequests(requests: Array<{ method: string; url: string }>): void {
+    for (const request of requests) {
+      const url = new URL(request.url, `${this.baseUrl}/`);
+      if (
+        url.origin !== this.origin ||
+        !url.pathname.startsWith(new URL(`${this.baseUrl}/`).pathname) ||
+        !['GET', 'POST', 'PATCH', 'DELETE'].includes(request.method)
+      ) {
+        throw new BpmApiError('Недопустимый адрес или метод пакетной операции.', 400);
+      }
+    }
+  }
+
   private async probeBatch(collectionPath: string): Promise<boolean> {
-    const known = getBatchSupport();
+    const scope = `${this.baseUrl}|${getAuthCacheScope() || `env:${this.config.username ?? ''}`}|${collectionPath}`;
+    const known = getBatchSupport(scope);
     if (known !== undefined) return known;
     try {
       const { responses } = await this.executeBatch([
         { method: 'GET', url: `${collectionPath}?$top=1&$select=Id` },
       ]);
       const status = responses[0]?.status;
+      if (status === 401 || status === 403) {
+        throw new BpmApiError('Нет доступа к проверке пакетного выполнения.', status);
+      }
       const ok = status !== undefined && status >= 200 && status < 300;
-      setBatchSupport(ok, ok ? undefined : `ответ пробы: ${status ?? 'без responses'}`);
+      const probeBody = responses[0]?.body as { error?: unknown } | null;
+      const unsupported =
+        responses[0]?.state === 'failed' &&
+        ([400, 404, 405, 415, 501].includes(status!) ||
+          isQueryUnsupportedError(new BpmApiError(String(probeBody?.error ?? ''), status ?? 0)));
+      if (ok || unsupported) {
+        setBatchSupport(ok, ok ? undefined : `ответ пробы: ${status}`, scope);
+      }
       return ok;
     } catch (error) {
       // Нет прав или сессии — это не свойство инстанса, латч не трогаем.
       if (error instanceof BpmApiError && (error.httpStatus === 401 || error.httpStatus === 403)) throw error;
-      setBatchSupport(false, error instanceof Error ? error.message : String(error));
+      if (
+        error instanceof BpmApiError &&
+        ([400, 404, 405, 415, 501].includes(error.httpStatus) || isQueryUnsupportedError(error))
+      ) {
+        setBatchSupport(false, error.message, scope);
+      }
       return false;
     }
   }
@@ -331,25 +663,41 @@ export class ODataClient {
    * сотни записей по одному станут узким местом.
    */
   private async executeOneByOne(
-    requests: Array<{ method: HttpRequestOptions['method']; url: string; body?: Record<string, unknown> }>,
+    requests: ClientBatchRequest[],
     continueOnError: boolean
-  ): Promise<Array<{ id?: string; status: number; body: unknown }>> {
-    const responses: Array<{ id?: string; status: number; body: unknown }> = [];
+  ): Promise<ClientBatchResponse[]> {
+    const responses: ClientBatchResponse[] = [];
+    let stopped = false;
     for (const [i, req] of requests.entries()) {
+      const id = String(i + 1);
+      if (stopped) {
+        responses.push({ id, status: 0, body: null, state: 'not_executed' });
+        continue;
+      }
       try {
         const res = await this.httpClient.request({
-          method: req.method,
+          method: req.method as HttpRequestOptions['method'],
           url: req.url,
           body: req.body,
+          headers: req.headers,
           contentKind: 'crud',
         });
-        responses.push({ id: String(i + 1), status: res.status, body: res.data });
+        responses.push({ id, status: res.status, body: res.data, state: 'completed' });
       } catch (error) {
-        if (error instanceof BpmApiError && error.httpStatus === 401) throw error;
         const status = error instanceof BpmApiError ? error.httpStatus : 0;
-        const message = error instanceof Error ? error.message : String(error);
-        responses.push({ id: String(i + 1), status, body: { error: message } });
-        if (!continueOnError) break;
+        const state =
+          error instanceof BpmApiError && error.code !== 'outcome_unknown' ? 'failed' : 'outcome_unknown';
+        responses.push({
+          id,
+          status,
+          body:
+            error instanceof BpmApiError
+              ? error.toToolError()
+              : { error: error instanceof Error ? error.message : String(error) },
+          state,
+        });
+        if (state === 'outcome_unknown' || !continueOnError || status === 401 || status === 403)
+          stopped = true;
       }
     }
     return responses;
@@ -386,15 +734,16 @@ export class ODataClient {
 
   /**
    * PUT raw bytes into an entity field.
-   * URL: {baseUrl}/{Collection}({id})/{FieldName}
+   * Named streams use /FieldName; primitive binary values use /FieldName/$value.
    */
   async putFieldBinary(
     collection: string,
     id: string,
     field: string,
-    data: Buffer | Uint8Array
+    data: Buffer | Uint8Array,
+    options?: BinaryFieldOptions
   ): Promise<void> {
-    const url = `${this.buildRecordPath(collection, id)}/${encodeURIComponent(field)}`;
+    const url = this.buildBinaryFieldUrl(collection, id, field, 'PUT', options);
     await this.httpClient.request({
       method: 'PUT',
       url,
@@ -405,12 +754,15 @@ export class ODataClient {
 
   /**
    * GET raw bytes from an entity field.
-   * URL: {baseUrl}/{Collection}({id})/{FieldName}
-   * For OData 3 the canonical $value form is also used: /FieldName/$value
+   * Explicit EDM type takes precedence over the legacy version-based route.
    */
-  async getFieldBinary(collection: string, id: string, field: string): Promise<Buffer> {
-    const fieldUrl = `${this.buildRecordPath(collection, id)}/${encodeURIComponent(field)}`;
-    const url = this.odataVersion === 3 ? `${fieldUrl}/$value` : fieldUrl;
+  async getFieldBinary(
+    collection: string,
+    id: string,
+    field: string,
+    options?: BinaryFieldOptions
+  ): Promise<Buffer> {
+    const url = this.buildBinaryFieldUrl(collection, id, field, 'GET', options);
     const response = await this.httpClient.request<Buffer>({
       method: 'GET',
       url,
@@ -421,8 +773,13 @@ export class ODataClient {
   }
 
   /** DELETE binary content of an entity field. */
-  async deleteFieldBinary(collection: string, id: string, field: string): Promise<void> {
-    const url = `${this.buildRecordPath(collection, id)}/${encodeURIComponent(field)}`;
+  async deleteFieldBinary(
+    collection: string,
+    id: string,
+    field: string,
+    options?: BinaryFieldOptions
+  ): Promise<void> {
+    const url = this.buildBinaryFieldUrl(collection, id, field, 'DELETE', options);
     await this.httpClient.request({
       method: 'DELETE',
       url,
@@ -430,11 +787,21 @@ export class ODataClient {
     });
   }
 
-  /**
-   * URL, который ушёл бы на сервер, без выполнения запроса.
-   * Нужен для dry_run: модель видит, во что превратились её критерии, и может
-   * поправиться сама, не тратя round-trip и не задевая данные.
-   */
+  private buildBinaryFieldUrl(
+    collection: string,
+    id: string,
+    field: string,
+    method: 'GET' | 'PUT' | 'DELETE',
+    options?: BinaryFieldOptions
+  ): string {
+    assertSafeIdentifier(field, 'field');
+    const url = `${this.buildRecordPath(collection, id)}/${encodeURIComponent(field)}`;
+    if (options?.fieldType === 'Edm.Binary') return `${url}/$value`;
+    if (options?.fieldType === 'Edm.Stream') return url;
+    return method === 'GET' && this.odataVersion === 3 ? `${url}/$value` : url;
+  }
+
+  /** Preview the native query without issuing a request. */
   previewCollectionUrl(collection: string, query?: QueryOptions): string {
     return this.buildCollectionUrl(collection, query);
   }
@@ -477,8 +844,12 @@ export class ODataClient {
     const params = new URLSearchParams();
     for (const [key, value] of Object.entries(query)) {
       if (value === undefined || value === null) continue;
-      if (key === '$count' && value === true) {
-        params.set('$count', 'true');
+      if (key === '$count') {
+        if (value !== true) continue;
+        params.set(
+          this.odataVersion === 3 ? '$inlinecount' : '$count',
+          this.odataVersion === 3 ? 'allpages' : 'true'
+        );
       } else {
         params.set(key, String(value));
       }
@@ -496,29 +867,183 @@ export class ODataClient {
    * Same-origin enforcement is applied at the HttpClient layer (setAllowedOrigin),
    * so an absolute URL pointing elsewhere will throw before any request is made.
    */
-  private resolveNextLink(link: string): string {
-    if (link.startsWith('http://') || link.startsWith('https://')) {
-      return link;
+  private validateNextLink(collection: string, link: string): string {
+    const expected = new URL(this.buildCollectionPath(collection));
+    const url = new URL(link, link.startsWith('?') ? expected.toString() : `${this.baseUrl}/`);
+    if (url.origin !== this.origin || url.pathname !== expected.pathname || url.username || url.password) {
+      throw new BpmApiError('Ссылка продолжения не соответствует исходной коллекции.', 400, collection);
     }
-    if (link.startsWith('/')) {
-      return `${this.origin}${link}`;
-    }
-    return `${this.baseUrl}/${link}`;
+    if (url.hash && !/^#mcp-offset=\d+$/.test(url.hash))
+      throw new BpmApiError('Некорректная ссылка продолжения.', 400, collection);
+    return url.toString();
   }
 }
 
-function pickNextLink<T>(resp: ODataCollectionResponse<T>): string | undefined {
-  if (resp['@odata.nextLink']) return resp['@odata.nextLink'];
-  // OData v3 returns __next on the envelope
-  const v3 = resp as unknown as { __next?: string };
-  if (typeof v3.__next === 'string') return v3.__next;
-  return undefined;
+const COLLATION_WARNING =
+  'BPMSoft не выполнил tolower; поиск использует исходное поле и коллацию платформы для сравнения регистра.';
+
+function isLowercaseCompatibilityError(error: unknown): boolean {
+  if (!(error instanceof BpmApiError)) return false;
+  if (error.code === 'network' && error.httpStatus === 0 && /\bterminated\b/i.test(error.message))
+    return true;
+  return (
+    [400, 501].includes(error.httpStatus) &&
+    /\btolower\b/i.test(error.message) &&
+    /unsupported|not\s+(?:implemented|supported)|not.*support|unknown\s+function|unrecognized\s+function|не.*поддерж|неизвестн.*функц/i.test(
+      error.message
+    )
+  );
+}
+
+/** Remove only actual tolower(field/path) calls, preserving quoted literals and doubled quote escaping. */
+export function removeLowercaseFunctions(filter: string): string {
+  let result = '';
+  let quoted = false;
+  for (let index = 0; index < filter.length; ) {
+    const char = filter[index];
+    if (char === "'") {
+      result += char;
+      index++;
+      if (quoted && filter[index] === "'") {
+        result += "'";
+        index++;
+      } else quoted = !quoted;
+      continue;
+    }
+    if (!quoted && (index === 0 || !/[\w/.$]/.test(filter[index - 1]))) {
+      const match = /^tolower\s*\(\s*([A-Za-z_][A-Za-z0-9_]*(?:\/[A-Za-z_][A-Za-z0-9_]*)*)\s*\)/i.exec(
+        filter.slice(index)
+      );
+      if (match) {
+        result += match[1];
+        index += match[0].length;
+        continue;
+      }
+    }
+    result += char;
+    index++;
+  }
+  return result;
+}
+
+function normalizeCount(raw: unknown, status: number, collection?: string): number {
+  const text = String(raw).trim();
+  const count = /^\d+$/.test(text) ? Number(text) : NaN;
+  if (!Number.isSafeInteger(count))
+    throw new BpmApiError(`Невалидный ответ $count: ${String(raw)}`, status, collection);
+  return count;
+}
+
+function normalizeCollection<T>(raw: unknown): ODataCollectionResponse<T> {
+  if (!raw || typeof raw !== 'object') throw new BpmApiError('Сервер вернул некорректный список OData.', 502);
+  const outer = raw as Record<string, unknown>;
+  const value = (outer.d && typeof outer.d === 'object' ? outer.d : outer) as Record<string, unknown>;
+  const rows = value.value ?? value.results;
+  if (!Array.isArray(rows)) throw new BpmApiError('В ответе OData отсутствует массив записей.', 502);
+  const result: ODataCollectionResponse<T> = { value: rows as T[] };
+  if (typeof value['@odata.context'] === 'string') result['@odata.context'] = value['@odata.context'];
+  const next = value['@odata.nextLink'] ?? value.__next;
+  if (typeof next === 'string' && next) result['@odata.nextLink'] = next;
+  const count = value['@odata.count'] ?? value.__count;
+  if (count !== undefined && /^\d+$/.test(String(count)) && Number.isSafeInteger(Number(count)))
+    result['@odata.count'] = Number(count);
+  return result;
+}
+
+function unwrapSingle<T>(raw: T): T {
+  if (raw && typeof raw === 'object' && 'd' in raw && raw.d && typeof raw.d === 'object') return raw.d as T;
+  return raw;
+}
+
+function validateLimit(limit?: number): number {
+  if (limit === undefined) return Infinity;
+  if (!Number.isSafeInteger(limit) || limit <= 0)
+    throw new BpmApiError('maxRecords должен быть положительным целым числом.', 400);
+  return limit;
+}
+
+function stableOrder(order?: string): string {
+  if (!order) return 'Id asc';
+  return order.split(',').some((entry) => /^Id(?:\s+(?:asc|desc))?$/i.test(entry.trim()))
+    ? order
+    : `${order},Id asc`;
+}
+
+function offsetContinuation(url: string, skip: number): string {
+  const next = new URL(url);
+  next.hash = '';
+  next.searchParams.delete('$skiptoken');
+  next.searchParams.set('$skip', String(skip));
+  next.searchParams.set('$orderby', stableOrder(next.searchParams.get('$orderby') ?? undefined));
+  return next.toString();
+}
+
+function withPageOffset(url: string, offset: number): string {
+  const next = new URL(url);
+  const current = next.hash.startsWith('#mcp-offset=') ? Number(next.hash.slice(12)) : 0;
+  next.hash = `mcp-offset=${current + offset}`;
+  return next.toString();
+}
+
+function conditionalHeaders(options?: WriteOptions): Record<string, string> | undefined {
+  if (options?.expectedEtag === undefined) return undefined;
+  if (!/^(?:W\/)?"[^"\r\n]+"$/.test(options.expectedEtag))
+    throw new BpmApiError('expected_etag должен быть конкретной версией записи.', 400);
+  return { 'If-Match': options.expectedEtag };
+}
+
+function equivalentValue(actual: unknown, expected: unknown): boolean {
+  if (actual === expected) return true;
+  if (typeof expected === 'number' && typeof actual === 'string' && /^-?\d+(?:\.\d+)?$/.test(actual))
+    return Number(actual) === expected;
+  if (typeof actual === 'string' && typeof expected === 'string') {
+    if (/^[0-9a-f]{8}-[0-9a-f-]{27}$/i.test(actual) && /^[0-9a-f]{8}-[0-9a-f-]{27}$/i.test(expected))
+      return actual.toLowerCase() === expected.toLowerCase();
+    if (/^\d{4}-\d{2}-\d{2}T/.test(actual) && /^\d{4}-\d{2}-\d{2}T/.test(expected))
+      return Date.parse(actual) === Date.parse(expected);
+  }
+  return false;
 }
 
 function chunkArray<T>(array: T[], chunkSize: number): T[][] {
+  if (!Number.isSafeInteger(chunkSize) || chunkSize < 1)
+    throw new BpmApiError('Некорректный размер пакетного запроса.', 400);
   const chunks: T[][] = [];
   for (let i = 0; i < array.length; i += chunkSize) {
     chunks.push(array.slice(i, i + chunkSize));
   }
   return chunks;
+}
+
+function nativeBatchBody(
+  body: Record<string, unknown> | undefined,
+  numericFields: readonly string[] = []
+): Record<string, unknown> | undefined {
+  if (!body || !numericFields.length) return body;
+  const rawJSON = (JSON as typeof JSON & { rawJSON?: (value: string) => unknown }).rawJSON;
+  if (!rawJSON)
+    throw new BpmApiError('Для точных чисел в пакетных запросах требуется Node.js с JSON.rawJSON.', 400);
+  const wire = { ...body };
+  for (const field of numericFields) {
+    assertSafeIdentifier(field, 'numericField');
+    const value = body[field];
+    if (value === undefined || value === null) continue;
+    if (typeof value === 'number') {
+      if (!Number.isFinite(value) || (Number.isInteger(value) && !Number.isSafeInteger(value)))
+        throw new BpmApiError(`Поле ${field}: передайте точное число строкой.`, 400);
+      continue;
+    }
+    if (typeof value !== 'string') throw new BpmApiError(`Поле ${field}: ожидается числовое значение.`, 400);
+    // Convert validated Decimal/Int64 text to a JSON number token without using
+    // Number: the native batch endpoint rejects IEEE754-compatible decimal strings.
+    const match = /^([+-]?)(?:(\d+)(?:\.(\d*))?|\.(\d+))([eE][+-]?\d+)?$/.exec(value.trim());
+    if (!match) throw new BpmApiError(`Поле ${field}: ожидается числовое значение.`, 400);
+    const [, sign, integer, fraction, leadingFraction, exponent] = match;
+    const whole = (integer ?? '0').replace(/^0+(?=\d)/, '');
+    const decimal = fraction ?? leadingFraction;
+    wire[field] = rawJSON(
+      `${sign === '-' ? '-' : ''}${whole}${decimal ? `.${decimal}` : ''}${exponent ?? ''}`
+    );
+  }
+  return wire;
 }

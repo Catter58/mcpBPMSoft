@@ -11,6 +11,7 @@ import { join } from 'node:path';
 import { checkLocalPath, registerStreamTools } from '../../src/tools/stream-tools.js';
 import { buildRebindingOptions } from '../../src/server/http-transport.js';
 import type { ServiceContainer } from '../../src/tools/init-tool.js';
+import { runWithAuth } from '../../src/auth/request-context.js';
 
 vi.mock('node:fs/promises', async (orig) => {
   const actual = await orig<typeof import('node:fs/promises')>();
@@ -34,22 +35,46 @@ function setup(maxSize = 1024) {
     },
   };
   const puts: Buffer[] = [];
+  let createdImageId: string | undefined;
   const services = {
-    config: { url: 'https://bpm.example', odata_version: 4, platform: 'net8', max_file_size: maxSize },
+    config: {
+      bpmsoft_url: 'https://bpm.example',
+      odata_version: 4,
+      platform: 'net8',
+      max_file_size: maxSize,
+      file_root: process.env.BPMSOFT_FILE_ROOT ?? root,
+    },
     authManager: { ensureAuthenticated: vi.fn(async () => undefined) },
-    metadataManager: { resolveCollectionReference: async (n: string) => ({ name: n }) },
+    metadataManager: {
+      resolveCollectionReference: async (n: string) => ({ name: n }),
+      resolveFieldReference: async (_collection: string, name: string) => ({ name }),
+      getEntityMetadata: async () => ({
+        properties: [
+          { name: 'Id', type: 'Edm.Guid' },
+          { name: 'Name', type: 'Edm.String' },
+          { name: 'MimeType', type: 'Edm.String' },
+          { name: 'Data', type: 'Edm.Stream' },
+          { name: 'Photo', type: 'Edm.Stream' },
+        ],
+      }),
+    },
+    lookupResolver: {
+      resolveDataLookups: async (_collection: string, data: Record<string, unknown>) => ({ data, notes: [] }),
+    },
     odataClient: {
       async putFieldBinary(_c: string, _i: string, _f: string, b: Buffer) {
         puts.push(b);
       },
-      async getFieldBinary() {
+      async getFieldBinary(collection: string, id: string) {
+        if (collection === 'SysImage' && id === createdImageId) return Buffer.alloc(0);
         return Buffer.from('hello');
       },
       async getRecord() {
         return { Id: UUID, Name: 'hello.txt', MimeType: 'text/plain' };
       },
-      async createRecord() {
-        return { Id: UUID };
+      async createRecord(_collection: string, data: Record<string, unknown>, options?: { id?: string }) {
+        createdImageId = options?.id ?? UUID;
+        return { ...data, Id: createdImageId };
       },
     },
     httpClient: {
@@ -61,7 +86,18 @@ function setup(maxSize = 1024) {
     initialized: true,
   } as unknown as ServiceContainer;
   registerStreamTools(server as never, services);
-  return { h: (n: string) => handlers.get(n)!, puts };
+  return {
+    h:
+      (n: string): Handler =>
+      (args) =>
+        process.env.MCP_TRANSPORT === 'stdio'
+          ? handlers.get(n)!(args)
+          : runWithAuth(
+              { csrfToken: 'test-csrf', cookies: new Map([['BPMSESSIONID', 'test-session']]) },
+              () => handlers.get(n)!(args)
+            ),
+    puts,
+  };
 }
 
 let root: string;
@@ -237,7 +273,7 @@ describe('bpm_download_file isError', () => {
     vi.mocked(fsp.writeFile).mockRejectedValueOnce(new Error('EACCES: permission denied'));
     const r = await h('bpm_download_file')({ image_id: UUID, save_path: '/tmp/bpm-unwritable.bin' });
     expect(r.isError).toBe(true);
-    expect(r.content[0].text).toContain('Ошибка сохранения');
+    expect(r.content[0].text).toContain('EACCES: permission denied');
   });
 
   it('successful local save → not an error', async () => {
@@ -258,29 +294,24 @@ describe('bpm_download_file isError', () => {
 });
 
 describe('buildRebindingOptions', () => {
-  it('loopback bind: default hosts plus env extras and origins', () => {
+  it('loopback bind honors the exact configured hosts and origins', () => {
     process.env.MCP_ALLOWED_HOSTS = 'mcp.example:443';
     process.env.MCP_ALLOWED_ORIGINS = 'https://app.example';
     const o = buildRebindingOptions('127.0.0.1', 8007);
-    expect(o.allowedHosts).toEqual(['127.0.0.1:8007', 'localhost:8007', 'mcp.example:443']);
+    expect(o.allowedHosts).toEqual(['mcp.example:443']);
     expect(o.allowedOrigins).toEqual(['https://app.example']);
   });
 
-  it('wildcard bind without MCP_ALLOWED_HOSTS skips host check with a warning', () => {
+  it('wildcard bind requires an explicit Host allowlist', () => {
     delete process.env.MCP_ALLOWED_HOSTS;
     delete process.env.MCP_ALLOWED_ORIGINS;
-    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
-    const o = buildRebindingOptions('0.0.0.0', 8007);
-    expect(o.allowedHosts).toBeUndefined();
-    expect(o.allowedOrigins).toBeUndefined();
-    expect(spy).toHaveBeenCalled();
-    spy.mockRestore();
+    expect(() => buildRebindingOptions('0.0.0.0', 8007)).toThrow('MCP_ALLOWED_HOSTS');
   });
 
   it('wildcard bind with MCP_ALLOWED_HOSTS enforces the list', () => {
     process.env.MCP_ALLOWED_HOSTS = 'mcp.example';
     const o = buildRebindingOptions('0.0.0.0', 8007);
     expect(o.allowedHosts).toContain('mcp.example');
-    expect(o.allowedHosts).toContain('localhost:8007');
+    expect(o.allowedHosts).toEqual(['mcp.example']);
   });
 });

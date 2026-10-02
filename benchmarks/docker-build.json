@@ -1,0 +1,9 @@
+{
+  "exit_code": 0,
+  "build_elapsed_s": 15.062403499847278,
+  "cache": "base/npm layers may be cached; current lockfile and source compiled",
+  "image_id": "sha256:46da22840f03f6fe96c98843b76604cbaf9138c9b83cbf8487ff4e9c868fbe8f",
+  "image_size_bytes": 182105304,
+  "os": "linux",
+  "arch": "arm64"
+}

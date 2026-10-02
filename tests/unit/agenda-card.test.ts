@@ -59,7 +59,7 @@ describe('bpm_record_card: compactRecord', () => {
       compactRecord({
         '@odata.context': 'x',
         Id: '410006e1-ca4e-4502-a9ec-e54d922d2c00',
-        Name: 'Supervisor',
+        Name: 'ApiUser',
         Email: '',
         OwnerId: '00000000-0000-0000-0000-000000000000',
         AccountId: 'c131eaff-d637-4863-bc64-363ff8a4bc4d',
@@ -75,7 +75,7 @@ describe('bpm_record_card: compactRecord', () => {
       })
     ).toEqual({
       Id: '410006e1-ca4e-4502-a9ec-e54d922d2c00',
-      Name: 'Supervisor',
+      Name: 'ApiUser',
       AccountName: 'ООО «Ромашка»',
       DoNotUseSms: true,
       TypeId: '60733efc-f36b-1410-a883-16d83cab0980',

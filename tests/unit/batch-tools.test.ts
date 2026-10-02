@@ -63,6 +63,11 @@ function setup(rows: Array<Record<string, unknown>> = []): { state: State; tool:
       },
     },
     odataClient: {
+      getRecord: async (_collection: string, id: string) =>
+        state.rows.find((row) => row.Id === id) ?? {
+          Id: id,
+          Name: id === ALPHA ? 'Альфа' : id === BETA ? 'Бета' : 'Name',
+        },
       buildCollectionPath: (c: string) => `/${c}`,
       buildRecordPath: (c: string, id: string) => `/${c}(${id})`,
       getRecords: async (_c: string, q: { $filter?: string }) => {
@@ -75,10 +80,15 @@ function setup(rows: Array<Record<string, unknown>> = []): { state: State; tool:
           mode: 'batch',
           responses: requests.map((r, i) =>
             r.body?.Name === 'FAIL'
-              ? { status: 400, body: { error: { code: '', message: 'Поле Name обязательно' } } }
+              ? {
+                  id: String(i + 1),
+                  status: 400,
+                  body: { error: { code: '', message: 'Поле Name обязательно' } },
+                }
               : {
                   status: r.method === 'POST' ? 201 : 204,
-                  body: r.method === 'POST' ? { Id: `new-${i}` } : null,
+                  id: String(i + 1),
+                  body: r.method === 'POST' ? { Id: r.body?.Id } : null,
                 }
           ),
         };
@@ -90,7 +100,24 @@ function setup(rows: Array<Record<string, unknown>> = []): { state: State; tool:
     { registerTool: (name: string, _m: unknown, h: Handler) => handlers.set(name, h) } as never,
     services as unknown as ServiceContainer
   );
-  return { state, tool: (n) => handlers.get(n)! };
+  return {
+    state,
+    tool: (n) => async (args) => {
+      const handler = handlers.get(n)!;
+      const shouldConfirm =
+        n === 'bpm_batch_update' ||
+        (n === 'bpm_batch_create' && args.if_exists === 'update') ||
+        (n === 'bpm_batch_delete' && args.confirm === true);
+      const preview = await handler(shouldConfirm ? { ...args, confirm: false } : args);
+      if (shouldConfirm && preview.structuredContent?.requires_confirmation)
+        return handler({
+          ...args,
+          confirm: true,
+          confirmation_token: preview.structuredContent.confirmation_token,
+        });
+      return preview;
+    },
+  };
 }
 
 describe('bpm_batch_create', () => {
@@ -100,9 +127,10 @@ describe('bpm_batch_create', () => {
       collection: 'Account',
       records: [{ Name: 'A' }, { Name: 'B' }],
     });
-    expect(r.content[0].text).toContain('#1 A → new-0');
-    expect(r.content[0].text).toContain('#2 B → new-1');
-    expect(r.structuredContent?.created).toEqual(['new-0', 'new-1']);
+    const ids = r.structuredContent?.created as string[];
+    expect(r.content[0].text).toContain(`#1 A → ${ids[0]}`);
+    expect(r.content[0].text).toContain(`#2 B → ${ids[1]}`);
+    expect(ids.every((id) => /^[0-9a-f-]{36}$/.test(id))).toBe(true);
     expect(r.isError).toBe(false);
   });
 
@@ -114,7 +142,7 @@ describe('bpm_batch_create', () => {
       continue_on_error: true,
     });
     expect(state.bulk[0]).toHaveLength(1);
-    expect(r.structuredContent?.created).toEqual([null, 'new-0']);
+    expect(r.structuredContent?.created).toEqual([null, state.bulk[0][0].body?.Id]);
     expect(r.structuredContent?.errors).toEqual([{ index: 0, reason: expect.stringContaining('BAD') }]);
     expect(r.isError).toBe(true);
   });
@@ -149,9 +177,11 @@ describe('bpm_batch_create', () => {
       match_on: ['name'],
     });
     expect(state.filters[0]).toBe("(Name eq 'O''Brien') or (Name eq 'New')");
-    expect(state.bulk[0]).toEqual([{ method: 'POST', url: '/Account', body: { Name: 'New' } }]);
+    expect(state.bulk[0]).toEqual([
+      { method: 'POST', url: '/Account', body: { Name: 'New', Id: expect.any(String) } },
+    ]);
     expect(r.structuredContent?.existing).toEqual([BETA, null]);
-    expect(r.structuredContent?.created).toEqual([null, 'new-0']);
+    expect(r.structuredContent?.created).toEqual([null, state.bulk[0][0].body?.Id]);
     expect(r.content[0].text).toContain(`уже есть: ${BETA}`);
   });
 

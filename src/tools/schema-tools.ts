@@ -18,6 +18,18 @@ import { lookupCandidateShape } from './_schemas.js';
 
 /** Сколько имён коллекций отдавать без явного limit. */
 const COLLECTIONS_LIMIT = 100;
+const defaultHintShape = z.object({
+  source: z.enum(['none', 'constant', 'system_setting', 'runtime', 'unknown']),
+  providedByServer: z.boolean().optional(),
+  value: z.union([z.string(), z.number(), z.boolean(), z.null()]).optional(),
+});
+const requiredFieldShape = z.object({
+  name: z.string(),
+  caption: z.string().nullable(),
+  type: z.string(),
+  provided_by_server: z.boolean(),
+  default_hint: defaultHintShape.nullable(),
+});
 
 export function registerSchemaTools(server: McpServer, services: ServiceContainer): void {
   // bpm_get_collections
@@ -83,6 +95,7 @@ export function registerSchemaTools(server: McpServer, services: ServiceContaine
           const toolError = formatToolError(error);
           return {
             content: [{ type: 'text', text: JSON.stringify(toolError, null, 2) }],
+            structuredContent: toolError as unknown as Record<string, unknown>,
             isError: true,
           };
         }
@@ -107,12 +120,21 @@ export function registerSchemaTools(server: McpServer, services: ServiceContaine
           property_count: z.number().int(),
           lookup_count: z.number().int(),
           has_captions: z.boolean(),
+          required_fields: z.array(requiredFieldShape),
+          caller_required_fields: z.array(requiredFieldShape),
+          requirements_complete: z.boolean(),
+          requirement_source: z.enum(['entity_schema_designer', 'unavailable']),
+          unknown_requirement_fields: z.array(z.string()),
+          requirement_notes: z.array(z.string()),
           properties: z.array(
             z.object({
               name: z.string(),
               caption: z.string().nullable(),
               type: z.string(),
-              required: z.boolean(),
+              required: z.boolean().nullable(),
+              nullable: z.boolean(),
+              requirement_source: z.literal('entity_schema_designer').nullable(),
+              default_hint: defaultHintShape.nullable(),
               isLookup: z.boolean(),
               lookupCollection: z.string().nullable(),
               lookupDisplayColumn: z.string().nullable(),
@@ -139,15 +161,55 @@ export function registerSchemaTools(server: McpServer, services: ServiceContaine
           ];
 
           const hasCaptions = metadata.properties.some((p) => p.caption);
+          const unknownRequirements = metadata.properties
+            .filter((p) => p.required === undefined)
+            .map((p) => p.name);
+          const requirementSource = metadata.properties.some(
+            (p) => p.requirementSource === 'entity_schema_designer'
+          )
+            ? ('entity_schema_designer' as const)
+            : ('unavailable' as const);
+          const requiredFields = metadata.properties
+            .filter((p) => p.required === true)
+            .map((p) => ({
+              name: p.name,
+              caption: p.caption ?? null,
+              type: p.type,
+              provided_by_server:
+                p.defaultHint?.providedByServer === true ||
+                ((metadata.keyFields ?? ['Id']).includes(p.name) && p.type === 'Edm.Guid'),
+              default_hint: p.defaultHint ?? null,
+            }));
+          const callerRequiredFields = requiredFields.filter((p) => !p.provided_by_server);
+          const requirementNotes = [
+            requirementSource === 'entity_schema_designer'
+              ? 'Обязательность взята из requirementType схемы BPMSoft и отличается от допустимости null в OData.'
+              : 'Описание обязательности полей BPMSoft недоступно. Допустимость null в OData не доказывает обязательность при создании.',
+            'Системные настройки и runtime-значения по умолчанию вычисляет BPMSoft; возвращённые подсказки не нужно подставлять или исполнять.',
+            'Условные правила страницы, процессы и серверные обработчики могут предъявлять дополнительные требования при сохранении.',
+            ...(unknownRequirements.length
+              ? [
+                  `Для ${unknownRequirements.length} полей сведения об обязательности недоступны; required=null означает неизвестность.`,
+                ]
+              : []),
+          ];
 
           for (const prop of metadata.properties) {
             const parts = [`  - ${prop.name}`];
             if (prop.caption) parts.push(`[${prop.caption}]`);
             parts.push(`: ${prop.type}`);
-            if (!prop.nullable) parts.push('(обязательное)');
+            if (prop.required === true) parts.push('(обязательное по схеме)');
+            if (prop.required === undefined) parts.push('(обязательность неизвестна)');
+            if (prop.defaultHint?.providedByServer === true)
+              parts.push(`(значение по умолчанию: ${prop.defaultHint.source}, вычисляет сервер)`);
             if (prop.isLookup) parts.push(`→ lookup на ${prop.lookupCollection || '?'}`);
             lines.push(parts.join(' '));
           }
+          lines.push(
+            '',
+            `Обязательные поля для данных пользователя: ${callerRequiredFields.map((p) => `${p.caption || p.name} (${p.name})`).join(', ') || 'не выявлены по доступному описанию'}`,
+            ...requirementNotes
+          );
 
           if (!hasCaptions) {
             lines.push('');
@@ -171,7 +233,10 @@ export function registerSchemaTools(server: McpServer, services: ServiceContaine
             name: p.name,
             caption: p.caption ?? null,
             type: p.type,
-            required: !p.nullable,
+            required: p.required ?? null,
+            nullable: p.nullable,
+            requirement_source: p.requirementSource ?? null,
+            default_hint: p.defaultHint ?? null,
             isLookup: p.isLookup,
             lookupCollection: p.lookupCollection ?? null,
             lookupDisplayColumn: p.lookupDisplayColumn ?? null,
@@ -185,6 +250,12 @@ export function registerSchemaTools(server: McpServer, services: ServiceContaine
               property_count: metadata.properties.length,
               lookup_count: metadata.lookupFields.length,
               has_captions: hasCaptions,
+              required_fields: requiredFields,
+              caller_required_fields: callerRequiredFields,
+              requirements_complete: requirementSource !== 'unavailable' && unknownRequirements.length === 0,
+              requirement_source: requirementSource,
+              unknown_requirement_fields: unknownRequirements,
+              requirement_notes: requirementNotes,
               properties: propertyPairs,
               hint: 'В bpm_create_record/bpm_update_record/bpm_search_records можно передавать ключи как на латинице (name), так и на русском (caption).',
             },
@@ -193,6 +264,7 @@ export function registerSchemaTools(server: McpServer, services: ServiceContaine
           const toolError = formatToolError(error, params.collection);
           return {
             content: [{ type: 'text', text: JSON.stringify(toolError, null, 2) }],
+            structuredContent: toolError as unknown as Record<string, unknown>,
             isError: true,
           };
         }
@@ -301,6 +373,7 @@ export function registerSchemaTools(server: McpServer, services: ServiceContaine
           const toolError = formatToolError(error, params.collection);
           return {
             content: [{ type: 'text', text: JSON.stringify(toolError, null, 2) }],
+            structuredContent: toolError as unknown as Record<string, unknown>,
             isError: true,
           };
         }
@@ -384,6 +457,7 @@ export function registerSchemaTools(server: McpServer, services: ServiceContaine
           const toolError = formatToolError(error);
           return {
             content: [{ type: 'text', text: JSON.stringify(toolError, null, 2) }],
+            structuredContent: toolError as unknown as Record<string, unknown>,
             isError: true,
           };
         }

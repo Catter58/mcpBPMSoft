@@ -309,7 +309,11 @@ describe('HttpClient 5xx replay safety', () => {
       runWithAuth(auth(), () =>
         client.request({ method: 'POST', url: `${ORIGIN}/odata/Activity`, body: { Title: 'x' } })
       )
-    ).rejects.toMatchObject({ httpStatus: 500, message: 'boom' });
+    ).rejects.toMatchObject({
+      httpStatus: 500,
+      code: 'outcome_unknown',
+      details: expect.stringContaining('boom'),
+    });
 
     expect(count).toBe(1);
   });
@@ -331,7 +335,7 @@ describe('HttpClient 5xx replay safety', () => {
       })
     );
 
-    const client = new HttpClient(makeCfg());
+    const client = new HttpClient(makeCfg({ request_timeout: 10000 }));
     client.setAllowedOrigin(ORIGIN);
 
     await expect(
@@ -361,8 +365,6 @@ describe('HttpClient 5xx replay safety', () => {
         );
       })
     );
-    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
-
     const client = new HttpClient(makeCfg());
     client.setAllowedOrigin(ORIGIN);
 
@@ -372,12 +374,11 @@ describe('HttpClient 5xx replay safety', () => {
       )
     ).rejects.toMatchObject({
       httpStatus: 500,
-      message: 'Невозможно добавить корневую единицу администрирования',
+      code: 'outcome_unknown',
+      details: expect.stringContaining('Невозможно добавить корневую единицу администрирования'),
     });
 
     expect(count).toBe(1);
-    expect(errSpy.mock.calls.some((c) => String(c[0]).includes('прикладная ошибка сервера'))).toBe(true);
-    errSpy.mockRestore();
   });
 
   it('binary GET 500 with a JSON error body is decoded and NOT retried', async () => {
@@ -450,14 +451,14 @@ describe('HttpClient 5xx replay safety', () => {
     ).catch((e: unknown) => e)) as BpmApiError;
 
     expect(err.httpStatus).toBe(408);
-    expect(err.message).toMatch(
-      /^Превышен таймаут запроса \(50ms\)\. Запрос POST мог выполниться на сервере/
-    );
+    expect(err.code).toBe('outcome_unknown');
+    expect(err.toToolError().safe_to_retry).toBe(false);
+    expect(err.details).toContain('таймаут');
     expect(err.nextSteps?.[0]).toContain('Не повторяйте запрос вслепую');
     expect(count).toBe(1);
   });
 
-  it('POST network error keeps status 0 and warns; GET timeout message is unchanged', async () => {
+  it('reports an unknown POST outcome separately from a safe read timeout', async () => {
     server.use(
       http.post(`${ORIGIN}/odata/Activity`, () => HttpResponse.error()),
       http.get(`${ORIGIN}/odata/Activity`, async () => {
@@ -472,17 +473,19 @@ describe('HttpClient 5xx replay safety', () => {
       client.request({ method: 'POST', url: `${ORIGIN}/odata/Activity`, body: { Title: 'x' } })
     ).catch((e: unknown) => e)) as BpmApiError;
     expect(postErr.httpStatus).toBe(0);
-    expect(postErr.message).toMatch(/^Сетевая ошибка: .*Запрос POST мог выполниться на сервере/);
+    expect(postErr.code).toBe('outcome_unknown');
+    expect(postErr.toToolError().safe_to_retry).toBe(false);
     expect(postErr.nextSteps).toBeDefined();
 
     const getErr = (await runWithAuth(auth(), () =>
       client.request({ method: 'GET', url: `${ORIGIN}/odata/Activity` })
     ).catch((e: unknown) => e)) as BpmApiError;
-    expect(getErr).toMatchObject({ httpStatus: 408, message: 'Превышен таймаут запроса (50ms)' });
+    expect(getErr).toMatchObject({ httpStatus: 408, code: 'network' });
+    expect(getErr.toToolError().safe_to_retry).toBeUndefined();
     expect(getErr.nextSteps).toBeUndefined();
   });
 
-  it('non-OData 500 body is surfaced in details instead of being dropped (and still retried)', async () => {
+  it('retains the non-OData 500 body without replaying a mutation', async () => {
     let count = 0;
     server.use(
       http.delete(`${ORIGIN}/odata/ActivityDelete`, () => {
@@ -490,7 +493,7 @@ describe('HttpClient 5xx replay safety', () => {
         return HttpResponse.text('<html>Server Error in Application</html>', { status: 500 });
       })
     );
-    onTestFinished(() => expect(count).toBe(1 + 3));
+    onTestFinished(() => expect(count).toBe(1));
 
     const client = new HttpClient(makeCfg());
     client.setAllowedOrigin(ORIGIN);
@@ -504,6 +507,7 @@ describe('HttpClient 5xx replay safety', () => {
       )
     ).rejects.toMatchObject({
       httpStatus: 500,
+      code: 'outcome_unknown',
       details: expect.stringContaining('Server Error in Application'),
     });
   }, 20000);

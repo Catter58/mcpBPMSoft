@@ -74,8 +74,14 @@ function buildServices(
     },
   };
   const metadataManager = {
+    async resolveCollectionReference(collection: string) {
+      return { name: collection };
+    },
     async getEntityMetadata() {
-      return { properties: [], lookupFields: [] };
+      return {
+        properties: [{ name: 'ResultId', type: 'Edm.Guid', nullable: true, isLookup: true }],
+        lookupFields: [],
+      };
     },
     async resolveFieldReference(_c: string, key: string) {
       return { name: key === 'Результат' ? 'ResultId' : key };

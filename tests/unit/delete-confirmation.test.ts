@@ -57,18 +57,18 @@ function buildStubServices(state: StubState): ServiceContainer {
     async deleteRecord(collection: string, id: string) {
       state.deleteRecordCalls.push({ collection, id });
     },
-    buildRecordPath(collection: string, id: string) {
-      return `/${collection}(${id})`;
-    },
     buildCollectionPath(collection: string) {
       return `/${collection}`;
     },
-    async executeBulk(requests: Array<{ method: string; url: string }>, _continueOnError: boolean) {
+    buildRecordPath(collection: string, id: string) {
+      return `/${collection}(${id})`;
+    },
+    async executeBatch(requests: Array<{ method: string; url: string }>, _continueOnError: boolean) {
       state.executeBatchCalls.push(requests);
-      return {
-        responses: requests.map((_, i) => ({ id: String(i + 1), status: 204, body: null })),
-        mode: 'batch',
-      };
+      return { responses: requests.map((_, i) => ({ id: String(i + 1), status: 204, body: null })) };
+    },
+    async getFieldBinary() {
+      return Buffer.from('photo');
     },
     async deleteFieldBinary(collection: string, id: string, field: string) {
       state.deleteFieldCalls.push({ collection, id, field });
@@ -76,13 +76,23 @@ function buildStubServices(state: StubState): ServiceContainer {
   };
 
   const authManager = { ensureAuthenticated: vi.fn(async () => undefined) };
+  Object.assign(odataClient, {
+    executeBulk: async (requests: Array<{ method: string; url: string }>, continueOnError: boolean) => ({
+      ...(await odataClient.executeBatch(requests, continueOnError)),
+      mode: 'batch',
+    }),
+  });
 
   return {
     config: null!,
     httpClient: null!,
     authManager: authManager as unknown as ServiceContainer['authManager'],
     odataClient: odataClient as unknown as ServiceContainer['odataClient'],
-    metadataManager: null! as ServiceContainer['metadataManager'],
+    metadataManager: {
+      resolveCollectionReference: async (name: string) => ({ name }),
+      resolveFieldReference: async (_collection: string, name: string) => ({ name }),
+      getEntityMetadata: async () => ({ properties: [{ name: 'Photo', type: 'Edm.Binary' }] }),
+    } as unknown as ServiceContainer['metadataManager'],
     lookupResolver: null! as ServiceContainer['lookupResolver'],
     processEngine: null! as ServiceContainer['processEngine'],
     initialized: true,
@@ -117,10 +127,12 @@ describe('bpm_delete_record confirmation', () => {
     registerWriteTools(server as never, services);
 
     const handler = getHandler(server, 'bpm_delete_record');
+    const preview = await handler({ collection: 'Contact', id: '11111111-2222-3333-4444-555555555555' });
     const result = await handler({
       collection: 'Contact',
       id: '11111111-2222-3333-4444-555555555555',
       confirm: true,
+      confirmation_token: preview.structuredContent?.confirmation_token,
     });
 
     expect(state.deleteRecordCalls).toEqual([
@@ -157,11 +169,13 @@ describe('bpm_delete_by_filter confirmation', () => {
     registerWriteTools(server as never, services);
 
     const handler = getHandler(server, 'bpm_delete_by_filter');
+    const preview = await handler({ collection: 'Contact', filter: "Name eq 'X'", expected_count: 2 });
     const result = await handler({
       collection: 'Contact',
       filter: "Name eq 'X'",
       expected_count: 2,
       confirm: true,
+      confirmation_token: preview.structuredContent?.confirmation_token,
     });
 
     expect(state.deleteRecordCalls).toHaveLength(2);
@@ -187,10 +201,6 @@ describe('bpm_delete_by_filter confirmation', () => {
   });
 });
 
-const UUID_A = 'bbbbbbbb-0000-0000-0000-000000000001';
-const UUID_B = 'bbbbbbbb-0000-0000-0000-000000000002';
-const UUID_C = 'bbbbbbbb-0000-0000-0000-000000000003';
-
 describe('bpm_batch_delete confirmation', () => {
   it('without confirm returns a preview and does not call executeBatch', async () => {
     const state: StubState = { deleteRecordCalls: [], executeBatchCalls: [], deleteFieldCalls: [] };
@@ -199,7 +209,14 @@ describe('bpm_batch_delete confirmation', () => {
     registerBatchTools(server as never, services);
 
     const handler = getHandler(server, 'bpm_batch_delete');
-    const result = await handler({ collection: 'Contact', ids: [UUID_A, UUID_B, UUID_C] });
+    const result = await handler({
+      collection: 'Contact',
+      ids: [
+        'aaaaaaaa-1111-4111-8111-111111111111',
+        'bbbbbbbb-2222-4222-8222-222222222222',
+        'cccccccc-3333-4333-8333-333333333333',
+      ],
+    });
 
     expect(state.executeBatchCalls).toHaveLength(0);
     expect(result.structuredContent?.requires_confirmation).toBe(true);
@@ -213,7 +230,16 @@ describe('bpm_batch_delete confirmation', () => {
     registerBatchTools(server as never, services);
 
     const handler = getHandler(server, 'bpm_batch_delete');
-    const result = await handler({ collection: 'Contact', ids: [UUID_A, UUID_B], confirm: true });
+    const preview = await handler({
+      collection: 'Contact',
+      ids: ['aaaaaaaa-1111-4111-8111-111111111111', 'bbbbbbbb-2222-4222-8222-222222222222'],
+    });
+    const result = await handler({
+      collection: 'Contact',
+      ids: ['aaaaaaaa-1111-4111-8111-111111111111', 'bbbbbbbb-2222-4222-8222-222222222222'],
+      confirm: true,
+      confirmation_token: preview.structuredContent?.confirmation_token,
+    });
 
     expect(state.executeBatchCalls).toHaveLength(1);
     expect(state.executeBatchCalls[0]).toHaveLength(2);
@@ -246,11 +272,17 @@ describe('bpm_field_delete confirmation', () => {
     registerStreamTools(server as never, services);
 
     const handler = getHandler(server, 'bpm_field_delete');
+    const preview = await handler({
+      collection: 'Contact',
+      id: '11111111-2222-3333-4444-555555555555',
+      field: 'Photo',
+    });
     const result = await handler({
       collection: 'Contact',
       id: '11111111-2222-3333-4444-555555555555',
       field: 'Photo',
       confirm: true,
+      confirmation_token: preview.structuredContent?.confirmation_token,
     });
 
     expect(state.deleteFieldCalls).toEqual([

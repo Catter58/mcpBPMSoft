@@ -64,6 +64,7 @@ export function normalizeName(raw: string): NormalizedName {
 
 /** 100 exact normalized > 90 exact core > 70 core-prefix > 55 token subset > 40 substring > 0 */
 export function scoreCandidate(query: NormalizedName, candidate: NormalizedName): number {
+  if (!query.normalized || !candidate.normalized) return 0;
   if (candidate.normalized === query.normalized) return 100;
   if (candidate.core === query.core) return 90;
   if (candidate.core.startsWith(query.core)) return 70;
@@ -74,18 +75,18 @@ export function scoreCandidate(query: NormalizedName, candidate: NormalizedName)
 }
 
 /**
- * Index of the confident leader: max score ≥ 40 AND either no rivals or the
- * runner-up trails by ≥ 15 points. A tie or weak signal → null (ambiguous).
+ * Only a unique equivalent name is safe for automatic reference assignment.
+ * Prefix, token and substring scores rank suggestions; they cannot select a record.
  */
 export function pickConfidentIndex(scores: number[]): number | null {
   if (scores.length === 0) return null;
   let best = 0;
   for (let i = 1; i < scores.length; i++) if (scores[i] > scores[best]) best = i;
-  if (scores[best] < 40) return null;
+  if (scores[best] < 90) return null;
   let second = -1;
   for (let i = 0; i < scores.length; i++) {
     if (i !== best && scores[i] > second) second = scores[i];
   }
-  if (second >= 0 && scores[best] - second < 15) return null;
+  if (second >= 90) return null;
   return best;
 }

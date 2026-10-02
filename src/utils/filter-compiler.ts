@@ -13,26 +13,32 @@
  *   - Generated filters are safe by construction — every identifier is
  *     validated, every value is escaped through escapeODataString.
  *
- * Lookup-колонки со строковым значением компилируются через навигацию:
- * {field: 'Тип', op: 'равно', value: 'Сотрудник'} → `Type/Name eq 'Сотрудник'`.
- * Это снимает с модели обязанность сначала доставать UUID и убирает целый класс
- * ошибок lookup_ambiguous. Проверено на стенде: фильтр и сортировка по
- * навигационному пути работают. UUID в значении по-прежнему сравнивается с
- * самой FK-колонкой — так дешевле для сервера.
+ * Metadata owns scalar types; LookupResolver owns reference identity.
  */
 
-import type { MetadataManager } from '../metadata/metadata-manager.js';
-import { UnknownFieldError } from './errors.js';
-import { containsExpression, escapeODataString, isSafeIdentifier } from './odata.js';
-import { normalizeName } from './name-normalize.js';
 import { getDisplayColumn } from './display.js';
 import { calendarRange, resolveTimeZone, zonedMidnightUtc, type CalendarPeriod } from './datetime.js';
 import { isMeMacro, meIdFor } from './me-macro.js';
+import { coerceValue } from './coerce.js';
 import type { CurrentUser } from '../user/current-user.js';
+import type { MetadataManager } from '../metadata/metadata-manager.js';
+import type { LookupResolver } from '../lookup/lookup-resolver.js';
+import type { EntityProperty } from '../types/index.js';
+import { BpmApiError, LookupResolutionError, UnknownFieldError } from './errors.js';
+import { containsExpression, escapeODataString, isSafeIdentifier } from './odata.js';
+import { normalizeName } from './name-normalize.js';
+import {
+  coerceFieldValue,
+  fieldValueError,
+  isDateType,
+  isNumericType,
+  literalizeFieldValue,
+  UUID_RE,
+} from './field-values.js';
 
 export interface Criterion {
   /** Field name, caption ("Город") or navigation path ("Account.City"). */
-  field: string;
+  field?: string;
   /** Operator — Russian synonym or canonical OData op. */
   op: string;
   /** Right-hand value. Optional for is_null / is_not_null. */
@@ -45,12 +51,11 @@ export interface CompileOptions {
   collection: string;
   metadataManager: MetadataManager;
   odataVersion: 3 | 4;
+  lookupResolver?: Pick<LookupResolver, 'resolve'>;
+  timeZone?: string;
+  currentUser?: { get(): Promise<CurrentUser> };
   /** How to combine multiple criteria. Default 'and'. */
   join?: 'and' | 'or';
-  /** Часовой пояс пользователя для «сегодня»/«вчера» (IANA). */
-  timeZone?: string;
-  /** Текущий пользователь — для «я»/@me в lookup на Contact/SysAdminUnit. */
-  currentUser?: { get(): Promise<CurrentUser> };
 }
 
 export interface UsedField {
@@ -209,10 +214,10 @@ const CALENDAR_PERIODS: CalendarPeriod[] = [
   'this_year',
 ];
 
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
 export async function compileFilter(criteria: Criterion[], options: CompileOptions): Promise<CompileResult> {
-  if (!Array.isArray(criteria) || criteria.length === 0) {
+  if (!Array.isArray(criteria))
+    throw new BpmApiError('criteria должен быть массивом условий.', 400, options.collection);
+  if (criteria.length === 0) {
     return { filter: '', used_fields: [], warnings: [] };
   }
 
@@ -222,7 +227,11 @@ export async function compileFilter(criteria: Criterion[], options: CompileOptio
 
   for (let criterion of criteria) {
     if (!criterion || typeof criterion.op !== 'string') {
-      throw new Error('Каждый critera должен быть объектом вида {field: string, op: string, value?: any}.');
+      throw new BpmApiError(
+        'Каждый criterion должен быть объектом вида {field: string, op: string, value?: any}.',
+        400,
+        options.collection
+      );
     }
 
     const op = canonicalOp(criterion.op);
@@ -233,55 +242,18 @@ export async function compileFilter(criteria: Criterion[], options: CompileOptio
       expressions.push(state.expr);
       continue;
     }
-    if (typeof criterion.field !== 'string') {
-      throw new Error('Каждый critera должен быть объектом вида {field: string, op: string, value?: any}.');
-    }
-    const resolved = await resolveFieldPath(criterion.field, options);
-    criterion = await substituteMe(criterion, resolved, options);
+    if (typeof criterion.field !== 'string')
+      throw new BpmApiError('Укажите field в условии.', 400, options.collection);
+    const reference = await resolveFieldPath(criterion.field, options);
+    criterion = await substituteMe(criterion, reference, options);
+    const resolved = await resolveExpressionField(reference, op, options, criterion);
 
-    // Lookup + текстовое значение → сравниваем с отображаемой колонкой справочника
-    // (Type/Name), а не с FK-колонкой, куда текст всё равно не подставить.
-    const byDisplayName = Boolean(resolved.displayPath) && isTextComparison(op, criterion);
-    // uuid в lookup сравниваем через навигацию (Owner/Id): на тестовом стенде /$count и $count=true
-    // падают на `OwnerId eq <uuid>`, а с навигацией работают. ne и пусто остаются на FK —
-    // навигация отбросила бы записи с пустой связью.
-    const byNavId = !byDisplayName && Boolean(resolved.idPath) && isUuidEquality(op, criterion);
-    let path = resolved.path;
-    if (byDisplayName) path = resolved.displayPath as string;
-    else if (byNavId) path = resolved.idPath as string;
-    // Пустота на FK (`AccountId eq null`, `OwnerId ne null`) на тестовом стенде рвёт поток даже без $count;
-    // через навигацию работает и в выборке, и в /$count: `Account eq null`, `Owner/Id ne null`.
-    else if (op === 'is_null' && resolved.idPath) path = resolved.idPath.replace(/\/Id$/, '');
-    else if (op === 'is_not_null' && resolved.idPath) path = resolved.idPath;
-
-    used.push({ input: criterion.field, resolved: path, caption: resolved.caption });
-    // Текст и uuid сервер уже обработал сам — предупреждать не о чем.
-    const uuidValue = typeof criterion.value === 'string' && UUID_RE.test(criterion.value);
-    if (resolved.lookupWarning && !byDisplayName && !byNavId && !uuidValue && criterion.value !== undefined)
-      warnings.push(resolved.lookupWarning);
-
-    // `OwnerId ne <uuid>` на тестовом стенде рвёт поток, а `Owner/Id ne <uuid>` теряет записи без связи
-    // (inner join). `not (Owner/Id eq <uuid>)` даёт верный результат и в выборке, и в /$count.
-    if (
-      op === 'ne' &&
-      resolved.idPath &&
-      typeof criterion.value === 'string' &&
-      UUID_RE.test(criterion.value)
-    ) {
-      expressions.push(
-        `not (${resolved.idPath} eq ${literalize(criterion.value, options.odataVersion, true)})`
-      );
-      continue;
-    }
-
-    const expr = buildExpression(
-      path,
-      op,
-      criterion,
-      options.odataVersion,
-      resolved.isLookup && !byDisplayName,
-      options.timeZone
-    );
+    used.push({
+      input: criterion.field ?? reference.path,
+      resolved: resolved.path,
+      caption: resolved.caption,
+    });
+    const expr = await buildExpression(resolved, op, criterion, options);
     expressions.push(expr);
   }
 
@@ -407,41 +379,6 @@ async function substituteMe(
   };
 }
 
-function isUuidEquality(op: CanonicalOp, criterion: Criterion): boolean {
-  const isUuid = (v: unknown) => typeof v === 'string' && UUID_RE.test(v);
-  if (op === 'eq') return isUuid(criterion.value);
-  if (op === 'in') {
-    return Array.isArray(criterion.value) && criterion.value.length > 0 && criterion.value.every(isUuid);
-  }
-  return false;
-}
-
-/**
- * Стоит ли сравнивать lookup с отображаемой колонкой справочника: значение —
- * текст, а не UUID, и оператор строковый. UUID и is_null остаются на FK-колонке.
- */
-function isTextComparison(op: CanonicalOp, criterion: Criterion): boolean {
-  if (CALENDAR_PERIODS.includes(op as CalendarPeriod)) return false;
-  const textOps: CanonicalOp[] = [
-    'eq',
-    'ne',
-    'contains',
-    'not_contains',
-    'startswith',
-    'endswith',
-    'similar_to',
-    'in',
-  ];
-  if (!textOps.includes(op)) return false;
-
-  const isText = (v: unknown) => typeof v === 'string' && v.length > 0 && !UUID_RE.test(v);
-
-  if (op === 'in') {
-    return Array.isArray(criterion.value) && criterion.value.length > 0 && criterion.value.every(isText);
-  }
-  return isText(criterion.value);
-}
-
 function canonicalOp(input: string): CanonicalOp {
   const trimmed = input.trim();
   const lower = trimmed.toLowerCase();
@@ -455,171 +392,203 @@ function canonicalOp(input: string): CanonicalOp {
   if (lower.startsWith('за последние ') && lower.endsWith(' дней')) return 'in_last_days';
   if (lower.startsWith('за последние ') && lower.endsWith(' часов')) return 'in_last_hours';
 
-  throw new Error(
+  throw new BpmApiError(
     `Неизвестный оператор: "${input}". Допустимые: равно/eq, не равно/ne, больше/gt, ` +
       `больше или равно/ge, меньше/lt, меньше или равно/le, содержит/contains, ` +
       `не содержит/not_contains, начинается с/startswith, заканчивается на/endswith, ` +
       `в списке/in, пусто/is_null, не пусто/is_not_null, ` +
       `за последние N дней/in_last_days, за последние N часов/in_last_hours, между/between, ` +
-      `похоже на/similar_to, открыт/open, закрыт/closed, успешно/won, неуспешно/lost.`
+      `похоже на/similar_to.`,
+    400
   );
 }
 
-interface ResolvedField {
-  /** OData identifier path with '/' separators ('Account/City') */
+export interface ResolvedField {
   path: string;
-  /** Caption of the FIRST resolved segment (if any). */
   caption?: string;
-  /** Whether final segment is a lookup column (e.g. CityId). */
+  property: EntityProperty;
+  collection: string;
   isLookup: boolean;
-  /** Optional warning about lookup-by-text. */
-  lookupWarning?: string;
-  /** Путь к отображаемой колонке справочника ('City/Name') — для сравнения по тексту. */
   displayPath?: string;
-  /** Справочник, на который ссылается последнее поле пути. */
-  lookupCollection?: string;
-  /** Путь к Id связанной записи через навигацию ('Owner/Id', только v4). */
   idPath?: string;
+  lookupCollection?: string;
+  lookup?: { lookupCollection: string; displayColumn: string; navigationProperty?: string };
 }
 
-async function resolveFieldPath(query: string, options: CompileOptions): Promise<ResolvedField> {
-  // Accept both '.' and '/' as separators; OData itself uses '/'.
-  const segments = query
-    .split(/[./]/)
-    .map((s) => s.trim())
-    .filter((s) => s.length > 0);
-
-  if (segments.length === 0) {
-    throw new Error(`Пустое имя поля: "${query}".`);
-  }
-
+export async function resolveFieldPath(query: string, options: CompileOptions): Promise<ResolvedField> {
+  const segments = query.split(/[./]/).map((s) => s.trim());
+  if (segments.some((segment) => !segment))
+    throw new BpmApiError(`Пустой сегмент пути поля: "${query}".`, 400, options.collection);
   let currentCollection = options.collection;
   const resolvedSegments: string[] = [];
-  let firstCaption: string | undefined;
-  let isLookup = false;
-  let lookupWarning: string | undefined;
-  let displayPath: string | undefined;
-  let lookupCollection: string | undefined;
-  let idPath: string | undefined;
-
+  let caption: string | undefined;
   for (let i = 0; i < segments.length; i++) {
-    const seg = segments[i];
-    const ref = await options.metadataManager.resolveFieldReference(currentCollection, seg);
-
-    if (!('name' in ref) || ref.name === null) {
-      // No match — surface UnknownFieldError so formatToolError lights up
-      // suggestions/next_steps for the LLM.
-      const suggestions = 'suggestions' in ref && Array.isArray(ref.suggestions) ? ref.suggestions : [];
-      throw new UnknownFieldError(query, currentCollection, suggestions);
-    }
-
+    const ref = await options.metadataManager.resolveFieldReference(currentCollection, segments[i]);
+    if (ref.name === null) throw new UnknownFieldError(query, currentCollection, ref.suggestions);
     const fieldName = ref.name;
-    if (!isSafeIdentifier(fieldName)) {
-      // resolveFieldReference returns metadata-derived names, but enforce the
-      // invariant once more so the URL builder never sees a tainted segment.
-      throw new Error(`Небезопасное имя поля от metadata: "${fieldName}".`);
-    }
-
-    if (i === 0) {
-      const meta = await options.metadataManager.getEntityMetadata(currentCollection);
-      const prop = meta.properties.find((p) => p.name === fieldName);
-      firstCaption = prop?.caption;
-    }
-
-    const isLastSegment = i === segments.length - 1;
-
-    if (!isLastSegment) {
-      // Mid-path: must be a navigation property. v4 uses navigation name like
-      // 'Account' (not 'AccountId'); v3 uses the bare lookup field name. We
-      // detect via getLookupInfo on the FK column when applicable.
-      const lookupInfo = await options.metadataManager.getLookupInfo(currentCollection, fieldName);
-      let nextCollection: string | null = null;
-      let navSegmentName: string;
-
-      if (lookupInfo) {
-        nextCollection = lookupInfo.lookupCollection;
-        // For v4 strip trailing 'Id' so '/Account/Name' navigation works
-        // (CityId is the FK column, City is the navigation property).
-        navSegmentName =
-          options.odataVersion === 4 && fieldName.endsWith('Id') ? fieldName.slice(0, -2) : fieldName;
-      } else {
-        // Could already be a navigation name — try resolving via metadata directly.
-        const meta = await options.metadataManager.getEntityMetadata(currentCollection);
-        const prop = meta.properties.find(
-          (p) => p.name === fieldName || (p.isLookup && p.name.replace(/Id$/, '') === fieldName)
-        );
-        if (!prop || !prop.isLookup || !prop.lookupCollection) {
-          throw new UnknownFieldError(query, currentCollection, [
-            `Сегмент "${seg}" в пути "${query}" не является навигационной (lookup) ссылкой.`,
-          ]);
-        }
-        nextCollection = prop.lookupCollection;
-        navSegmentName =
-          options.odataVersion === 4 && fieldName.endsWith('Id') ? fieldName.slice(0, -2) : fieldName;
-      }
-
-      if (!isSafeIdentifier(navSegmentName)) {
-        throw new Error(`Небезопасное имя навигации: "${navSegmentName}".`);
-      }
-
-      resolvedSegments.push(navSegmentName);
-      currentCollection = nextCollection;
-    } else {
+    if (!isSafeIdentifier(fieldName))
+      throw new BpmApiError(`Небезопасное имя поля: "${fieldName}".`, 400, currentCollection);
+    const meta = await options.metadataManager.getEntityMetadata(currentCollection);
+    const property = meta.properties.find((p) => p.name === fieldName);
+    if (!property) throw new UnknownFieldError(query, currentCollection, []);
+    if (i === 0) caption = property.caption;
+    const lookup = await options.metadataManager.getLookupInfo(currentCollection, fieldName);
+    if (i === segments.length - 1) {
       resolvedSegments.push(fieldName);
-      const lookupInfo = await options.metadataManager.getLookupInfo(currentCollection, fieldName);
-      if (lookupInfo) {
-        isLookup = true;
-        lookupCollection = lookupInfo.lookupCollection;
-        lookupWarning =
-          `Поле "${query}" является lookup; передайте UUID или используйте bpm_lookup_value для ` +
-          `получения UUID по тексту.`;
-
-        const meta = await options.metadataManager.getEntityMetadata(currentCollection);
-        const prop = meta.properties.find((p) => p.name === fieldName);
-        const nav =
-          prop?.lookupNavProperty ??
-          (options.odataVersion === 4 && fieldName.endsWith('Id') ? fieldName.slice(0, -2) : fieldName);
-        const display =
-          (await getDisplayColumn(options.metadataManager, lookupInfo.lookupCollection)) ??
-          lookupInfo.displayColumn;
-        if (isSafeIdentifier(nav) && isSafeIdentifier(display)) {
-          displayPath = [...resolvedSegments.slice(0, -1), nav, display].join('/');
-        }
-        if (options.odataVersion === 4 && isSafeIdentifier(nav) && nav !== fieldName) {
-          idPath = [...resolvedSegments.slice(0, -1), nav, 'Id'].join('/');
-        }
+      const nav =
+        lookup?.navigationProperty ||
+        property.lookupNavProperty ||
+        (options.odataVersion === 4 ? fieldName.replace(/Id$/, '') : fieldName);
+      const display = lookup
+        ? ((await getDisplayColumn(options.metadataManager, lookup.lookupCollection)) ?? lookup.displayColumn)
+        : undefined;
+      let idPath: string | undefined;
+      if (lookup && options.odataVersion === 4 && nav !== fieldName && isSafeIdentifier(nav)) {
+        const target = await options.metadataManager.getEntityMetadata(lookup.lookupCollection);
+        const keys = target.keyFields?.length
+          ? target.keyFields
+          : target.properties.some((p) => p.name === 'Id' && p.type === 'Edm.Guid')
+            ? ['Id']
+            : [];
+        const key =
+          keys.length === 1
+            ? target.properties.find((p) => p.name === keys[0] && p.type === 'Edm.Guid')
+            : undefined;
+        if (!key || !isSafeIdentifier(key.name))
+          throw fieldValueError(
+            property,
+            'справочник не описывает однозначный UUID-ключ.',
+            currentCollection
+          );
+        idPath = [...resolvedSegments.slice(0, -1), nav, key.name].join('/');
       }
+      return {
+        path: resolvedSegments.join('/'),
+        isLookup: !!lookup,
+        lookupCollection: lookup?.lookupCollection,
+        displayPath:
+          lookup && display && isSafeIdentifier(nav) && isSafeIdentifier(display)
+            ? [...resolvedSegments.slice(0, -1), nav, display].join('/')
+            : undefined,
+        idPath,
+        caption,
+        property,
+        collection: currentCollection,
+        lookup: lookup ?? undefined,
+      };
     }
+    if (!lookup)
+      throw new UnknownFieldError(query, currentCollection, [
+        `Сегмент "${segments[i]}" не является ссылкой на справочник.`,
+      ]);
+    const nav =
+      lookup.navigationProperty ||
+      property.lookupNavProperty ||
+      (options.odataVersion === 4 ? fieldName.replace(/Id$/, '') : fieldName);
+    if (!isSafeIdentifier(nav))
+      throw new BpmApiError(`Небезопасное имя навигации: "${nav}".`, 400, currentCollection);
+    resolvedSegments.push(nav);
+    currentCollection = lookup.lookupCollection;
   }
-
-  return {
-    path: resolvedSegments.join('/'),
-    caption: firstCaption,
-    isLookup,
-    lookupWarning,
-    displayPath,
-    lookupCollection,
-    idPath,
-  };
+  throw new UnknownFieldError(query, options.collection, []);
 }
 
-function buildExpression(
-  fieldPath: string,
+async function resolveExpressionField(
+  field: ResolvedField,
+  op: CanonicalOp,
+  options: CompileOptions,
+  criterion: Criterion
+): Promise<ResolvedField> {
+  let { path, property } = field;
+  const stringOps = ['contains', 'not_contains', 'similar_to', 'startswith', 'endswith'];
+  const values = Array.isArray(criterion.value) ? criterion.value : [criterion.value];
+  const displayEquality =
+    !options.lookupResolver &&
+    ['eq', 'ne', 'in'].includes(op) &&
+    values.length > 0 &&
+    values.every((v) => typeof v === 'string' && !UUID_RE.test(v.trim()));
+  if ((stringOps.includes(op) || displayEquality) && field.lookup) {
+    const target = await options.metadataManager.getEntityMetadata(field.lookup.lookupCollection);
+    const displayName = field.displayPath?.split('/').pop() ?? field.lookup.displayColumn;
+    const display = target.properties.find((p) => p.name === displayName);
+    if (!display || !field.displayPath)
+      throw fieldValueError(property, 'отображаемое поле справочника недоступно.', field.collection);
+    path = field.displayPath;
+    property = display;
+    return { ...field, path, property, lookup: undefined };
+  }
+  if (field.idPath && ['eq', 'ne', 'in', 'is_not_null'].includes(op)) path = field.idPath;
+  if (field.idPath && op === 'is_null') path = field.idPath.split('/').slice(0, -1).join('/');
+  return { ...field, path, property };
+}
+
+async function buildExpression(
+  field: ResolvedField,
   op: CanonicalOp,
   criterion: Criterion,
-  odataVersion: 3 | 4,
-  isLookup: boolean,
-  timeZone?: string
-): string {
+  options: CompileOptions
+): Promise<string> {
+  const { path, property } = field;
+  const stringOps = ['contains', 'not_contains', 'similar_to', 'startswith', 'endswith'];
+  if (stringOps.includes(op) && property.type !== 'Edm.String')
+    throw fieldValueError(property, `оператор "${op}" допустим только для строк.`, field.collection);
+  if ([...CALENDAR_PERIODS, 'in_last_days', 'in_last_hours'].includes(op) && !isDateType(property.type))
+    throw fieldValueError(property, `оператор "${op}" допустим только для дат.`, field.collection);
+  if (
+    ['gt', 'ge', 'lt', 'le', 'between'].includes(op) &&
+    !isDateType(property.type) &&
+    !isNumericType(property.type) &&
+    property.type !== 'Edm.String'
+  )
+    throw fieldValueError(property, `оператор "${op}" не поддерживается этим типом.`, field.collection);
+  const literal = async (value: unknown): Promise<string> => {
+    if (field.lookup && !stringOps.includes(op) && typeof value === 'string' && !UUID_RE.test(value.trim())) {
+      if (!options.lookupResolver)
+        throw fieldValueError(property, 'для поиска по названию требуется LookupResolver.', field.collection);
+      const result = await options.lookupResolver.resolve(
+        field.lookup.lookupCollection,
+        value,
+        field.lookup.displayColumn,
+        { fuzzy: true }
+      );
+      if (!result.resolved || !result.id)
+        throw new LookupResolutionError(
+          criterion.field ?? field.path,
+          value,
+          result.matchCount,
+          result.candidates,
+          field.lookup
+        );
+      value = result.id;
+    }
+    if (property.type === 'Edm.Date' && value instanceof Date) {
+      const parts = new Intl.DateTimeFormat('en-CA', {
+        timeZone: resolveTimeZone(options.timeZone),
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+      }).formatToParts(value);
+      const part = (type: string) => parts.find((p) => p.type === type)?.value;
+      value = `${part('year')}-${part('month')}-${part('day')}`;
+    }
+    if (isDateType(property.type))
+      value = coerceValue(property.name, value, property.type, options.timeZone).value;
+    return literalizeFieldValue(value, property, options.odataVersion, field.collection);
+  };
+  const stringValue = (): string => {
+    const value = coerceFieldValue(criterion.value, property, field.collection);
+    if (typeof value !== 'string')
+      throw fieldValueError(
+        property,
+        'оператор поиска по тексту требует строковое значение.',
+        field.collection
+      );
+    return value;
+  };
   if (CALENDAR_PERIODS.includes(op as CalendarPeriod)) {
-    // Полуинтервал [from, to): так последняя секунда суток не теряется.
-    const range = calendarRange(op as CalendarPeriod, resolveTimeZone(timeZone));
-    return (
-      `${fieldPath} ge ${dateTimeLiteral(range.from, odataVersion)} and ` +
-      `${fieldPath} lt ${dateTimeLiteral(range.to, odataVersion)}`
-    );
+    const range = calendarRange(op as CalendarPeriod, resolveTimeZone(options.timeZone));
+    return `${path} ge ${await literal(range.from)} and ${path} lt ${await literal(range.to)}`;
   }
-
   switch (op) {
     case 'eq':
     case 'ne':
@@ -627,163 +596,76 @@ function buildExpression(
     case 'ge':
     case 'lt':
     case 'le': {
-      // Дата без времени — это сутки в поясе пользователя, а не миг полуночи UTC.
-      if (isDateOnly(criterion.value)) {
-        const from = dateTimeLiteral(zonedInstant(criterion.value, timeZone), odataVersion);
-        const to = dateTimeLiteral(nextDayStart(criterion.value, timeZone), odataVersion);
-        if (op === 'eq') return `${fieldPath} ge ${from} and ${fieldPath} lt ${to}`;
-        if (op === 'ne') return `(${fieldPath} lt ${from} or ${fieldPath} ge ${to})`;
-        if (op === 'gt') return `${fieldPath} ge ${to}`;
-        if (op === 'le') return `${fieldPath} lt ${to}`;
-        return `${fieldPath} ${op} ${from}`;
+      if (isDateType(property.type) && property.type !== 'Edm.Date' && isDateOnly(criterion.value)) {
+        const from = await literal(criterion.value);
+        const to = await literal(nextDayStart(criterion.value, options.timeZone));
+        if (op === 'eq') return `${path} ge ${from} and ${path} lt ${to}`;
+        if (op === 'ne') return `(${path} lt ${from} or ${path} ge ${to})`;
+        if (op === 'gt') return `${path} ge ${to}`;
+        if (op === 'le') return `${path} lt ${to}`;
+        return `${path} ${op} ${from}`;
       }
-      return `${fieldPath} ${op} ${literalize(criterion.value, odataVersion, isLookup, timeZone)}`;
+      if (op === 'ne' && field.idPath && criterion.value !== null)
+        return `not (${path} eq ${await literal(criterion.value)})`;
+      return `${path} ${op} ${await literal(criterion.value)}`;
     }
-
     case 'contains':
-      return containsExpression(fieldPath, String(criterion.value ?? ''), odataVersion, {
-        caseInsensitive: true,
-      });
-
     case 'not_contains':
-      return `not ${containsExpression(fieldPath, String(criterion.value ?? ''), odataVersion, { caseInsensitive: true })}`;
-
-    case 'similar_to':
-      return containsExpression(fieldPath, normalizeName(String(criterion.value ?? '')).core, odataVersion, {
-        caseInsensitive: true,
-      });
-
+    case 'similar_to': {
+      const value = stringValue();
+      const needle = op === 'similar_to' ? normalizeName(value).core : value.toLowerCase();
+      const expression = containsExpression(path, needle, options.odataVersion, { caseInsensitive: true });
+      return op === 'not_contains' ? `not ${expression}` : expression;
+    }
     case 'startswith':
-      return `startswith(${fieldPath}, ${stringLiteral(criterion.value)})`;
-
     case 'endswith':
-      return `endswith(${fieldPath}, ${stringLiteral(criterion.value)})`;
-
+      return `${op}(${path}, '${escapeODataString(stringValue())}')`;
     case 'in': {
-      if (!Array.isArray(criterion.value) || criterion.value.length === 0) {
-        throw new Error(`Оператор "in" требует value=массив с минимум одним элементом.`);
-      }
-      const parts = criterion.value.map(
-        (v) => `${fieldPath} eq ${literalize(v, odataVersion, isLookup, timeZone)}`
-      );
+      if (!Array.isArray(criterion.value) || criterion.value.length === 0)
+        throw fieldValueError(property, 'оператор in требует непустой массив.', field.collection);
+      const parts: string[] = [];
+      for (const value of criterion.value) parts.push(`${path} eq ${await literal(value)}`);
       return parts.length === 1 ? parts[0] : `(${parts.join(' or ')})`;
     }
-
     case 'is_null':
-      return `${fieldPath} eq null`;
-
+      return `${path} eq null`;
     case 'is_not_null':
-      return `${fieldPath} ne null`;
-
-    case 'in_last_days': {
-      const days = numericValue(criterion.value, op);
-      const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
-      return `${fieldPath} ge ${dateTimeLiteral(since, odataVersion)}`;
-    }
-
+      return `${path} ne null`;
+    case 'in_last_days':
     case 'in_last_hours': {
-      const hours = numericValue(criterion.value, op);
-      const since = new Date(Date.now() - hours * 60 * 60 * 1000);
-      return `${fieldPath} ge ${dateTimeLiteral(since, odataVersion)}`;
+      const amount = numericValue(criterion.value, op);
+      const since = new Date(Date.now() - amount * (op === 'in_last_days' ? 86400000 : 3600000));
+      return `${path} ge ${await literal(since)}`;
     }
-
     case 'between': {
-      if (criterion.value === undefined || criterion.value_to === undefined) {
-        throw new Error(`Оператор "between" требует value (нижняя граница) и value_to (верхняя граница).`);
-      }
-      const lo = literalize(criterion.value, odataVersion, isLookup, timeZone);
-      // «между 01.09 и 14.09» включает весь последний день.
-      if (isDateOnly(criterion.value_to)) {
-        const to = dateTimeLiteral(nextDayStart(criterion.value_to, timeZone), odataVersion);
-        return `${fieldPath} ge ${lo} and ${fieldPath} lt ${to}`;
-      }
-      const hi = literalize(criterion.value_to, odataVersion, isLookup, timeZone);
-      return `${fieldPath} ge ${lo} and ${fieldPath} le ${hi}`;
+      if (criterion.value === undefined || criterion.value_to === undefined)
+        throw fieldValueError(property, 'оператор between требует обе границы.', field.collection);
+      if (isDateType(property.type) && property.type !== 'Edm.Date' && isDateOnly(criterion.value_to))
+        return `${path} ge ${await literal(criterion.value)} and ${path} lt ${await literal(nextDayStart(criterion.value_to, options.timeZone))}`;
+      return `${path} ge ${await literal(criterion.value)} and ${path} le ${await literal(criterion.value_to)}`;
     }
-
     default:
-      throw new Error(`Оператор "${op}" не поддерживается.`);
+      throw new BpmApiError(`Оператор "${op}" не поддерживается.`, 400, field.collection);
   }
-}
-
-function literalize(value: unknown, odataVersion: 3 | 4, isLookup: boolean, timeZone?: string): string {
-  if (value === null || value === undefined) return 'null';
-  if (typeof value === 'boolean') return value ? 'true' : 'false';
-  if (typeof value === 'number' && Number.isFinite(value)) return String(value);
-
-  if (value instanceof Date) {
-    return dateTimeLiteral(value, odataVersion);
-  }
-
-  if (typeof value === 'string') {
-    if (UUID_RE.test(value)) {
-      return odataVersion === 3 ? `guid'${value}'` : value;
-    }
-    if (isIsoDateLike(value)) {
-      const d = zonedInstant(value, timeZone);
-      if (!Number.isNaN(d.getTime())) {
-        return dateTimeLiteral(d, odataVersion);
-      }
-    }
-    // Fallthrough — treat as string. For lookup-typed columns this will not
-    // produce a usable filter, but compileFilter has already attached a
-    // warning telling the caller to resolve the UUID first. Returning the
-    // string literal at least keeps the operator well-formed.
-    void isLookup;
-    return stringLiteral(value);
-  }
-
-  // Fallback — toString, escaped as string. Better than crashing.
-  return stringLiteral(String(value));
-}
-
-function stringLiteral(value: unknown): string {
-  if (typeof value !== 'string') {
-    return `'${escapeODataString(String(value ?? ''))}'`;
-  }
-  return `'${escapeODataString(value)}'`;
-}
-
-function dateTimeLiteral(date: Date, odataVersion: 3 | 4): string {
-  // ISO 8601 without fractional seconds — tolerated by both v3 and v4 servers.
-  const iso = date.toISOString().replace(/\.\d{3}Z$/, 'Z');
-  return odataVersion === 3 ? `datetime'${iso.replace(/Z$/, '')}'` : iso;
 }
 
 function numericValue(value: unknown, op: CanonicalOp): number {
-  if (typeof value === 'number' && Number.isFinite(value) && value > 0) return Math.floor(value);
-  if (typeof value === 'string' && /^\d+$/.test(value.trim())) {
-    const n = Number.parseInt(value.trim(), 10);
-    if (n > 0) return n;
-  }
-  throw new Error(`Оператор "${op}" требует value=положительное число.`);
+  const number =
+    typeof value === 'number'
+      ? value
+      : typeof value === 'string' && /^\d+$/.test(value.trim())
+        ? Number(value)
+        : NaN;
+  if (Number.isSafeInteger(number) && number > 0) return number;
+  throw new BpmApiError(`Оператор "${op}" требует value=положительное целое число.`, 400);
 }
-
-const DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/;
 
 function isDateOnly(value: unknown): value is string {
-  return typeof value === 'string' && DATE_ONLY_RE.test(value);
+  return typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value);
 }
-
-/**
- * Дата/время без Z и смещения — местное время пользователя. `new Date()` взял бы
- * пояс процесса MCP (в Docker это UTC), и «15:00» уехало бы на три часа.
- */
-function zonedInstant(value: string, timeZone?: string): Date {
-  if (/(Z|[+-]\d{2}:?\d{2})$/.test(value)) return new Date(value);
-  const m = value.match(/^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2}))?(?:\.\d+)?)?$/);
-  if (!m) return new Date(value);
-  const midnight = zonedMidnightUtc(Number(m[1]), Number(m[2]), Number(m[3]), resolveTimeZone(timeZone));
-  // ponytail: смещение берётся на полночь; в день перевода часов время после перевода уедет на час.
-  const offsetMs = ((Number(m[4] ?? 0) * 60 + Number(m[5] ?? 0)) * 60 + Number(m[6] ?? 0)) * 1000;
-  return new Date(midnight.getTime() + offsetMs);
-}
-
 function nextDayStart(value: string, timeZone?: string): Date {
+  // Validate the original calendar date before adding a day (invalid dates must not normalize).
+  coerceFieldValue(value, { name: 'date', type: 'Edm.Date', nullable: false, isLookup: false });
   const [year, month, day] = value.split('-').map(Number);
   return zonedMidnightUtc(year, month, day + 1, resolveTimeZone(timeZone));
-}
-
-function isIsoDateLike(value: string): boolean {
-  return /^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}(:\d{2})?(\.\d+)?(Z|[+-]\d{2}:?\d{2})?)?$/.test(value);
 }

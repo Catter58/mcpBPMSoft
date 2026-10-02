@@ -9,6 +9,18 @@
 
 import type { ServiceContainer } from '../tools/init-tool.js';
 import { guidLiteral, isGuid } from '../utils/odata.js';
+import { coerceFieldValue } from '../utils/field-values.js';
+import {
+  type Decimal,
+  decimal,
+  addDecimal,
+  subtractDecimal,
+  multiplyDecimal,
+  compareDecimal,
+  divideDecimal,
+  roundDecimal,
+  decimalText,
+} from '../utils/decimal.js';
 
 interface LineConfig {
   parent: 'Order' | 'Invoice' | null;
@@ -41,8 +53,17 @@ export function lineConfig(collection: string): LineConfig | null {
   return LINE_ITEMS[collection.replace(/Collection$/, '')] ?? null;
 }
 
-const r2 = (n: number): number => Math.round(n * 100) / 100;
-const num = (v: unknown): number => (Number.isFinite(Number(v)) ? Number(v) : 0);
+const ZERO = decimal(0);
+const ONE = decimal(1);
+const HUNDRED = decimal(100);
+const num = (value: unknown): Decimal => {
+  if (value === undefined || value === null || value === '') return ZERO;
+  if (typeof value !== 'string' && typeof value !== 'number')
+    throw new TypeError('Ожидается десятичное число.');
+  return decimal(value);
+};
+const money = (value: Decimal): string => decimalText(roundDecimal(value, 2));
+const baseCurrency = (rate: Decimal): boolean => rate.units === 0n || compareDecimal(rate, ONE) === 0;
 const isEmpty = (v: unknown): boolean => v === undefined || v === null || v === '' || v === EMPTY_GUID;
 const errorOf = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 const guidOf = (v: unknown): string | null =>
@@ -68,6 +89,18 @@ export async function enrichLineItem(
   }
 }
 
+/** Generated fields must pass the same EDM coercion as caller-provided values. */
+async function normalizeFields(services: ServiceContainer, collection: string, data: Row): Promise<Row> {
+  const metadata = await services.metadataManager.getEntityMetadata(collection);
+  const properties = new Map(metadata.properties.map((property) => [property.name, property]));
+  return Object.fromEntries(
+    Object.entries(data).map(([field, value]) => {
+      const property = properties.get(field);
+      return [field, property ? coerceFieldValue(value, property, collection) : value];
+    })
+  );
+}
+
 async function enrich(
   services: ServiceContainer,
   collection: string,
@@ -87,7 +120,7 @@ async function enrich(
   const productChanged = update !== undefined && 'ProductId' in data && data.ProductId !== existing.ProductId;
   const needs = (field: string): boolean =>
     !(field in data) &&
-    (isEmpty(merged[field]) || productChanged || (field === 'Price' && !num(merged[field])));
+    (isEmpty(merged[field]) || productChanged || (field === 'Price' && num(merged[field]).units === 0n));
 
   const productId = guidOf(merged.ProductId);
   const product = productId
@@ -120,7 +153,7 @@ async function enrich(
           })
         ).value[0]
       : undefined;
-    const price = r2(num(listed ? listed.Price : product.Price));
+    const price = money(num(listed ? listed.Price : product.Price));
     out.Price = merged.Price = price;
     notes.push(`Цена из ${listed ? 'прайс-листа' : 'продукта'}: ${price}`);
   }
@@ -132,32 +165,42 @@ async function enrich(
 
   const price = num(merged.Price);
   const quantity = num(merged.Quantity);
-  const computed: Row = { Amount: r2(price * quantity) };
+  const amount = roundDecimal(multiplyDecimal(price, quantity), 2);
+  const computed: Row = { Amount: decimalText(amount) };
 
   if (cfg.full) {
-    const amount = computed.Amount as number;
     const percent = num(merged.DiscountPercent);
-    const discount = percent ? r2((amount * percent) / 100) : r2(num(merged.DiscountAmount));
-    const total = r2(amount - discount);
+    const discount =
+      percent.units !== 0n
+        ? divideDecimal(multiplyDecimal(amount, percent), HUNDRED, 2)
+        : roundDecimal(num(merged.DiscountAmount), 2);
+    const total = roundDecimal(subtractDecimal(amount, discount), 2);
     const taxId = guidOf(merged.TaxId);
     const taxPercent = taxId
       ? num((await services.odataClient.getRecord<Row>('Tax', taxId, { $select: 'Percent' })).Percent)
-      : 0;
+      : ZERO;
     // ponytail: налог «в том числе» (цена включает НДС) — взято из логики страницы продукта
     // платформы, на тестовом стенде не проверено. Если стенд считает налог сверху — поменять здесь.
-    const tax = taxPercent ? r2((total * taxPercent) / (100 + taxPercent)) : 0;
-    Object.assign(computed, { DiscountAmount: discount, TotalAmount: total, TaxAmount: tax });
+    const tax =
+      taxPercent.units !== 0n
+        ? divideDecimal(multiplyDecimal(total, taxPercent), addDecimal(HUNDRED, taxPercent), 2)
+        : ZERO;
+    Object.assign(computed, {
+      DiscountAmount: decimalText(discount),
+      TotalAmount: decimalText(total),
+      TaxAmount: decimalText(tax),
+    });
 
     // ponytail: Primary* = суммы строки только при курсе 0/1 (валюта строки = базовая).
     // При другом курсе Primary* не трогаем: направление пересчёта курса на стенде не проверено.
     const rate = num(merged.CurrencyRate);
-    if (rate === 0 || rate === 1) {
+    if (baseCurrency(rate)) {
       Object.assign(computed, {
-        PrimaryPrice: r2(price),
-        PrimaryAmount: amount,
-        PrimaryDiscountAmount: discount,
-        PrimaryTaxAmount: tax,
-        PrimaryTotalAmount: total,
+        PrimaryPrice: money(price),
+        PrimaryAmount: decimalText(amount),
+        PrimaryDiscountAmount: decimalText(discount),
+        PrimaryTaxAmount: decimalText(tax),
+        PrimaryTotalAmount: decimalText(total),
       });
     }
   }
@@ -165,18 +208,22 @@ async function enrich(
   for (const [field, value] of Object.entries(computed)) {
     // Primary* от вызывающего не трогаем; суммы строки держим согласованными всегда.
     if (field.startsWith('Primary') && field in data) continue;
-    if (field in data && num(data[field]) !== value) {
+    if (field in data && compareDecimal(num(data[field]), num(value)) !== 0) {
       notes.push(`${field}: передано ${String(data[field])}, записано расчётное ${String(value)}`);
     }
     out[field] = value;
   }
   notes.push(`Сумма: ${String(computed.Amount)}`);
   if (cfg.full) {
-    if (computed.DiscountAmount) notes.push(`Скидка: ${String(computed.DiscountAmount)}`);
+    if (num(computed.DiscountAmount).units !== 0n) notes.push(`Скидка: ${String(computed.DiscountAmount)}`);
     notes.push(`Итого: ${String(computed.TotalAmount)}`);
-    if (computed.TaxAmount) notes.push(`Налог (в т. ч.): ${String(computed.TaxAmount)}`);
+    if (num(computed.TaxAmount).units !== 0n) notes.push(`Налог (в т. ч.): ${String(computed.TaxAmount)}`);
   }
-  return { data: out, notes, parents: cfg.parent ? [...new Set(parents)] : [] };
+  return {
+    data: await normalizeFields(services, collection, out),
+    notes,
+    parents: cfg.parent ? [...new Set(parents)] : [],
+  };
 }
 
 /** Родители строк по их Id — читать до удаления, иначе пересчитывать будет нечего. */
@@ -232,19 +279,28 @@ export async function recalcParentTotals(
         },
         true
       );
-      const total = r2(lines.value.reduce((s, l) => s + num(l.TotalAmount), 0));
-      const withoutTax = r2(lines.value.reduce((s, l) => s + num(l.TotalAmount) - num(l.TaxAmount), 0));
+      const total = money(lines.value.reduce((sum, line) => addDecimal(sum, num(line.TotalAmount)), ZERO));
+      const withoutTax = money(
+        lines.value.reduce(
+          (sum, line) => addDecimal(sum, subtractDecimal(num(line.TotalAmount), num(line.TaxAmount))),
+          ZERO
+        )
+      );
       const record = await services.odataClient.getRecord<Row>(parent, parentId, {
         $select: 'Number,CurrencyRate',
       });
       const rate = num(record.CurrencyRate);
-      const primary = rate === 0 || rate === 1;
+      const primary = baseCurrency(rate);
       const patch: Row = { Amount: total, ...(primary ? { PrimaryAmount: total } : {}) };
       if (parent === 'Invoice') {
         patch.AmountWithoutTax = withoutTax;
         if (primary) patch.PrimaryAmountWithoutTax = withoutTax;
       }
-      await services.odataClient.updateRecord(parent, parentId, patch);
+      await services.odataClient.updateRecord(
+        parent,
+        parentId,
+        await normalizeFields(services, parent, patch)
+      );
       const name = isEmpty(record.Number) ? parentId : String(record.Number);
       notes.push(`Сумма ${PARENT_LABEL[parent]} ${name} пересчитана: ${total}`);
     } catch (error) {

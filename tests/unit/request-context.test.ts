@@ -5,6 +5,7 @@ import {
   runWithAuth,
   getRequestAuth,
   hasRequestAuth,
+  getAuthCacheScope,
 } from '../../src/auth/request-context.js';
 
 describe('parseCookieString', () => {
@@ -74,5 +75,32 @@ describe('runWithAuth / getRequestAuth isolation', () => {
 
     expect(seen).toContain('a:A:sa');
     expect(seen).toContain('b:B:sb');
+  });
+});
+
+describe('cache principal isolation', () => {
+  it('separates different identity cookies even when BPMSESSIONID is unchanged', () => {
+    const first = extractAuthFromHeaders({
+      BPMCSRF: 'same',
+      Cookie: 'BPMSESSIONID=session; .ASPXAUTH=identity-one',
+    });
+    const second = extractAuthFromHeaders({
+      BPMCSRF: 'same',
+      Cookie: 'BPMSESSIONID=session; .ASPXAUTH=identity-two',
+    });
+    expect(runWithAuth(first, getAuthCacheScope)).not.toBe(runWithAuth(second, getAuthCacheScope));
+  });
+  it('is independent of incoming cookie ordering and never exposes credentials', () => {
+    const first = extractAuthFromHeaders({
+      BPMCSRF: 'token',
+      Cookie: 'BPMSESSIONID=session; .ASPXAUTH=identity',
+    });
+    const second = extractAuthFromHeaders({
+      BPMCSRF: 'token',
+      Cookie: '.ASPXAUTH=identity; BPMSESSIONID=session',
+    });
+    expect(runWithAuth(first, getAuthCacheScope)).toBe(runWithAuth(second, getAuthCacheScope));
+    expect(runWithAuth(first, getAuthCacheScope)).toMatch(/^[0-9a-f]{64}$/);
+    expect(getAuthCacheScope()).toBe('');
   });
 });

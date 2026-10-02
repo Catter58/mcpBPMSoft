@@ -101,7 +101,11 @@ export function suggestFields(
     if (field.caption) candidates.push(field.caption);
     for (const cand of candidates) {
       const dist = fuzzyDistance(query, cand);
-      const norm = dist / Math.max(query.length, cand.length);
+      const containsQuery =
+        query.trim().length >= 3 && cand.toLowerCase().includes(query.trim().toLowerCase());
+      const norm = containsQuery
+        ? Math.min(0.25, dist / Math.max(query.length, cand.length))
+        : dist / Math.max(query.length, cand.length);
       if (norm < best) best = norm;
     }
     if (best <= threshold) {

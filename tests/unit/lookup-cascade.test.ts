@@ -136,7 +136,15 @@ describe('LookupResolver fuzzy cascade', () => {
     });
     const mm = {
       async getEntityMetadata() {
-        return { properties: [], lookupFields: [] };
+        return {
+          properties: [
+            { name: 'AccountId', type: 'Edm.Guid', nullable: true, isLookup: true },
+            { name: 'ResultId', type: 'Edm.Guid', nullable: true, isLookup: true },
+            { name: 'CityId', type: 'Edm.Guid', nullable: true, isLookup: true },
+            { name: 'Notes', type: 'Edm.String', nullable: true, isLookup: false },
+          ],
+          lookupFields: [],
+        };
       },
       async resolveFieldReference(_c: string, key: string) {
         return { name: key };
@@ -165,7 +173,15 @@ describe('LookupResolver fuzzy cascade', () => {
     );
     const mm = {
       async getEntityMetadata() {
-        return { properties: [], lookupFields: [] };
+        return {
+          properties: [
+            { name: 'AccountId', type: 'Edm.Guid', nullable: true, isLookup: true },
+            { name: 'ResultId', type: 'Edm.Guid', nullable: true, isLookup: true },
+            { name: 'CityId', type: 'Edm.Guid', nullable: true, isLookup: true },
+            { name: 'Notes', type: 'Edm.String', nullable: true, isLookup: false },
+          ],
+          lookupFields: [],
+        };
       },
       async resolveFieldReference(_c: string, key: string) {
         // Caption-словарь метаданных: «Результат» → ResultId
@@ -198,7 +214,15 @@ describe('LookupResolver fuzzy cascade', () => {
     });
     const mm = {
       async getEntityMetadata() {
-        return { properties: [], lookupFields: [] };
+        return {
+          properties: [
+            { name: 'AccountId', type: 'Edm.Guid', nullable: true, isLookup: true },
+            { name: 'ResultId', type: 'Edm.Guid', nullable: true, isLookup: true },
+            { name: 'CityId', type: 'Edm.Guid', nullable: true, isLookup: true },
+            { name: 'Notes', type: 'Edm.String', nullable: true, isLookup: false },
+          ],
+          lookupFields: [],
+        };
       },
       async resolveFieldReference(_c: string, key: string) {
         return { name: key === 'Результат' ? 'ResultId' : key };
@@ -228,7 +252,15 @@ describe('LookupResolver fuzzy cascade', () => {
     );
     const mm = {
       async getEntityMetadata() {
-        return { properties: [], lookupFields: [] };
+        return {
+          properties: [
+            { name: 'AccountId', type: 'Edm.Guid', nullable: true, isLookup: true },
+            { name: 'ResultId', type: 'Edm.Guid', nullable: true, isLookup: true },
+            { name: 'CityId', type: 'Edm.Guid', nullable: true, isLookup: true },
+            { name: 'Notes', type: 'Edm.String', nullable: true, isLookup: false },
+          ],
+          lookupFields: [],
+        };
       },
       async resolveFieldReference(_c: string, key: string) {
         return { name: key };
@@ -247,7 +279,10 @@ describe('LookupResolver fuzzy cascade', () => {
     const od = makeStubODataClient(() => []);
     const mm = {
       async getEntityMetadata() {
-        return { properties: [], lookupFields: [] };
+        return {
+          properties: [{ name: 'CityId', type: 'Edm.Guid', nullable: true, isLookup: true }],
+          lookupFields: ['CityId'],
+        };
       },
       async resolveFieldReference(_c: string, key: string) {
         return { name: key };

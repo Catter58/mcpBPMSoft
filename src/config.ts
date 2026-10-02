@@ -7,7 +7,21 @@
  * BPMSOFT_ALLOW_ENV_CREDS=true (headless/CI single-identity scenarios).
  */
 
+import { readFileSync } from 'node:fs';
+import { parseEnv } from 'node:util';
+import { resolve, parse } from 'node:path';
 import type { BpmConfig, ODataVersion, PlatformType } from './types/index.js';
+
+/** Load the optional local .env without replacing values already supplied by the runtime. */
+export function loadLocalEnvironment(path: string = '.env'): void {
+  try {
+    for (const [key, value] of Object.entries(parseEnv(readFileSync(path, 'utf8')))) {
+      if (process.env[key] === undefined) process.env[key] = value;
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+}
 
 const DEFAULT_CONFIG: Omit<BpmConfig, 'bpmsoft_url' | 'username' | 'password'> = {
   odata_version: 4,
@@ -61,6 +75,27 @@ export function buildConfig(
     platform?: string;
   }
 ): BpmConfig {
+  let target: URL;
+  try {
+    target = new URL(url);
+  } catch {
+    throw new Error('BPMSOFT_URL должен быть абсолютным URL HTTP или HTTPS.');
+  }
+  if (
+    !['http:', 'https:'].includes(target.protocol) ||
+    target.username ||
+    target.password ||
+    target.search ||
+    target.hash
+  ) {
+    throw new Error(
+      'BPMSOFT_URL должен содержать только HTTP(S) адрес приложения без логина, пароля, query и fragment.'
+    );
+  }
+  const fileRoot = process.env.BPMSOFT_FILE_ROOT ?? './files';
+  if (!fileRoot.trim() || fileRoot.includes('\0') || resolve(fileRoot) === parse(resolve(fileRoot)).root) {
+    throw new Error('BPMSOFT_FILE_ROOT должен указывать выделенный каталог, а не корень файловой системы.');
+  }
   const odataVersion = parseODataVersion(
     typeof options?.odata_version === 'number' ? String(options.odata_version) : options?.odata_version
   );
@@ -71,16 +106,17 @@ export function buildConfig(
   }
 
   return {
-    bpmsoft_url: url.replace(/\/+$/, ''), // strip trailing slashes
+    bpmsoft_url: target.toString().replace(/\/+$/, ''), // strip trailing slashes
     username,
     password,
     odata_version: odataVersion,
     platform,
     page_size: parseIntEnv('BPMSOFT_PAGE_SIZE', DEFAULT_CONFIG.page_size),
-    max_batch_size: parseIntEnv('BPMSOFT_MAX_BATCH_SIZE', DEFAULT_CONFIG.max_batch_size),
+    max_batch_size: Math.min(100, parseIntEnv('BPMSOFT_MAX_BATCH_SIZE', DEFAULT_CONFIG.max_batch_size)),
     lookup_cache_ttl: parseIntEnv('BPMSOFT_LOOKUP_CACHE_TTL', DEFAULT_CONFIG.lookup_cache_ttl),
     request_timeout: parseIntEnv('BPMSOFT_REQUEST_TIMEOUT', DEFAULT_CONFIG.request_timeout),
     max_file_size: parseIntEnv('BPMSOFT_MAX_FILE_SIZE', DEFAULT_CONFIG.max_file_size),
+    file_root: fileRoot,
   };
 }
 
@@ -111,7 +147,7 @@ export function getAuthUrl(config: BpmConfig): string {
 
 function parseODataVersion(value: string | undefined): ODataVersion {
   if (!value) return DEFAULT_CONFIG.odata_version;
-  const num = parseInt(value, 10);
+  const num = /^[34]$/.test(value) ? Number(value) : NaN;
   if (num === 3 || num === 4) return num;
   throw new Error(`Неверная версия OData: "${value}". Допустимые значения: 3 или 4.`);
 }
@@ -125,8 +161,8 @@ function parsePlatform(value: string | undefined): PlatformType {
 function parseIntEnv(name: string, defaultValue: number): number {
   const value = process.env[name];
   if (!value) return defaultValue;
-  const parsed = parseInt(value, 10);
-  if (isNaN(parsed) || parsed <= 0) {
+  const parsed = /^\d+$/.test(value) ? Number(value) : NaN;
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
     throw new Error(`Неверное значение ${name}: "${value}". Ожидается положительное целое число.`);
   }
   return parsed;

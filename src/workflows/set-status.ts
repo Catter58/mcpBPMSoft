@@ -11,8 +11,9 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import type { ServiceContainer } from '../tools/init-tool.js';
 import type { EntityProperty } from '../types/index.js';
-import { BpmApiError, UnknownCollectionError, formatToolError } from '../utils/errors.js';
+import { BpmApiError, UnknownCollectionError } from '../utils/errors.js';
 import { getTool } from '../tools/registry.js';
+import { writeToolError, writeFailureState } from '../utils/write-safety.js';
 import { notInitialized, resolveRecordId } from '../tools/_guards.js';
 
 function isStatusFieldName(name: string): boolean {
@@ -29,11 +30,11 @@ export function registerSetStatusTool(server: McpServer, services: ServiceContai
       description: meta.description,
       inputSchema: {
         collection: z.string().describe('Имя коллекции (EntitySet), например: Opportunity, Lead, Activity'),
-        id: z
+        id: z.string().describe('UUID или название записи, у которой меняется статус'),
+        expected_etag: z
           .string()
-          .describe(
-            'UUID записи или её название (Name/Title) — название ищется нечётким поиском; при неоднозначности вернутся кандидаты'
-          ),
+          .optional()
+          .describe('Версия записи из @odata.etag; защищает от перезаписи чужих изменений.'),
         status: z.string().describe('Человекочитаемое имя статуса (Name справочника)'),
         status_field: z
           .string()
@@ -53,6 +54,7 @@ export function registerSetStatusTool(server: McpServer, services: ServiceContai
     },
     async (params): Promise<CallToolResult> => {
       if (!services.initialized) return notInitialized();
+      let started = false;
       try {
         await services.authManager.ensureAuthenticated();
 
@@ -61,7 +63,7 @@ export function registerSetStatusTool(server: McpServer, services: ServiceContai
           throw new UnknownCollectionError(params.collection, collRef.suggestions);
         }
         const collection = collRef.name;
-        const { id: recordId, matched } = await resolveRecordId(services, collection, params.id);
+        const record = await resolveRecordId(services, collection, params.id);
 
         const entityMeta = await services.metadataManager.getEntityMetadata(collection);
 
@@ -93,10 +95,8 @@ export function registerSetStatusTool(server: McpServer, services: ServiceContai
               ]
             );
           }
-          // Несколько кандидатов (Activity: StatusId и EmailSendStatusId) — канонический
-          // StatusId (v4) / Status (v3) побеждает, остальные требуют status_field.
-          const canonical = candidates.find((c) => c.name === 'StatusId' || c.name === 'Status');
-          if (candidates.length > 1 && !canonical) {
+          const primary = candidates.find((field) => field.name === 'StatusId' || field.name === 'Status');
+          if (candidates.length > 1 && !primary) {
             throw new BpmApiError(
               `Найдено несколько статусных полей: ${candidates.map((c) => c.name).join(', ')}. Передайте status_field явно.`,
               400,
@@ -106,7 +106,7 @@ export function registerSetStatusTool(server: McpServer, services: ServiceContai
               [`Повторите вызов, добавив параметр status_field='<нужное имя>'.`]
             );
           }
-          statusField = canonical ?? candidates[0];
+          statusField = primary ?? candidates[0];
         }
 
         if (!statusField) {
@@ -126,48 +126,41 @@ export function registerSetStatusTool(server: McpServer, services: ServiceContai
           );
         }
 
-        const lookupResult = await services.lookupResolver.resolve(
-          lookupInfo.lookupCollection,
-          params.status,
-          lookupInfo.displayColumn,
-          { fuzzy: true }
-        );
-        if (!lookupResult.resolved || !lookupResult.id) {
-          throw new BpmApiError(
-            `Статус "${params.status}" не разрешён в справочнике ${lookupInfo.lookupCollection}.${lookupInfo.displayColumn} (matchCount=${lookupResult.matchCount}).`,
-            400,
-            collection,
-            undefined,
-            lookupResult.candidates.map((c) => c.displayValue),
-            [
-              `Запросите доступные значения: bpm_get_records(${lookupInfo.lookupCollection}, select='Id,${lookupInfo.displayColumn}').`,
-            ]
-          );
-        }
-
-        await services.odataClient.updateRecord(collection, recordId, {
-          [statusField.name]: lookupResult.id,
+        const resolved = await services.lookupResolver.resolveDataLookups(collection, {
+          [statusField.name]: params.status,
+        });
+        const statusId = resolved.data[statusField.name];
+        if (typeof statusId !== 'string')
+          throw new BpmApiError('Не удалось разрешить UUID статуса.', 400, collection);
+        started = true;
+        await services.odataClient.updateRecord(collection, record.id, resolved.data, {
+          expectedEtag: params.expected_etag,
         });
 
         return {
           content: [
             {
               type: 'text',
-              text: `Статус ${collection}(${recordId}${matched ? `, «${matched}»` : ''}) установлен: ${statusField.name} = "${params.status}" (${lookupResult.id}).`,
+              text: `Статус ${collection}(${record.id}${record.matched ? `, «${record.matched}»` : ''}) установлен: ${statusField.name} = "${params.status}" (${statusId}).`,
             },
           ],
           structuredContent: {
             collection,
-            id: recordId,
+            id: record.id,
             status_field: statusField.name,
-            status_id: lookupResult.id,
+            status_id: statusId,
             status_value: params.status,
           },
         };
       } catch (error) {
-        const toolError = formatToolError(error, params.collection);
+        const toolError = {
+          ...writeToolError(error, params.collection),
+          id: params.id,
+          ...(started ? { state: writeFailureState(error) } : {}),
+        };
         return {
           content: [{ type: 'text', text: JSON.stringify(toolError, null, 2) }],
+          structuredContent: { ...toolError },
           isError: true,
         };
       }

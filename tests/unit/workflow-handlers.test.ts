@@ -13,9 +13,16 @@ import { findOrCreate } from '../../src/workflows/find-or-create.js';
 import type { ServiceContainer } from '../../src/tools/init-tool.js';
 import type { EntityMetadata, EntityProperty, LookupResult } from '../../src/types/index.js';
 import { LookupResolutionError } from '../../src/utils/errors.js';
+import { LookupResolver } from '../../src/lookup/lookup-resolver.js';
 
 type Handler = (args: Record<string, unknown>) => Promise<CallToolResult>;
 
+const STATUS_DONE = 'aaaaaaaa-1111-4111-8111-111111111111';
+const CONTACT_EXISTING = 'bbbbbbbb-2222-4222-8222-222222222222';
+const ACCOUNT_EXISTING = 'cccccccc-3333-4333-8333-333333333333';
+const CURRENT_CONTACT = 'dddddddd-4444-4444-8444-444444444444';
+const CURRENT_USER = 'eeeeeeee-5555-4555-8555-555555555555';
+const CREATED = 'ffffffff-6666-4666-8666-666666666666';
 const CALL_CATEGORY_CALL = 'e52bd583-7825-e011-8165-00155d043204';
 const CALL_CATEGORY_TASK = '03df85bf-6b19-4dea-8463-d5d49b80bb28';
 
@@ -46,7 +53,7 @@ function meta(name: string, properties: EntityProperty[]): EntityMetadata {
 
 const METAS: Record<string, EntityMetadata> = {
   Contact: meta('Contact', [
-    str('Name'),
+    { ...str('Name'), required: true, requirementSource: 'entity_schema_designer' },
     str('Email'),
     str('JobTitle'),
     lookup('JobId', 'Job'),
@@ -54,7 +61,7 @@ const METAS: Record<string, EntityMetadata> = {
   ]),
   Account: meta('Account', [str('Name')]),
   Activity: meta('Activity', [
-    str('Title'),
+    { ...str('Title'), required: true, requirementSource: 'entity_schema_designer' },
     lookup('OwnerId', 'Contact'),
     lookup('ActivityCategoryId', 'ActivityCategory'),
     lookup('AccountId', 'Account'),
@@ -100,40 +107,57 @@ function buildStub(
       return p?.isLookup ? { lookupCollection: p.lookupCollection!, displayColumn: 'Name' } : null;
     },
   };
-  const lookupResolver = {
-    async resolve(collection: string, value: string) {
-      return lookups[`${collection}:${value}`] ?? notFound(value);
-    },
-    async resolveDataLookups(_c: string, data: Record<string, unknown>) {
-      return { data: { ...data }, notes: [] };
-    },
-  };
   const odataClient = {
     async getRecords(collection: string, query?: { $filter?: string }) {
       stub.queries.push({ collection, filter: query?.$filter });
       return { value: records(collection, query?.$filter) };
     },
-    async createRecord(collection: string, data: Record<string, unknown>) {
+    async getRecord(_collection: string, id: string) {
+      return { Id: id };
+    },
+    async createRecord(collection: string, data: Record<string, unknown>, options?: { id?: string }) {
       stub.created.push({ collection, data });
-      return { Id: `new-${collection}`, ...data };
+      return { ...data, Id: options?.id ?? CREATED };
+    },
+    async createRecordWithOutcome(
+      collection: string,
+      data: Record<string, unknown>,
+      options?: { id?: string }
+    ) {
+      return { record: await this.createRecord(collection, data, options), created: true };
     },
     async updateRecord(collection: string, id: string, data: Record<string, unknown>) {
       stub.updated.push({ collection, id, data });
     },
   };
+  const config = {
+    bpmsoft_url: 'https://crm.example.test',
+    username: 'tester',
+    odata_version: 4,
+  } as ServiceContainer['config'];
+  const currentUser = {
+    async get() {
+      return { userId: CURRENT_USER, userName: 'Test user', contactId: CURRENT_CONTACT };
+    },
+  } as unknown as ServiceContainer['currentUser'];
+  // Use the real field preparation path; only the lookup search API is stubbed.
+  const lookupResolver = new LookupResolver(
+    config,
+    odataClient as unknown as ServiceContainer['odataClient'],
+    metadataManager as unknown as ServiceContainer['metadataManager'],
+    { currentUser }
+  );
+  lookupResolver.resolve = async (collection: string, value: string) =>
+    lookups[`${collection}:${value}`] ?? notFound(value);
   stub.services = {
-    config: { odata_version: 4 } as ServiceContainer['config'],
+    config,
     httpClient: null!,
     authManager: { async ensureAuthenticated() {} } as unknown as ServiceContainer['authManager'],
     odataClient: odataClient as unknown as ServiceContainer['odataClient'],
     metadataManager: metadataManager as unknown as ServiceContainer['metadataManager'],
     lookupResolver: lookupResolver as unknown as ServiceContainer['lookupResolver'],
     processEngine: null!,
-    currentUser: {
-      async get() {
-        return { userId: 'user-1', userName: 'Supervisor', contactId: 'me-contact' };
-      },
-    } as unknown as ServiceContainer['currentUser'],
+    currentUser,
     initialized: true,
   };
   return stub;
@@ -154,19 +178,19 @@ describe('bpm_set_status', () => {
   const ACT = '11111111-2222-3333-4444-555555555555';
 
   it('prefers canonical StatusId over EmailSendStatusId', async () => {
-    const stub = buildStub({ 'ActivityStatus:Завершена': found('st-done', 'Завершена') });
+    const stub = buildStub({ 'ActivityStatus:Завершена': found(STATUS_DONE, 'Завершена') });
     const res = await handler(
       registerSetStatusTool,
       stub
     )({ collection: 'Activity', id: ACT, status: 'Завершена' });
     expect(res.isError).toBeUndefined();
-    expect(stub.updated).toEqual([{ collection: 'Activity', id: ACT, data: { StatusId: 'st-done' } }]);
+    expect(stub.updated).toEqual([{ collection: 'Activity', id: ACT, data: { StatusId: STATUS_DONE } }]);
   });
 
   it('accepts a record name instead of UUID', async () => {
     const stub = buildStub({
       'Activity:Звонок Иванову': found(ACT, 'Звонок Иванову'),
-      'ActivityStatus:Завершена': found('st-done', 'Завершена'),
+      'ActivityStatus:Завершена': found(STATUS_DONE, 'Завершена'),
     });
     await handler(
       registerSetStatusTool,
@@ -192,20 +216,20 @@ describe('bpm_register_contact', () => {
 
   it('returns already_exists for a contact with the same Email and creates nothing', async () => {
     const stub = buildStub({}, (c, f) =>
-      c === 'Contact' && f?.startsWith('Email eq') ? [{ Id: 'c-1', Name: 'Иван' }] : []
+      c === 'Contact' && f?.startsWith('Email eq') ? [{ Id: CONTACT_EXISTING, Name: 'Иван' }] : []
     );
     const res = await handler(registerRegisterContactTool, stub)({ name: 'Иван', email: 'i@x.ru' });
     expect(res.isError).toBeUndefined();
     expect(res.structuredContent).toMatchObject({
       already_exists: true,
-      contact_id: 'c-1',
+      contact_id: CONTACT_EXISTING,
       contact_name: 'Иван',
     });
     expect(stub.created).toHaveLength(0);
   });
 
   it('creates the contact anyway with force=true', async () => {
-    const stub = buildStub({}, () => [{ Id: 'c-1', Name: 'Иван' }]);
+    const stub = buildStub({}, () => [{ Id: CONTACT_EXISTING, Name: 'Иван' }]);
     const res = await handler(
       registerRegisterContactTool,
       stub
@@ -218,7 +242,7 @@ describe('bpm_register_contact', () => {
 describe('findOrCreate (fuzzy)', () => {
   it('reuses a fuzzy match instead of creating a duplicate', async () => {
     const stub = buildStub({
-      'Account:Ромашка': { ...found('acc-1', 'ООО «Ромашка»'), matchedValue: 'ООО «Ромашка»' },
+      'Account:Ромашка': { ...found(ACCOUNT_EXISTING, 'ООО «Ромашка»'), matchedValue: 'ООО «Ромашка»' },
     });
     const res = await findOrCreate(
       stub.services,
@@ -226,7 +250,7 @@ describe('findOrCreate (fuzzy)', () => {
       { field: 'Name', value: 'Ромашка' },
       { Name: 'Ромашка' }
     );
-    expect(res).toMatchObject({ id: 'acc-1', created: false });
+    expect(res).toMatchObject({ id: ACCOUNT_EXISTING, created: false });
     expect(stub.created).toHaveLength(0);
   });
 
@@ -237,8 +261,8 @@ describe('findOrCreate (fuzzy)', () => {
         searchValue: 'Ромашка',
         matchCount: 2,
         candidates: [
-          { id: 'a1', displayValue: 'ООО «Ромашка»' },
-          { id: 'a2', displayValue: 'АО «Ромашка»' },
+          { id: ACCOUNT_EXISTING, displayValue: 'ООО «Ромашка»' },
+          { id: CREATED, displayValue: 'АО «Ромашка»' },
         ],
       },
     });
@@ -277,7 +301,7 @@ describe('bpm_log_activity', () => {
   });
 
   it('maps owner_name "я" to the current contact and related_id name to a record id', async () => {
-    const stub = buildStub({ 'Account:Ромашка': found('acc-1', 'ООО «Ромашка»') });
+    const stub = buildStub({ 'Account:Ромашка': found(ACCOUNT_EXISTING, 'ООО «Ромашка»') });
     await handler(
       registerLogActivityTool,
       stub
@@ -287,6 +311,6 @@ describe('bpm_log_activity', () => {
       related_collection: 'Account',
       related_id: 'Ромашка',
     });
-    expect(stub.created[0].data).toMatchObject({ OwnerId: 'me-contact', AccountId: 'acc-1' });
+    expect(stub.created[0].data).toMatchObject({ OwnerId: CURRENT_CONTACT, AccountId: ACCOUNT_EXISTING });
   });
 });

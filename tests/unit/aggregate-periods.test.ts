@@ -1,4 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
+import * as z from 'zod';
+import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
+import type { QueryOptions } from '../../src/types/index.js';
 import { bucketLabel, bucketLabelsInRange, previousPeriodRange } from '../../src/utils/datetime.js';
 import {
   accumulate,
@@ -41,6 +44,132 @@ describe('bucketLabel в поясе пользователя', () => {
     expect(days).toHaveLength(7);
     expect(days[0]).toBe('2026-09-14');
     expect(days[6]).toBe('2026-09-20');
+  });
+});
+
+describe('bpm_aggregate scan completeness', () => {
+  function setup(
+    rows: Array<Record<string, unknown>>,
+    options: { serverPageSize?: number; nextLinks?: boolean; count?: boolean; ignoreTop?: boolean } = {}
+  ) {
+    let handler: (args: Record<string, unknown>) => Promise<CallToolResult>;
+    let input: z.ZodRawShape;
+    let output: z.ZodRawShape;
+    const queries: QueryOptions[] = [];
+    registerAggregateTool(
+      {
+        registerTool(
+          _name: string,
+          definition: { inputSchema: z.ZodRawShape; outputSchema: z.ZodRawShape },
+          registered: typeof handler
+        ) {
+          handler = registered;
+          input = definition.inputSchema;
+          output = definition.outputSchema;
+        },
+      } as never,
+      {
+        initialized: true,
+        config: { odata_version: 4 },
+        authManager: { async ensureAuthenticated() {} },
+        metadataManager: {
+          async resolveCollectionReference() {
+            return { name: 'Contact' };
+          },
+          async resolveFieldReference(_collection: string, field: string) {
+            return { name: field };
+          },
+          async getEntityMetadata() {
+            return { properties: [{ name: 'Name', type: 'Edm.String' }] };
+          },
+        },
+        odataClient: {
+          async getRecords(_collection: string, query: QueryOptions) {
+            queries.push(query);
+            const skip = query.$skip ?? 0;
+            const top = options.ignoreTop ? rows.length : (query.$top ?? 1000);
+            const value = rows.slice(skip, skip + Math.min(top, options.serverPageSize ?? 1000));
+            const hasNext = options.nextLinks && skip + value.length < rows.length && value.length < top;
+            return {
+              value,
+              ...(options.count ? { '@odata.count': rows.length } : {}),
+              ...(hasNext ? { '@odata.nextLink': 'https://bpm.test/odata/Contact?$skip=1' } : {}),
+            };
+          },
+        },
+      } as never
+    );
+    return {
+      queries,
+      async call(maxRecords: number) {
+        const result = await handler!(
+          z.object(input!).parse({
+            collection: 'Contact',
+            group_by: 'Name',
+            metrics: [{ field: 'Amount', op: 'sum' }],
+            filter: 'Amount ge 0',
+            max_records: maxRecords,
+          })
+        );
+        expect(result.isError).toBeUndefined();
+        z.object(output!).parse(result.structuredContent);
+        return result;
+      },
+    };
+  }
+
+  const rows = [
+    { Id: 'a', Name: 'A', Amount: '1' },
+    { Id: 'b', Name: 'A', Amount: '2' },
+    { Id: 'c', Name: 'A', Amount: '1000' },
+  ];
+
+  it('reports a complete result when exactly max_records rows match and no count is available', async () => {
+    const { call, queries } = setup(rows.slice(0, 2));
+    const result = await call(2);
+    expect(result.structuredContent).toMatchObject({
+      scanned: 2,
+      truncated: false,
+      groups: [{ key: 'A', count: 2, metrics: { 'sum(Amount)': 3 } }],
+    });
+    expect(queries).toHaveLength(2);
+    expect(queries[1]).toMatchObject({ $filter: 'Amount ge 0', $select: 'Id', $skip: 2, $top: 1 });
+  });
+
+  it('probes beyond the limit without including the extra row in groups or metrics', async () => {
+    const { call, queries } = setup(rows);
+    const result = await call(2);
+    expect(result.structuredContent).toMatchObject({
+      scanned: 2,
+      truncated: true,
+      groups: [{ key: 'A', count: 2, metrics: { 'sum(Amount)': 3 } }],
+    });
+    expect(queries[1]).toMatchObject({ $filter: 'Amount ge 0', $skip: 2, $top: 1 });
+  });
+
+  it.each([{ nextLinks: true }, { count: true }])(
+    'continues through short backend pages when continuation evidence is present: %o',
+    async (evidence) => {
+      const { call, queries } = setup(rows, { serverPageSize: 1, ...evidence });
+      const result = await call(4);
+      expect(result.structuredContent).toMatchObject({
+        scanned: 3,
+        truncated: false,
+        groups: [{ count: 3, metrics: { 'sum(Amount)': 1003 } }],
+      });
+      expect(queries.map((query) => query.$skip)).toEqual([0, 1, 2]);
+    }
+  );
+
+  it('honors max_records even if a backend ignores $top', async () => {
+    const { call, queries } = setup(rows, { ignoreTop: true });
+    const result = await call(2);
+    expect(result.structuredContent).toMatchObject({
+      scanned: 2,
+      truncated: true,
+      groups: [{ count: 2, metrics: { 'sum(Amount)': 3 } }],
+    });
+    expect(queries).toHaveLength(1);
   });
 });
 
@@ -176,7 +305,7 @@ describe('bpm_aggregate: неделя против прошлой по дням 
       config: { odata_version: 4 },
       authManager: { async ensureAuthenticated() {} },
       currentUser: {
-        get: async () => ({ userId: 'u', userName: 'Supervisor', contactId: ME, timeZoneId: MSK }),
+        get: async () => ({ userId: 'u', userName: 'ApiUser', contactId: ME, timeZoneId: MSK }),
       },
       metadataManager: {
         async resolveCollectionReference() {

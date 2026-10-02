@@ -90,6 +90,7 @@ export class ProcessEngineClient {
       url,
       contentKind: 'metadata',
       responseType: 'text',
+      operation: 'mutation',
     });
 
     const raw = typeof response.data === 'string' ? response.data : '';
@@ -120,6 +121,7 @@ export class ProcessEngineClient {
       url,
       contentKind: 'metadata',
       responseType: 'text',
+      operation: 'mutation',
     });
 
     const raw = typeof response.data === 'string' ? response.data : '';

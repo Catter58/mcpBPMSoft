@@ -37,7 +37,14 @@ export const lookupCandidateShape = z.object({
 export const confirmShape = {
   requires_confirmation: z.boolean().optional().describe('true — это превью, ничего не изменено'),
   code: z.string().optional().describe('Машинный код состояния (confirm_required и т.п.)'),
+  confirmation_token: z.string().optional(),
+  concurrency_protection: z.enum(['snapshot_only', 'etag']).optional(),
 };
+
+export const confirmationTokenParam = z
+  .string()
+  .optional()
+  .describe('Одноразовый токен из предварительного просмотра той же операции.');
 
 /** Критерий criteria-DSL: компилируется сервером в $filter (см. utils/filter-compiler.ts). */
 export const criterionSchema = z.object({

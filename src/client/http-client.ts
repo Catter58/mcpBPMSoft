@@ -8,7 +8,7 @@
  * - Context-aware Content-Type/Accept by `contentKind`
  * - Binary I/O (Buffer/Uint8Array bodies, binary responses)
  * - Same-origin enforcement (must be set explicitly via setAllowedOrigin)
- * - Retry with exponential backoff for 5xx
+ * - Retry read operations with exponential backoff for 5xx
  * - Retry honoring Retry-After for 429/503
  * - Auto-reauthentication on 401/403 (single attempt)
  * - Optional debug logging via BPMSOFT_DEBUG=1|trace with secret masking
@@ -23,14 +23,6 @@ const MAX_REDIRECTS = 5;
 const RETRY_BASE_DELAY_MS = 1000;
 const MAX_RETRY_AFTER_SECONDS = 60; // hard cap to avoid pathological waits
 
-/**
- * Methods that must never be replayed after a 5xx.
- * BPMSoft can persist the record and still answer 500 (insert succeeds, response
- * serialization/business process throws), so retrying a POST creates duplicates.
- * 429/503 are answered before processing, so they stay retryable for any method.
- */
-const NON_REPLAYABLE_METHODS = new Set(['POST']);
-
 /** Auth resolved for a single request: a BPMCSRF token and the cookies to send. */
 type ResolvedAuth = { csrfToken: string | null; cookies: Map<string, string> };
 
@@ -43,7 +35,7 @@ export class HttpClient {
   };
 
   private reauthHandler: (() => Promise<void>) | null = null;
-  private isReauthenticating = false;
+  private reauthPromise: Promise<void> | null = null;
   private allowedOrigin: string | null = null;
   private allowEnvCreds = false;
 
@@ -111,61 +103,64 @@ export class HttpClient {
    */
   async request<T = unknown>(options: HttpRequestOptions): Promise<HttpResponse<T>> {
     this.assertAllowedOrigin(options.url);
-    return this.requestWithRetry<T>(options, 0);
+    const timeout = options.timeout ?? this.config.request_timeout;
+    const timeoutSignal = AbortSignal.timeout(timeout);
+    const signal = options.signal ? AbortSignal.any([options.signal, timeoutSignal]) : timeoutSignal;
+    return this.requestWithRetry<T>({ ...options, signal }, 0, false);
   }
 
-  private async requestWithRetry<T>(options: HttpRequestOptions, attempt: number): Promise<HttpResponse<T>> {
+  private async requestWithRetry<T>(
+    options: HttpRequestOptions,
+    attempt: number,
+    reauthenticated: boolean
+  ): Promise<HttpResponse<T>> {
+    const mutation =
+      options.operation === 'mutation' || (options.operation !== 'read' && options.method !== 'GET');
     const resolved = this.resolveAuth(options.skipAuth);
     const headers = this.buildHeaders(options, resolved);
     const cookieStr = this.buildCookieString(resolved);
     if (cookieStr) headers['Cookie'] = cookieStr;
-
-    const controller = new AbortController();
-    const timeout = options.timeout ?? this.config.request_timeout;
-    const timeoutId = setTimeout(() => controller.abort(), timeout);
-
     const startedAt = Date.now();
+    let dispatched = false;
     try {
+      options.signal?.throwIfAborted();
       const fetchOptions: RequestInit = {
         method: options.method,
         headers,
-        signal: controller.signal,
+        signal: options.signal,
         redirect: 'manual',
       };
-
       if (options.body !== undefined && options.body !== null && options.method !== 'GET') {
         fetchOptions.body = this.encodeBody(options.body, headers);
       }
-
       this.logRequest(options, headers);
-
       let currentUrl = options.url;
+      dispatched = true;
       let response = await fetch(currentUrl, fetchOptions);
       let redirects = 0;
       while ([301, 302, 303, 307, 308].includes(response.status) && response.headers.get('location')) {
-        if (++redirects > MAX_REDIRECTS) {
-          throw new BpmApiError('Превышено число редиректов', 0);
-        }
-        const resolvedUrl = new URL(response.headers.get('location') as string, currentUrl).toString();
-        this.assertAllowedOrigin(resolvedUrl); // throws BpmApiError on cross-origin
-        currentUrl = resolvedUrl;
-        const redirectOpts: RequestInit = { ...fetchOptions };
-        if (response.status === 303) {
-          redirectOpts.method = 'GET';
-          delete (redirectOpts as { body?: unknown }).body;
-        }
-        response = await fetch(currentUrl, redirectOpts);
+        // Reissuing a side effect at a redirect destination has no exactly-once guarantee.
+        if (mutation) throw outcomeUnknown(response.status, 'Сервер перенаправил запрос изменения.');
+        if (++redirects > MAX_REDIRECTS) throw new BpmApiError('Превышено число редиректов', 0);
+        const nextUrl = new URL(response.headers.get('location') as string, currentUrl).toString();
+        this.assertAllowedOrigin(nextUrl);
+        currentUrl = nextUrl;
+        response = await fetch(currentUrl, fetchOptions);
       }
-
       this.extractCookies(response);
-
-      const data = await this.decodeBody<T>(response, options);
-
+      let data: T;
+      try {
+        data = await this.decodeBody<T>(response, options);
+      } catch (error) {
+        if (response.ok) throw error;
+        // The HTTP status still establishes a definite rejection even if the
+        // platform's error envelope is malformed or empty.
+        data = undefined as T;
+      }
       const responseHeaders: Record<string, string> = {};
       response.headers.forEach((value, key) => {
         responseHeaders[key] = value;
       });
-
       const httpResponse: HttpResponse<T> = {
         status: response.status,
         statusText: response.statusText,
@@ -173,105 +168,73 @@ export class HttpClient {
         data,
         ok: response.ok,
       };
-
       this.logResponse(options, httpResponse, Date.now() - startedAt);
 
-      // 401/403: reauth only in env-creds mode (never with a per-request token)
+      // A definite auth rejection precedes execution; one re-login is safe.
       if (
         (response.status === 401 || response.status === 403) &&
         !options.skipAuth &&
         !hasRequestAuth(getRequestAuth())
       ) {
-        return this.handleAuthFailure<T>(options, httpResponse);
+        if (!reauthenticated && this.allowEnvCreds && this.reauthHandler) {
+          dispatched = false; // The rejected attempt could not execute the mutation.
+          options.signal?.throwIfAborted();
+          await abortable(this.reauthenticate(), options.signal);
+          return this.requestWithRetry<T>(options, attempt, true);
+        }
       }
-
-      // 429 / 503 with Retry-After
-      if ((response.status === 429 || response.status === 503) && attempt < MAX_RETRIES) {
+      if (mutation && (response.status >= 500 || response.status === 408)) {
+        throw outcomeUnknown(response.status, parseODataError(data) ?? truncate(safeStringify(data), 1000));
+      }
+      if (
+        !mutation &&
+        ([500, 502, 503, 504].includes(response.status) || response.status === 429) &&
+        !isDeterministicAppError(data) &&
+        attempt < MAX_RETRIES
+      ) {
         const delayMs =
           this.parseRetryAfter(responseHeaders['retry-after']) ?? RETRY_BASE_DELAY_MS * Math.pow(2, attempt);
         console.error(
-          `[HttpClient] ${response.status} on ${options.method} ${shortUrl(options.url)}, retrying in ${delayMs}ms (attempt ${attempt + 1}/${MAX_RETRIES})`
+          `[HttpClient] HTTP ${response.status}; retry ${attempt + 1}/${MAX_RETRIES} in ${delayMs}ms`
         );
-        await sleep(delayMs);
-        return this.requestWithRetry<T>(options, attempt + 1);
+        await sleep(delayMs, options.signal);
+        return this.requestWithRetry<T>(options, attempt + 1, reauthenticated);
       }
-
-      const mayHaveApplied = NON_REPLAYABLE_METHODS.has(options.method) && !options.skipAuth;
-
-      // 5xx (other than 503): exponential backoff, except for non-replayable methods
-      // and deterministic application errors (повтор даст тот же ответ).
-      if (response.status >= 500 && response.status !== 503) {
-        const errorBody = jsonFromBinary(data);
-        const body = truncate(safeStringify(errorBody), 500);
-        const nonReplayable = NON_REPLAYABLE_METHODS.has(options.method);
-        const deterministic = isDeterministicAppError(errorBody);
-        if (attempt < MAX_RETRIES && !nonReplayable && !deterministic) {
-          const delayMs = RETRY_BASE_DELAY_MS * Math.pow(2, attempt);
-          console.error(
-            `[HttpClient] 5xx (${response.status}) on ${options.method} ${shortUrl(options.url)}: ${body}, retrying in ${delayMs}ms (attempt ${attempt + 1}/${MAX_RETRIES})`
-          );
-          await sleep(delayMs);
-          return this.requestWithRetry<T>(options, attempt + 1);
-        }
-        const reason = nonReplayable
-          ? 'неидемпотентный метод, запись могла пройти'
-          : deterministic
-            ? 'прикладная ошибка сервера, повтор не поможет'
-            : 'исчерпаны попытки';
-        console.error(
-          `[HttpClient] 5xx (${response.status}) on ${options.method} ${shortUrl(options.url)}: ${body} — не повторяю (${reason})`
-        );
-      }
-
-      // 304 — штатный ответ на условный GET (If-None-Match), а не сбой.
       if (!response.ok && response.status !== 304) {
-        const errorBody = jsonFromBinary(data);
-        const odataError = parseODataError(errorBody);
-        const bodySnippet = truncate(safeStringify(errorBody), 1000);
-        let details =
-          odataError ?? (bodySnippet && bodySnippet !== '{}' ? `Тело ответа: ${bodySnippet}` : undefined);
-        let nextSteps: string[] | undefined;
-        if (mayHaveApplied && response.status >= 500 && response.status !== 503) {
-          details = [details, replayNote(options.method)].filter(Boolean).join('\n');
-          nextSteps = REPLAY_NEXT_STEPS;
-        }
+        const message = parseODataError(data);
+        const bodySnippet = truncate(safeStringify(data), 1000);
         throw new BpmApiError(
-          odataError || `HTTP ${response.status}: ${response.statusText}`,
+          message || `HTTP ${response.status}: ${response.statusText}`,
           response.status,
           undefined,
-          details,
-          undefined,
-          nextSteps
+          message ?? (bodySnippet && bodySnippet !== '{}' ? `Тело ответа: ${bodySnippet}` : undefined)
         );
       }
-
       return httpResponse;
     } catch (error) {
       if (error instanceof BpmApiError) throw error;
-      // Таймаут или обрыв соединения после отправки POST не означает, что запись не создана.
-      const mayHaveApplied = NON_REPLAYABLE_METHODS.has(options.method) && !options.skipAuth;
-      const note = mayHaveApplied ? `. ${replayNote(options.method)}` : '';
-      const nextSteps = mayHaveApplied ? REPLAY_NEXT_STEPS : undefined;
-      if (error instanceof Error && error.name === 'AbortError') {
-        throw new BpmApiError(
-          `Превышен таймаут запроса (${timeout}ms)${note}`,
-          408,
-          undefined,
-          undefined,
-          undefined,
-          nextSteps
+      const interrupted =
+        options.signal?.aborted ||
+        (error instanceof Error && ['AbortError', 'TimeoutError'].includes(error.name));
+      if (mutation && dispatched) {
+        throw outcomeUnknown(
+          interrupted ? 408 : 0,
+          interrupted
+            ? 'Запрос прерван или истёк таймаут.'
+            : 'Соединение прервано до получения корректного ответа.'
         );
       }
       throw new BpmApiError(
-        `Сетевая ошибка: ${error instanceof Error ? error.message : String(error)}${note}`,
-        0,
+        interrupted
+          ? 'Запрос прерван или истёк таймаут.'
+          : `Сетевая ошибка: ${error instanceof Error ? error.message : String(error)}`,
+        interrupted ? 408 : 0,
         undefined,
         undefined,
         undefined,
-        nextSteps
+        undefined,
+        'network'
       );
-    } finally {
-      clearTimeout(timeoutId);
     }
   }
 
@@ -315,8 +278,8 @@ export class HttpClient {
         break;
       case 'crud':
       default:
-        contentType = v3 ? 'application/json; odata=verbose' : 'application/json';
-        accept = v3 ? 'application/json; odata=verbose' : 'application/json';
+        contentType = v3 ? 'application/json; odata=verbose' : 'application/json; IEEE754Compatible=true';
+        accept = v3 ? 'application/json; odata=verbose' : 'application/json; IEEE754Compatible=true';
         break;
     }
 
@@ -380,11 +343,13 @@ export class HttpClient {
    * - default — auto: prefers JSON when content-type indicates so, otherwise text
    */
   private async decodeBody<T>(response: Response, options: HttpRequestOptions): Promise<T> {
+    const responseType = options.responseType ?? 'auto';
     if (response.status === 204) {
+      if (responseType === 'binary') return Buffer.alloc(0) as unknown as T;
+      if (responseType === 'text') return '' as unknown as T;
       return {} as T;
     }
 
-    const responseType = options.responseType ?? 'auto';
     if (responseType === 'binary') {
       const buf = await response.arrayBuffer();
       return Buffer.from(buf) as unknown as T;
@@ -414,35 +379,17 @@ export class HttpClient {
     return (await response.text()) as unknown as T;
   }
 
-  private async handleAuthFailure<T>(
-    options: HttpRequestOptions,
-    failedResponse: HttpResponse<T>
-  ): Promise<HttpResponse<T>> {
-    if (this.isReauthenticating || !this.reauthHandler) {
-      throw new BpmApiError(
-        'Аутентификация не удалась. Проверьте учётные данные.',
-        failedResponse.status,
-        undefined,
-        'Повторная аутентификация невозможна'
-      );
+  private async reauthenticate(): Promise<void> {
+    if (!this.reauthPromise) {
+      this.reauthPromise = (async () => {
+        try {
+          await this.reauthHandler?.();
+        } finally {
+          this.reauthPromise = null;
+        }
+      })();
     }
-
-    this.isReauthenticating = true;
-    try {
-      console.error('[HttpClient] Auth failed, attempting reauthentication...');
-      await this.reauthHandler();
-      console.error('[HttpClient] Reauthentication successful, retrying request');
-      return this.requestWithRetry<T>(options, 0);
-    } catch (error) {
-      throw new BpmApiError(
-        'Повторная аутентификация не удалась',
-        401,
-        undefined,
-        error instanceof Error ? error.message : String(error)
-      );
-    } finally {
-      this.isReauthenticating = false;
-    }
+    return this.reauthPromise;
   }
 
   private extractCookies(response: Response): void {
@@ -498,8 +445,8 @@ export class HttpClient {
 
   private parseRetryAfter(header: string | undefined): number | null {
     if (!header) return null;
-    const seconds = parseInt(header, 10);
-    if (!isNaN(seconds) && seconds >= 0) {
+    const seconds = /^\d+$/.test(header.trim()) ? Number(header.trim()) : NaN;
+    if (Number.isFinite(seconds) && seconds >= 0) {
       return Math.min(seconds, MAX_RETRY_AFTER_SECONDS) * 1000;
     }
     // HTTP-date form
@@ -514,7 +461,7 @@ export class HttpClient {
   private logRequest(options: HttpRequestOptions, headers: Record<string, string>): void {
     if (this.debugMode === 'off') return;
     const masked = maskSecrets(headers);
-    console.error(`[HttpClient][req] ${options.method} ${options.url}`);
+    console.error(`[HttpClient][req] ${options.method} ${shortUrl(options.url)}`);
     if (this.debugMode === 'trace') {
       console.error(`[HttpClient][req] headers=${JSON.stringify(masked)}`);
       if (options.body !== undefined && options.body !== null && options.method !== 'GET') {
@@ -534,61 +481,91 @@ export class HttpClient {
   }
 }
 
-function replayNote(method: string): string {
-  return `Запрос ${method} мог выполниться на сервере: перед повтором проверьте, не создана ли запись (bpm_get_records/bpm_count_records по уникальному полю).`;
+function outcomeUnknown(status: number, details?: string): BpmApiError {
+  return new BpmApiError(
+    'Результат операции неизвестен: сервер мог уже выполнить изменение.',
+    status,
+    undefined,
+    [details, 'Запрос мог выполниться на сервере; проверьте фактическое состояние до повтора.']
+      .filter(Boolean)
+      .join('\n'),
+    undefined,
+    [
+      'Не повторяйте запрос вслепую: сервер мог уже выполнить изменение.',
+      'Проверьте существование и состояние записи через bpm_get_record, bpm_get_records или bpm_count_records по известному UUID или уникальным полям.',
+      'Для создания используйте тот же idempotency_key; новый ключ может создать дубль.',
+    ],
+    'outcome_unknown'
+  );
 }
 
-const REPLAY_NEXT_STEPS = [
-  'Не повторяйте запрос вслепую: сервер мог успеть сохранить запись, и повтор создаст дубликат.',
-  'Найдите запись через bpm_get_records или bpm_count_records по уникальному полю (например, Title/Name и CreatedOn за последние минуты).',
-  'Повторяйте создание, только если запись не найдена.',
-];
-
-/** Признаки временного сбоя в тексте/типе исключения: такие 5xx повторять имеет смысл. */
-// Тип исключения СУБД (Npgsql/SqlException) сам по себе не значит «временно»: на тестовом стенде битая таблица
-// отвечает PostgresException на каждый запрос. Повторяем только по признакам временного сбоя.
 const TRANSIENT_ERROR_RE =
   /timeout|timed out|deadlock|could not serialize|too many clients|connection|transport|temporar|reading from stream|end of stream|broken pipe/i;
 
-/** BPMSoft отдаёт JSON-ошибку и на binary-запросы (contentKind 'binary') — достаём её из Buffer. */
-function jsonFromBinary(data: unknown): unknown {
-  if (!(data instanceof Uint8Array)) return data;
-  try {
-    return JSON.parse(Buffer.from(data).toString('utf8').trim());
-  } catch {
-    return data;
-  }
-}
-
-/**
- * 5xx с телом OData-ошибки и нетранзиентным исключением (валидация, бизнес-правило,
- * FormatException) — детерминирован: повтор вернёт то же самое. HTML шлюза, пустое
- * тело и timeout/deadlock/обрыв БД — не детерминированы.
- */
+/** Read retries do not repeat deterministic application errors. */
 function isDeterministicAppError(body: unknown): boolean {
   let parsed = body;
+  if (body instanceof Uint8Array) parsed = Buffer.from(body).toString('utf8');
   if (typeof parsed === 'string') {
     try {
-      parsed = JSON.parse(parsed.trim());
+      parsed = JSON.parse(parsed);
     } catch {
       return false;
     }
   }
   const message = parseODataError(parsed);
   if (!message) return false;
-  const inner = (parsed as { error?: { innererror?: { type?: unknown; message?: unknown } } }).error
-    ?.innererror;
+  const envelope = parsed as {
+    error?: { innererror?: { type?: unknown; message?: unknown } };
+    'odata.error'?: { innererror?: { type?: unknown; message?: unknown } };
+  };
+  const inner = (envelope.error ?? envelope['odata.error'])?.innererror;
   return !TRANSIENT_ERROR_RE.test([message, inner?.type, inner?.message].join(' '));
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function abortable<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return promise;
+  return new Promise<T>((resolve, reject) => {
+    signal.throwIfAborted();
+    const abort = () => {
+      signal.removeEventListener('abort', abort);
+      reject(signal.reason);
+    };
+    signal.addEventListener('abort', abort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener('abort', abort);
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener('abort', abort);
+        reject(error);
+      }
+    );
+  });
+}
+
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    signal?.throwIfAborted();
+    const done = () => {
+      signal?.removeEventListener('abort', abort);
+      resolve();
+    };
+    const timer = setTimeout(done, ms);
+    const abort = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', abort);
+      reject(signal?.reason);
+    };
+    signal?.addEventListener('abort', abort, { once: true });
+  });
 }
 
 function shortUrl(url: string): string {
   try {
     const u = new URL(url);
-    return `${u.origin}${u.pathname}${u.search ? '?' + u.search.slice(1, 80) : ''}`;
+    return `${u.origin}${u.pathname}`;
   } catch {
     return url;
   }

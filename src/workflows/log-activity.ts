@@ -1,59 +1,73 @@
-/**
- * MCP Tool: bpm_log_activity
- *
- * Create an Activity record with optional auto-resolved owner, type and
- * relation lookups. The exact field names are discovered from metadata so
- * the tool works across BPMSoft instances with different schema captions.
- */
-
+/** Every supplied activity requirement is validated before the create request. */
 import * as z from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import type { ServiceContainer } from '../tools/init-tool.js';
 import type { EntityMetadata, EntityProperty } from '../types/index.js';
-import { formatToolError } from '../utils/errors.js';
+import { BpmApiError, UnknownCollectionError, UnknownFieldError } from '../utils/errors.js';
 import { getTool } from '../tools/registry.js';
 import { notInitialized, resolveRecordId } from '../tools/_guards.js';
-import { isMeMacro, meIdFor } from '../utils/me-macro.js';
 import { guidLiteral, isGuid } from '../utils/odata.js';
+import {
+  operationRecordId,
+  recordId,
+  writeFailureState,
+  validateIdempotencyKey,
+  validateRequiredCreateFields,
+  MissingRequiredFieldsError,
+  writeToolError,
+} from '../utils/write-safety.js';
 
-/** Тип, который BPMSoft ставит Activity по умолчанию (ActivityType «Задача»). */
-const DEFAULT_ACTIVITY_TYPE_ID = 'fbe0acdc-cfc0-df11-b00f-001d60e938c6';
+const TITLE = ['Title', 'Subject', 'Caption'];
+const OWNER = ['OwnerId', 'Owner', 'ResponsibleId', 'Responsible', 'AuthorId', 'Author'];
+const TYPE = ['ActivityCategoryId', 'ActivityCategory', 'TypeId', 'Type', 'ActivityTypeId', 'ActivityType'];
+const DUE = ['DueDate', 'StartDate', 'StartedOn', 'DueOn'];
+function findField(meta: EntityMetadata, candidates: string[]): EntityProperty | undefined {
+  return candidates.map((name) => meta.properties.find((p) => p.name === name)).find(Boolean);
+}
 
-const TITLE_CANDIDATES = ['Title', 'Subject', 'Caption'];
-const OWNER_CANDIDATES = ['Owner', 'OwnerId', 'Author', 'AuthorId', 'Responsible', 'ResponsibleId'];
-const TYPE_CANDIDATES = [
-  'ActivityCategory',
-  'ActivityCategoryId',
-  'Type',
-  'TypeId',
-  'ActivityType',
-  'ActivityTypeId',
-];
-const DUE_DATE_CANDIDATES = ['DueDate', 'StartDate', 'StartedOn', 'DueOn'];
-
-function findFieldName(meta: EntityMetadata, candidates: string[]): EntityProperty | undefined {
-  for (const cand of candidates) {
-    const prop = meta.properties.find((p) => p.name === cand);
-    if (prop) return prop;
+class ActivityRelationError extends BpmApiError {
+  constructor(
+    collection: string,
+    public readonly fields: EntityProperty[]
+  ) {
+    super(
+      `Нельзя однозначно установить связь Activity → ${collection}. Укажите related_field; ничего не создано.`,
+      400,
+      'Activity',
+      undefined,
+      fields.map((field) => field.name),
+      ['Выберите related_field из candidates и повторите вызов.']
+    );
   }
-  return undefined;
+  override toToolError() {
+    return {
+      ...super.toToolError(),
+      candidates: this.fields.map((field) => ({
+        field: field.name,
+        caption: field.caption ?? field.name,
+        lookup_collection: field.lookupCollection,
+      })),
+    };
+  }
 }
 
-/** Системные ссылки на Contact — связью с записью они не являются. */
-const SYSTEM_LOOKUPS = new Set(['CreatedById', 'ModifiedById', 'OwnerId', 'AuthorId']);
-
-function findLookupTo(meta: EntityMetadata, targetCollection: string): EntityProperty | undefined {
-  const candidates = meta.properties.filter((p) => p.isLookup && p.lookupCollection === targetCollection);
-  // ContactId/Contact раньше системных CreatedById/ModifiedById: иначе связь с контактом
-  // записывалась в «Кем создан» (проверено на тестовом стенде).
-  const entity = targetCollection.replace(/Collection$/, '');
-  return (
-    candidates.find((p) => p.name === `${entity}Id` || p.name === entity) ??
-    candidates.find((p) => !SYSTEM_LOOKUPS.has(p.name))
+/** Technical relation names distinguish a contact from owner/author contact lookups. */
+function relationField(metadata: EntityMetadata, collection: string): EntityProperty {
+  const fields = metadata.properties.filter(
+    (field) => field.isLookup && field.lookupCollection === collection
   );
+  for (const name of [`${collection}Id`, collection]) {
+    const canonical = fields.find((field) => field.name === name);
+    if (canonical) return canonical;
+  }
+  const navigation = fields.filter((field) => field.navigationProperty === collection);
+  if (navigation.length === 1) return navigation[0];
+  if (fields.length === 1) return fields[0];
+  throw new ActivityRelationError(collection, fields);
 }
 
+const DEFAULT_ACTIVITY_TYPE_ID = 'fbe0acdc-cfc0-df11-b00f-001d60e938c6';
 /**
  * В ActivityCategory бывают одноимённые строки: «Звонок» для типа «Звонок» и для
  * типа «Задача». Если все кандидаты названы одинаково, берём тот, чей ActivityTypeId
@@ -96,182 +110,143 @@ export function registerLogActivityTool(server: McpServer, services: ServiceCont
     {
       title: meta.title,
       description: meta.description,
+      annotations: meta.annotations,
       inputSchema: {
-        title: z.string().describe('Заголовок активности (обязательное поле)'),
-        type: z
-          .string()
-          .optional()
-          .describe('Тип активности (например, "Звонок", "Email", "Встреча"). Резолвится через справочник.'),
-        owner_name: z
-          .string()
-          .optional()
-          .describe(
-            'ФИО владельца — будет найден в Contact.Name и подставлен в OwnerId. "я" / "@me" — текущий пользователь.'
-          ),
-        related_collection: z
-          .string()
-          .optional()
-          .describe('Коллекция связанной записи (Account, Contact, Opportunity, Lead и т.п.).'),
+        title: z.string().trim().min(1),
+        type: z.string().optional(),
+        owner_name: z.string().optional(),
+        related_collection: z.string().optional(),
         related_id: z
           .string()
           .optional()
-          .describe('UUID связанной записи или её название (ищется в related_collection нечётким поиском).'),
-        due_date: z.string().optional().describe('Срок выполнения (ISO-8601).'),
-        notes: z.string().optional().describe('Заметки (Notes/Description).'),
+          .describe('UUID связанной записи или её название; сервер разрешает имя.'),
+        related_field: z
+          .string()
+          .optional()
+          .describe(
+            'Поле связи для нестандартной схемы. Обычно сервер сам выбирает ContactId/AccountId и каноническую навигацию; при неоднозначности возвращает candidates.'
+          ),
+        due_date: z.string().optional(),
+        notes: z.string().optional(),
+        idempotency_key: z
+          .string()
+          .min(1)
+          .max(200)
+          .optional()
+          .describe('Ключ одной активности. Повтор с теми же данными не создаёт дубль.'),
       },
       outputSchema: {
         activity_id: z.string(),
         used_fields: z.record(z.string(), z.string()),
         warnings: z.array(z.string()),
       },
-      annotations: meta.annotations,
     },
     async (params): Promise<CallToolResult> => {
       if (!services.initialized) return notInitialized();
+      let plannedId: string | undefined;
       try {
         await services.authManager.ensureAuthenticated();
-        const warnings: string[] = [];
-
+        validateIdempotencyKey(params.idempotency_key);
         const activityMeta = await services.metadataManager.getEntityMetadata('Activity');
-
-        const titleField = findFieldName(activityMeta, TITLE_CANDIDATES);
-        if (!titleField) {
-          throw new Error('В метаданных Activity не найдено поле заголовка (Title/Subject/Caption).');
+        if (typeof params.title !== 'string' || !params.title.trim()) {
+          const field = findField(activityMeta, TITLE);
+          throw new MissingRequiredFieldsError('Activity', [
+            {
+              name: field?.name ?? 'Title',
+              caption: field?.caption ?? field?.name ?? 'Title',
+              type: field?.type ?? 'Edm.String',
+            },
+          ]);
         }
-
+        if ((params.related_collection === undefined) !== (params.related_id === undefined))
+          throw new BpmApiError(
+            'Для связи передайте related_collection и related_id вместе.',
+            400,
+            'Activity'
+          );
+        if (params.related_field !== undefined && params.related_collection === undefined)
+          throw new BpmApiError('related_field требует related_collection и related_id.', 400, 'Activity');
         const data: Record<string, unknown> = {};
-        data[titleField.name] = params.title;
-        const usedFields: Record<string, string> = { title: titleField.name };
-
-        if (params.notes !== undefined) {
-          const notesField = activityMeta.properties.find(
-            (p) => p.name === 'Notes' || p.name === 'Description'
-          );
-          if (notesField) {
-            data[notesField.name] = params.notes;
-            usedFields.notes = notesField.name;
-          } else {
-            warnings.push('Не найдено поле для заметок (Notes/Description) — параметр notes проигнорирован.');
-          }
-        }
-
-        if (params.due_date !== undefined) {
-          const dueField = findFieldName(activityMeta, DUE_DATE_CANDIDATES);
-          if (dueField) {
-            data[dueField.name] = params.due_date;
-            usedFields.due_date = dueField.name;
-          } else {
-            warnings.push('Не найдено поле срока выполнения — параметр due_date проигнорирован.');
-          }
-        }
-
+        const usedFields: Record<string, string> = {};
+        const put = (input: string, value: string, candidates: string[], lookup = false) => {
+          const field = findField(activityMeta, candidates);
+          if (!field || (lookup && !field.isLookup))
+            throw new BpmApiError(
+              `Не найдено подходящее поле для ${input}; ничего не создано.`,
+              400,
+              'Activity'
+            );
+          data[field.name] = value;
+          usedFields[input] = field.name;
+        };
+        put('title', params.title, TITLE);
+        if (params.notes !== undefined) put('notes', params.notes, ['Notes', 'Description']);
+        if (params.due_date !== undefined) put('due_date', params.due_date, DUE);
         if (params.type !== undefined) {
-          const typeField = findFieldName(activityMeta, TYPE_CANDIDATES);
-          if (typeField && typeField.isLookup) {
-            data[typeField.name] =
-              (await pickSameNamedCategory(services, typeField, params.type)) ?? params.type;
-            usedFields.type = typeField.name;
-          } else if (typeField) {
-            data[typeField.name] = params.type;
-            usedFields.type = typeField.name;
-          } else {
-            warnings.push('Не найдено поле типа активности — параметр type проигнорирован.');
-          }
+          const field = findField(activityMeta, TYPE);
+          const category = field?.isLookup ? await pickSameNamedCategory(services, field, params.type) : null;
+          put('type', category ?? params.type, TYPE);
         }
-
-        if (params.owner_name !== undefined) {
-          const ownerField = findFieldName(activityMeta, OWNER_CANDIDATES);
-          const ownerCollection = ownerField?.lookupCollection ?? 'Contact';
-          if (ownerField && ownerField.isLookup && isMeMacro(params.owner_name)) {
-            const meId = meIdFor(ownerCollection, await services.currentUser.get());
-            if (meId) {
-              data[ownerField.name] = meId;
-              usedFields.owner = ownerField.name;
-            } else {
-              warnings.push(
-                `Текущий пользователь не связан с записью ${ownerCollection} — поле ${ownerField.name} оставлено пустым.`
-              );
-            }
-          } else if (ownerField && ownerField.isLookup) {
-            const ownerLookup = await services.lookupResolver.resolve(
-              ownerCollection,
-              params.owner_name,
-              ownerField.lookupDisplayColumn ?? 'Name',
-              { fuzzy: true }
+        if (params.owner_name !== undefined) put('owner', params.owner_name, OWNER, true);
+        if (params.related_collection !== undefined && params.related_id !== undefined) {
+          const ref = await services.metadataManager.resolveCollectionReference(params.related_collection);
+          if (ref.name === null) throw new UnknownCollectionError(params.related_collection, ref.suggestions);
+          const related = await resolveRecordId(services, ref.name, params.related_id);
+          let field: EntityProperty;
+          if (params.related_field !== undefined) {
+            const fieldRef = await services.metadataManager.resolveFieldReference(
+              'Activity',
+              params.related_field
             );
-            if (ownerLookup.resolved && ownerLookup.id) {
-              data[ownerField.name] = ownerLookup.id;
-              usedFields.owner = ownerField.name;
-            } else {
-              warnings.push(
-                `Не удалось разрешить owner_name "${params.owner_name}" (matchCount=${ownerLookup.matchCount}) — поле ${ownerField.name} оставлено пустым.`
+            if (fieldRef.name === null)
+              throw new UnknownFieldError(params.related_field, 'Activity', fieldRef.suggestions);
+            const explicit = activityMeta.properties.find((property) => property.name === fieldRef.name);
+            if (!explicit?.isLookup || explicit.lookupCollection !== ref.name)
+              throw new BpmApiError(
+                `Поле ${fieldRef.name} не является связью Activity → ${ref.name}.`,
+                400,
+                'Activity'
               );
-            }
-          } else {
-            warnings.push('Не найдено lookup-поле владельца — параметр owner_name проигнорирован.');
-          }
-        }
-
-        if (params.related_collection && params.related_id) {
-          const relField = findLookupTo(activityMeta, params.related_collection);
-          if (relField) {
-            const rel = await resolveRecordId(services, params.related_collection, params.related_id);
-            data[relField.name] = rel.id;
-            usedFields.relation = relField.name;
-            if (rel.matched && rel.matched !== params.related_id) {
-              warnings.push(
-                `Связанная запись "${params.related_id}" найдена как "${rel.matched}" (${rel.id}).`
+            field = explicit;
+          } else field = relationField(activityMeta, ref.name);
+          if (field.name in data) {
+            const existing = (
+              await services.lookupResolver.resolveDataLookups('Activity', { [field.name]: data[field.name] })
+            ).data[field.name];
+            if (typeof existing !== 'string' || existing.toLowerCase() !== related.id.toLowerCase())
+              throw new BpmApiError(
+                `Параметры владельца/типа и related_field задают разные значения поля ${field.name}.`,
+                400,
+                'Activity'
               );
-            }
-          } else {
-            warnings.push(
-              `В Activity нет lookup-поля, ссылающегося на ${params.related_collection}; связь не установлена.`
-            );
           }
+          await services.odataClient.getRecord(ref.name, related.id);
+          data[field.name] = related.id;
+          usedFields.relation = field.name;
         }
-
         const resolved = await services.lookupResolver.resolveDataLookups('Activity', data);
-        for (const n of resolved.notes) {
-          warnings.push(`Поле ${n.field}: "${n.input}" разрешено неточно как "${n.matchedValue}"`);
-        }
-        for (const c of resolved.coerced ?? []) {
-          warnings.push(
-            `Поле ${c.field}: ${JSON.stringify(c.input)} приведено к ${JSON.stringify(c.output)}`
-          );
-        }
+        await validateRequiredCreateFields(services, 'Activity', resolved.data);
+        plannedId = operationRecordId(services, params.idempotency_key, 'log-activity');
         const created = await services.odataClient.createRecord<Record<string, unknown>>(
           'Activity',
-          resolved.data
+          resolved.data,
+          { id: plannedId }
         );
-        const activityId = String(
-          (created as { Id?: unknown; id?: unknown }).Id ?? (created as { id?: unknown }).id ?? ''
-        );
-
+        const activityId = recordId(created);
+        const output = { activity_id: activityId, used_fields: usedFields, warnings: [] };
         return {
-          content: [
-            {
-              type: 'text',
-              text: [
-                `Активность зафиксирована: ${params.title} (${activityId})`,
-                `Использованные поля: ${Object.entries(usedFields)
-                  .map(([k, v]) => `${k}=${v}`)
-                  .join(', ')}`,
-                warnings.length ? `Предупреждения: ${warnings.join('; ')}` : '',
-              ]
-                .filter(Boolean)
-                .join('\n'),
-            },
-          ],
-          structuredContent: {
-            activity_id: activityId,
-            used_fields: usedFields,
-            warnings,
-          },
+          content: [{ type: 'text', text: `Активность создана: ${params.title} (${activityId}).` }],
+          structuredContent: output,
         };
       } catch (error) {
-        const toolError = formatToolError(error, 'Activity');
+        const formatted = writeToolError(error, 'Activity');
+        const output = {
+          ...formatted,
+          ...(plannedId ? { activity_id: plannedId, state: writeFailureState(error) } : {}),
+        };
         return {
-          content: [{ type: 'text', text: JSON.stringify(toolError, null, 2) }],
+          content: [{ type: 'text', text: JSON.stringify(output, null, 2) }],
+          structuredContent: output,
           isError: true,
         };
       }

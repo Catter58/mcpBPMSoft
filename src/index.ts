@@ -16,41 +16,19 @@
  * Transport: chosen via MCP_TRANSPORT (default `http`; set `stdio` for stdio).
  */
 
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 
 import { startHttpServer } from './server/http-transport.js';
-import { instrumentTools } from './server/instrumentation.js';
-import { tryLoadConfigFromEnv, isEnvCredsAllowed } from './config.js';
-import {
-  registerInitTool,
-  initializeServices,
-  createEmptyContainer,
-  type ServiceContainer,
-} from './tools/init-tool.js';
-import { registerReadTools } from './tools/read-tools.js';
-import { registerWriteTools } from './tools/write-tools.js';
-import { registerSchemaTools } from './tools/schema-tools.js';
-import { registerDescribeInstanceTool } from './tools/describe-instance-tool.js';
-import { registerEnumTool } from './tools/enum-tool.js';
-import { registerAggregateTool } from './tools/aggregate-tool.js';
-import { registerRecordCardTool } from './tools/record-card-tool.js';
-import { registerRelationsTool } from './tools/relations-tool.js';
-import { registerDedupTools } from './tools/dedup-tools.js';
-import { registerWhoamiTool } from './tools/whoami-tool.js';
-import { registerWorkflowCatalogTool } from './tools/workflow-catalog-tool.js';
-import { registerBatchTools } from './tools/batch-tools.js';
-import { registerStreamTools } from './tools/stream-tools.js';
-import { registerProcessTools } from './tools/process-tools.js';
-import { registerWorkflowTools } from './workflows/index.js';
-import { registerPrompts } from './prompts/index.js';
-import { registerResources } from './resources/index.js';
+import { tryLoadConfigFromEnv, isEnvCredsAllowed, loadLocalEnvironment } from './config.js';
+import { initializeServices, createEmptyContainer, type ServiceContainer } from './tools/init-tool.js';
+import { createToolServer } from './server/tool-server.js';
 import { TOOLS } from './tools/registry.js';
 import { PROMPTS } from './prompts/registry.js';
 
 let services: ServiceContainer = createEmptyContainer();
 
 async function main(): Promise<void> {
+  loadLocalEnvironment();
   const envConfig = tryLoadConfigFromEnv();
 
   if (!envConfig) {
@@ -73,42 +51,13 @@ async function main(): Promise<void> {
   // server/transport; the stdio path calls it once. `services` is shared across
   // all instances — it holds the HttpClient/AuthManager which read per-request
   // auth from AsyncLocalStorage and are stateless w.r.t. user identity.
-  const buildServer = (): McpServer => {
-    const server = new McpServer({
-      name: 'mcp-bpmsoft-odata',
-      version: '0.3.1',
-    });
-
-    // Замер должен встать до регистрации, иначе обработчики уже обёрнуты не будут.
-    instrumentTools(server);
-
-    // bpm_init is only exposed when env-stored credentials are explicitly enabled.
-    if (allowEnvCreds) {
-      registerInitTool(server, services, (newContainer) => {
+  const buildServer = () =>
+    createToolServer(services, {
+      allowEnvCreds,
+      onInitialized: (newContainer) => {
         services = newContainer;
-      });
-    }
-
-    registerReadTools(server, services);
-    registerWriteTools(server, services);
-    registerSchemaTools(server, services);
-    registerDescribeInstanceTool(server, services);
-    registerEnumTool(server, services);
-    registerAggregateTool(server, services);
-    registerRecordCardTool(server, services);
-    registerRelationsTool(server, services);
-    registerDedupTools(server, services);
-    registerWhoamiTool(server, services);
-    registerWorkflowCatalogTool(server, services);
-    registerBatchTools(server, services);
-    registerStreamTools(server, services);
-    registerWorkflowTools(server, services);
-    registerProcessTools(server, services);
-    registerPrompts(server, services);
-    registerResources(server, services);
-
-    return server;
-  };
+      },
+    });
 
   const operational = TOOLS.filter((t) => t.category !== 'init').length;
   const registeredTools = allowEnvCreds ? operational + 1 : operational;
@@ -118,15 +67,47 @@ async function main(): Promise<void> {
   console.error(`Registered ${PROMPTS.length} prompts, 4 resource templates`);
 
   const transportKind = (process.env.MCP_TRANSPORT || 'http').toLowerCase();
+  if (!['http', 'stdio'].includes(transportKind))
+    throw new Error('MCP_TRANSPORT должен быть http или stdio.');
   if (transportKind === 'stdio') {
+    if (!allowEnvCreds)
+      throw new Error(
+        'stdio не передаёт HTTP cookies. Включите BPMSOFT_ALLOW_ENV_CREDS=true и задайте данные отдельного пользователя для локального подключения.'
+      );
     const server = buildServer();
     const transport = new StdioServerTransport();
     await server.connect(transport);
     console.error('MCP BPMSoft OData Server running on stdio');
   } else {
-    const port = parseInt(process.env.MCP_HTTP_PORT || '8007', 10);
+    const rawPort = process.env.MCP_HTTP_PORT || '8007';
+    const port = /^\d+$/.test(rawPort) ? Number(rawPort) : NaN;
+    if (!Number.isInteger(port) || port < 1 || port > 65535)
+      throw new Error('MCP_HTTP_PORT должен быть числом от 1 до 65535.');
     const host = process.env.MCP_HTTP_HOST || '127.0.0.1';
-    await startHttpServer(buildServer, { port, host });
+    if (allowEnvCreds && !['127.0.0.1', 'localhost', '::1'].includes(host)) {
+      throw new Error(
+        'env-creds HTTP допускается только на loopback интерфейсе. Для удалённых пользователей используйте per-request авторизацию.'
+      );
+    }
+    const httpServer = await startHttpServer(buildServer, {
+      port,
+      host,
+      allowedHosts: process.env.MCP_ALLOWED_HOSTS?.split(',')
+        .map((item) => item.trim())
+        .filter(Boolean),
+      allowedOrigins: process.env.MCP_ALLOWED_ORIGINS?.split(',')
+        .map((item) => item.trim())
+        .filter(Boolean),
+    });
+    const shutdown = () => {
+      httpServer.close();
+      const force = setTimeout(() => {
+        httpServer.closeAllConnections();
+      }, 10000);
+      force.unref();
+    };
+    process.once('SIGINT', shutdown);
+    process.once('SIGTERM', shutdown);
     console.error(`MCP BPMSoft OData Server running on Streamable HTTP (${host}:${port})`);
   }
 }

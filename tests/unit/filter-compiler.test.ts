@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { compileFilter, type Criterion } from '../../src/utils/filter-compiler.js';
+import { compileFilter, resolveFieldPath, type Criterion } from '../../src/utils/filter-compiler.js';
 import { UnknownFieldError } from '../../src/utils/errors.js';
 import type { MetadataManager } from '../../src/metadata/metadata-manager.js';
 import type { EntityMetadata, EntityProperty } from '../../src/types/index.js';
@@ -57,6 +57,7 @@ function makeStubMetadata(collections: Record<string, CollectionDef>): MetadataM
       return {
         lookupCollection: prop.lookupCollection,
         displayColumn: prop.lookupDisplayColumn || 'Name',
+        navigationProperty: prop.name.replace(/Id$/, ''),
       };
     },
     async resolveFieldReference(collection: string, query: string) {
@@ -229,7 +230,17 @@ describe('compileFilter — relative time windows', () => {
 });
 
 describe('compileFilter — navigation and captions', () => {
-  it('Account.City navigation: uuid compared via Account/City/Id', async () => {
+  it('exports scalar navigation resolution independently from comparisons', async () => {
+    const result = await resolveFieldPath('Account.City', {
+      collection: 'Contact',
+      metadataManager: META,
+      odataVersion: 4,
+    });
+    expect(result.path).toBe('Account/CityId');
+    expect(result.property.type).toBe('Edm.Guid');
+    expect(result.collection).toBe('Account');
+  });
+  it('lookup identity follows actual navigation to the target UUID key', async () => {
     const r = await compile([
       {
         field: 'Account.City',
@@ -237,9 +248,11 @@ describe('compileFilter — navigation and captions', () => {
         value: '11111111-1111-1111-1111-111111111111',
       },
     ]);
-    // Navigation property name in v4 is "Account"; uuid equality on the final lookup
-    // goes through its navigation (City/Id) — the test instance's /$count rejects `CityId eq <uuid>`.
+    // Navigation property name in v4 is "Account" (the FK is AccountId, but
+    // the metadata stub exposes "Account" directly as a lookup field). The
+    // Comparison uses the referenced entity key; scalar selection stays CityId.
     expect(r.filter).toBe('Account/City/Id eq 11111111-1111-1111-1111-111111111111');
+    expect(r.used_fields[0].resolved).toBe('Account/City/Id');
   });
 
   it('resolves a Russian caption to the OData field name', async () => {
@@ -258,13 +271,89 @@ describe('compileFilter — error handling', () => {
 });
 
 describe('compileFilter — lookup values', () => {
+  it('resolves text and list values to identifiers inside the compiler', async () => {
+    const resolved: string[] = [];
+    const result = await compileFilter([{ field: 'Город', op: 'in', value: ['Москва', 'Казань'] }], {
+      collection: 'Contact',
+      metadataManager: META,
+      odataVersion: 4,
+      lookupResolver: {
+        async resolve(_collection, value) {
+          resolved.push(value);
+          const id =
+            value === 'Москва'
+              ? '11111111-1111-1111-1111-111111111111'
+              : '22222222-2222-2222-2222-222222222222';
+          return { resolved: true, id, searchValue: value, matchCount: 1, candidates: [] };
+        },
+      },
+    });
+    expect(resolved).toEqual(['Москва', 'Казань']);
+    expect(result.filter).toBe(
+      '(City/Id eq 11111111-1111-1111-1111-111111111111 or City/Id eq 22222222-2222-2222-2222-222222222222)'
+    );
+    expect(result.warnings).toEqual([]);
+  });
+  it('stops before producing a filter when lookup identity is ambiguous', async () => {
+    await expect(
+      compileFilter([{ field: 'Город', op: 'eq', value: 'Москва' }], {
+        collection: 'Contact',
+        metadataManager: META,
+        odataVersion: 4,
+        lookupResolver: {
+          async resolve(_collection, value) {
+            return {
+              resolved: false,
+              searchValue: value,
+              matchCount: 2,
+              candidates: [
+                { id: 'a', displayValue: 'Москва' },
+                { id: 'b', displayValue: 'Москва' },
+              ],
+            };
+          },
+        },
+      })
+    ).rejects.toThrow('требуется уточнение');
+  });
+  it('supports substring search on lookup display values', async () => {
+    expect((await compile([{ field: 'Город', op: 'contains', value: 'Моск' }])).filter).toBe(
+      "contains(tolower(City/Name), 'моск')"
+    );
+  });
+  it('supports read-only display-name equality when no identity resolver is supplied', async () => {
+    const result = await compile([{ field: 'CityId', op: 'eq', value: 'Москва' }]);
+    expect(result.filter).toBe("City/Name eq 'Москва'");
+  });
   it('GUID for a lookup field on OData v3 wraps in guid"..."', async () => {
     const r = await compile([{ field: 'CityId', op: 'eq', value: '22222222-2222-2222-2222-222222222222' }], {
       v: 3,
     });
     expect(r.filter).toBe("CityId eq guid'22222222-2222-2222-2222-222222222222'");
-    // uuid уже передан — предупреждать «передайте UUID» незачем.
     expect(r.warnings).toEqual([]);
+  });
+});
+
+describe('compileFilter — metadata type invariants', () => {
+  it.each(['2026-01-01', '11111111-1111-1111-1111-111111111111'])(
+    'does not infer scalar type from string shape %s',
+    async (value) => {
+      expect((await compile([{ field: 'Name', op: 'eq', value }])).filter).toBe(`Name eq '${value}'`);
+    }
+  );
+  it.each([
+    { field: 'Age', op: 'contains', value: '2' },
+    { field: 'Name', op: 'in_last_days', value: 3 },
+    { field: 'IsVip', op: 'gt', value: true },
+    { field: 'Age', op: 'eq', value: '3.5' },
+  ])('rejects incompatible field values/operators', async (criterion) => {
+    await expect(compile([criterion])).rejects.toThrow();
+  });
+  it('rejects a missing comparison value and malformed navigation path', async () => {
+    await expect(compile([{ field: 'Name', op: 'eq' }])).rejects.toThrow('значение не задано');
+    await expect(compile([{ field: 'Account..City', op: 'eq', value: null }])).rejects.toThrow(
+      'Пустой сегмент'
+    );
   });
 });
 
@@ -286,5 +375,27 @@ describe('compileFilter — joining', () => {
       { join: 'or' }
     );
     expect(r.filter).toBe("(Name eq 'Иванов') or (Name eq 'Петров')");
+  });
+});
+
+describe('calendar filters on metadata date types', () => {
+  afterEach(() => vi.useRealTimers());
+  it('compiles whole-day ranges as dates for Edm.Date', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-09-22T22:30:00Z'));
+    const metadata = makeStubMetadata({ Contact: { fields: { Date: { type: 'Edm.Date' } } } });
+    const result = await compileFilter([{ field: 'Date', op: 'сегодня' }], {
+      collection: 'Contact',
+      metadataManager: metadata,
+      odataVersion: 4,
+      timeZone: 'Europe/Moscow',
+    });
+    expect(result.filter).toBe('Date ge 2026-09-23 and Date lt 2026-09-24');
+  });
+  it('does not interpret date-shaped strings as calendar dates in string fields', async () => {
+    expect((await compile([{ field: 'Name', op: 'eq', value: '2026-09-23' }])).filter).toBe(
+      "Name eq '2026-09-23'"
+    );
+    await expect(compile([{ field: 'Name', op: 'today' }])).rejects.toThrow('только для дат');
   });
 });

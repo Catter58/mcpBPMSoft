@@ -26,7 +26,7 @@ ENV NODE_ENV=production
 
 # MCP Streamable HTTP transport. Bind 0.0.0.0 so the port is reachable
 # from outside the container; put a TLS proxy + firewall in front for prod.
-# BPMSOFT_URL is the only required env var — pass it at `docker run`.
+# Pass BPMSOFT_URL and MCP_ALLOWED_HOSTS at runtime.
 ENV MCP_TRANSPORT=http \
     MCP_HTTP_HOST=0.0.0.0 \
     MCP_HTTP_PORT=8007
