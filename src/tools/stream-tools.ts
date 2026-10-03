@@ -1,10 +1,10 @@
 /** Binary operations share metadata validation, exact confirmation, and resumable uploads. */
 import * as z from 'zod';
-import { open, realpath } from 'node:fs/promises';
+import { open } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import { getRequestAuth } from '../auth/request-context.js';
 import { uploadPath, saveDownload } from '../utils/file-access.js';
-import { basename, dirname, join, resolve, sep } from 'node:path';
+import { basename } from 'node:path';
 import { createHash } from 'node:crypto';
 import { createRequire } from 'node:module';
 import { MIMEType } from 'node:util';
@@ -143,54 +143,6 @@ async function existingBinary(
   }
 }
 
-type PathCheck = { ok: true; path: string } | { ok: false; error: string };
-
-/**
- * Единственная точка допуска локальных путей. В HTTP-режиме любой держатель
- * cookies BPMSoft иначе читал бы/писал бы произвольные файлы на хосте MCP.
- * Разрешено: stdio-транспорт (локальный процесс пользователя) либо путь внутри
- * BPMSOFT_FILE_ROOT после realpath (симлинки наружу не проходят).
- * Для записи realpath берётся от самого файла, если он есть, иначе от родителя.
- */
-export async function checkLocalPath(input: string, forWrite: boolean): Promise<PathCheck> {
-  if (process.env.MCP_TRANSPORT === 'stdio') return { ok: true, path: input };
-  const root = process.env.BPMSOFT_FILE_ROOT;
-  if (!root) {
-    return {
-      ok: false,
-      error:
-        'Работа с локальными файлами сервера отключена в HTTP-режиме. ' +
-        (forWrite
-          ? 'Используйте return_base64=true, чтобы получить содержимое в ответе, '
-          : 'Передайте содержимое файла в параметре content_base64, ') +
-        'или попросите администратора задать BPMSOFT_FILE_ROOT (каталог, внутри которого разрешены файлы).',
-    };
-  }
-  if (dirname(resolve(root)) === resolve(root))
-    return { ok: false, error: 'BPMSOFT_FILE_ROOT не может быть корнем файловой системы.' };
-  let realRoot: string;
-  let real: string;
-  try {
-    realRoot = await realpath(root);
-    const abs = resolve(realRoot, input);
-    if (!forWrite) {
-      real = await realpath(abs);
-    } else {
-      try {
-        real = await realpath(abs);
-      } catch {
-        real = join(await realpath(dirname(abs)), basename(abs));
-      }
-    }
-  } catch {
-    return { ok: false, error: `Файл или каталог не найден: ${input}` };
-  }
-  if (real !== realRoot && !real.startsWith(realRoot + sep)) {
-    return { ok: false, error: `Путь ${input} вне разрешённого каталога BPMSOFT_FILE_ROOT (${realRoot}).` };
-  }
-  return { ok: true, path: real };
-}
-
 const mb = (n: number): string => (n / 1024 / 1024).toFixed(2);
 
 /** Байты для загрузки: из content_base64 или из файла (размер проверяется ДО чтения). */
@@ -238,7 +190,7 @@ const uploadShape = {
     .string()
     .optional()
     .describe(
-      'Путь к файлу на хосте MCP-сервера (только stdio-режим или внутри BPMSOFT_FILE_ROOT). Альтернатива — content_base64'
+      'Путь к файлу на хосте MCP-сервера (в stdio или по относительному пути внутри личного каталога пользователя и стенда). Альтернатива — content_base64'
     ),
   content_base64: z.string().optional().describe('Содержимое файла в base64 (вместо file_path)'),
 };
@@ -247,7 +199,9 @@ const downloadShape = {
   save_path: z
     .string()
     .optional()
-    .describe('Путь для сохранения на хосте MCP-сервера (только stdio-режим или внутри BPMSOFT_FILE_ROOT)'),
+    .describe(
+      'Путь для сохранения на хосте MCP-сервера (в stdio или по относительному пути внутри личного каталога пользователя и стенда)'
+    ),
   return_base64: z
     .boolean()
     .optional()

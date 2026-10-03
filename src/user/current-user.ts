@@ -26,6 +26,7 @@ import { BpmApiError } from '../utils/errors.js';
 
 /** Макрос DataService, вычисляемый сервером в контексте вызывающего. */
 const MACROS_CURRENT_USER = 1;
+const MAX_CACHED_IDENTITIES = 2000;
 
 export interface CurrentUser {
   /** Id записи SysAdminUnit */
@@ -69,6 +70,8 @@ interface CacheEntry {
 
 export class CurrentUserService {
   private cache = new Map<string, CacheEntry>();
+  private inFlight = new Map<string, Promise<CurrentUser>>();
+  private cacheGeneration = 0;
 
   constructor(
     private config: BpmConfig,
@@ -78,18 +81,42 @@ export class CurrentUserService {
   /** Текущий пользователь вызова. Кэш — на TTL справочников. */
   async get(): Promise<CurrentUser> {
     const scope = getAuthCacheScope();
+    this.removeExpired(Date.now());
     const cached = this.cache.get(scope);
-    if (cached && Date.now() - cached.timestamp < this.config.lookup_cache_ttl * 1000) {
+    if (cached) {
+      this.cache.delete(scope);
+      this.cache.set(scope, cached);
       return cached.user;
     }
-
-    const user = await this.fetch();
-    this.cache.set(scope, { user, timestamp: Date.now() });
-    return user;
+    const existing = this.inFlight.get(scope);
+    if (existing) return existing;
+    if (this.inFlight.size >= MAX_CACHED_IDENTITIES)
+      throw new BpmApiError('Слишком много одновременных проверок пользователя. Повторите позже.', 429);
+    const generation = this.cacheGeneration;
+    const pending = this.fetch();
+    this.inFlight.set(scope, pending);
+    try {
+      const user = await pending;
+      if (generation === this.cacheGeneration) {
+        this.removeExpired(Date.now());
+        if (this.cache.size >= MAX_CACHED_IDENTITIES) this.cache.delete(this.cache.keys().next().value!);
+        this.cache.set(scope, { user, timestamp: Date.now() });
+      }
+      return user;
+    } finally {
+      if (this.inFlight.get(scope) === pending) this.inFlight.delete(scope);
+    }
   }
 
   clearCache(): void {
+    this.cacheGeneration += 1;
     this.cache.clear();
+    this.inFlight.clear();
+  }
+
+  private removeExpired(now: number): void {
+    const ttl = this.config.lookup_cache_ttl * 1000;
+    for (const [scope, entry] of this.cache) if (now - entry.timestamp >= ttl) this.cache.delete(scope);
   }
 
   private async fetch(): Promise<CurrentUser> {

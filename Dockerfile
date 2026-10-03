@@ -38,6 +38,12 @@ COPY --chown=node:node package.json ./
 COPY --from=build --chown=node:node /app/node_modules ./node_modules
 COPY --from=build --chown=node:node /app/build ./build
 
+# Default private file/journal roots must be writable by the runtime user.
+# Mount persistent volumes here when the data must survive container replacement.
+RUN mkdir -p /app/files /app/state/operations \
+    && chown -R node:node /app/files /app/state \
+    && chmod 700 /app/files /app/state /app/state/operations
+
 USER node
 
 EXPOSE 8007

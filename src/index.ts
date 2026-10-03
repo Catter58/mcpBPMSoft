@@ -19,62 +19,48 @@
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 
 import { startHttpServer } from './server/http-transport.js';
-import { tryLoadConfigFromEnv, isEnvCredsAllowed, loadLocalEnvironment } from './config.js';
-import { initializeServices, createEmptyContainer, type ServiceContainer } from './tools/init-tool.js';
+import { isEnvCredsAllowed, loadLocalEnvironment } from './config.js';
+import { loadTenantRegistry } from './server/tenant-registry.js';
 import { createToolServer } from './server/tool-server.js';
 import { TOOLS } from './tools/registry.js';
 import { PROMPTS } from './prompts/registry.js';
 
-let services: ServiceContainer = createEmptyContainer();
-
 async function main(): Promise<void> {
   loadLocalEnvironment();
-  const envConfig = tryLoadConfigFromEnv();
-
-  if (!envConfig) {
-    console.error('[Server] FATAL: BPMSOFT_URL is required but not set.');
-    console.error('[Server] Set BPMSOFT_URL to the target BPMSoft instance and restart.');
-    process.exit(1);
-  }
-
+  const registry = loadTenantRegistry();
   const allowEnvCreds = isEnvCredsAllowed();
-  services = initializeServices(envConfig, allowEnvCreds);
-  console.error('[Server] Configuration loaded from environment.');
-  console.error(`  Target: ${envConfig.bpmsoft_url}`);
-  console.error(`  OData: v${envConfig.odata_version}, Platform: ${envConfig.platform}`);
+  console.error(`[Server] Configuration loaded (${registry.multitenant ? 'multitenant' : 'single stand'}).`);
   console.error(
     `  Auth mode: ${allowEnvCreds ? 'env-creds opt-in (bpm_init available)' : 'per-request (caller forwards credentials)'}`
   );
 
   // Build a fully-registered McpServer. The HTTP path calls this once per
   // request (see http-transport.ts) so concurrent callers each get their own
-  // server/transport; the stdio path calls it once. `services` is shared across
-  // all instances — it holds the HttpClient/AuthManager which read per-request
-  // auth from AsyncLocalStorage and are stateless w.r.t. user identity.
-  const buildServer = () =>
-    createToolServer(services, {
-      allowEnvCreds,
-      onInitialized: (newContainer) => {
-        services = newContainer;
-      },
-    });
+  // server/transport; the stdio path calls it once. Each tenant owns its services;
+  // auth and cancellation remain bound to each request via AsyncLocalStorage.
+  const buildServer = (tenant: string) => createToolServer(registry.get(tenant), { allowEnvCreds });
 
-  const operational = TOOLS.filter((t) => t.category !== 'init').length;
+  const operational = TOOLS.filter(
+    (t) =>
+      t.category !== 'init' &&
+      (t.name !== 'bpm_get_operation' || registry.multitenant || !!process.env.BPMSOFT_JOURNAL_ROOT)
+  ).length;
   const registeredTools = allowEnvCreds ? operational + 1 : operational;
   console.error(
     `Registered ${registeredTools} tools (${operational} operational${allowEnvCreds ? ' + bpm_init' : ''})`
   );
-  console.error(`Registered ${PROMPTS.length} prompts, 4 resource templates`);
+  console.error(`Registered ${PROMPTS.length} prompts, 1 resource and 3 resource templates`);
 
   const transportKind = (process.env.MCP_TRANSPORT || 'http').toLowerCase();
   if (!['http', 'stdio'].includes(transportKind))
     throw new Error('MCP_TRANSPORT должен быть http или stdio.');
   if (transportKind === 'stdio') {
+    if (registry.multitenant) throw new Error('Мультитенантный режим доступен только через HTTP.');
     if (!allowEnvCreds)
       throw new Error(
         'stdio не передаёт HTTP cookies. Включите BPMSOFT_ALLOW_ENV_CREDS=true и задайте данные отдельного пользователя для локального подключения.'
       );
-    const server = buildServer();
+    const server = buildServer('default');
     const transport = new StdioServerTransport();
     await server.connect(transport);
     console.error('MCP BPMSoft OData Server running on stdio');
@@ -89,9 +75,20 @@ async function main(): Promise<void> {
         'env-creds HTTP допускается только на loopback интерфейсе. Для удалённых пользователей используйте per-request авторизацию.'
       );
     }
-    const httpServer = await startHttpServer(buildServer, {
+    const limit = (name: string, fallback: number) => {
+      const raw = process.env[name];
+      const value = raw === undefined ? fallback : /^\d+$/.test(raw) ? Number(raw) : NaN;
+      if (!Number.isSafeInteger(value) || value < 1) throw new Error(`${name}: нужно положительное целое.`);
+      return value;
+    };
+    const httpServer = await startHttpServer((req) => buildServer(registry.resolveTenant(req)), {
       port,
       host,
+      resolveTenant: (req) => registry.resolveTenant(req),
+      requireAuth: registry.multitenant,
+      maxConcurrentRequests: limit('MCP_MAX_CONCURRENT_REQUESTS', 500),
+      maxQueuedRequests: limit('MCP_MAX_QUEUED_REQUESTS', 500),
+      maxConcurrentPerScope: limit('MCP_MAX_CONCURRENT_PER_SCOPE', 50),
       allowedHosts: process.env.MCP_ALLOWED_HOSTS?.split(',')
         .map((item) => item.trim())
         .filter(Boolean),

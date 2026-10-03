@@ -20,8 +20,8 @@
  *   Each request runs in its own server/transport with its own
  *   AsyncLocalStorage auth context, so callers' BPMCSRF/cookies never cross
  *   between requests and slow OData round-trips overlap instead of serializing.
- *   Re-registering the ~36 tools per request is cheap in-memory work
- *   (single-digit ms) that overlaps the network I/O it enables.
+ *   Tool schemas and handlers are compiled once per tenant; each request reuses
+ *   those definitions with an independent protocol and transport.
  *
  * Why `enableJsonResponse: true`:
  *   It returns a single buffered JSON response per POST instead of an
@@ -49,7 +49,9 @@
 import http from 'node:http';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { extractAuthFromHeaders, runWithAuth } from '../auth/request-context.js';
+import { extractAuthFromHeaders, getAuthCacheScope, runWithAuth } from '../auth/request-context.js';
+import { BpmApiError } from '../utils/errors.js';
+import { RequestAdmission, runWithRequestSignal, waitWithRequestSignal } from './request-runtime.js';
 
 import { SERVER_VERSION } from '../version.js';
 
@@ -62,7 +64,17 @@ export interface HttpServerOptions {
   allowedHosts?: string[];
   /** Browser origins explicitly allowed to connect. Non-browser clients omit Origin. */
   allowedOrigins?: string[];
+  /** Allowlisted tenant ID resolver; raw caller URLs must never be used here. */
+  resolveTenant?: (req: http.IncomingMessage) => string;
+  /** Require both a CSRF token and a session cookie before any MCP processing. */
+  requireAuth?: boolean;
+  maxConcurrentRequests?: number;
+  maxQueuedRequests?: number;
+  /** Per complete forwarded credential context, including tenant. */
+  maxConcurrentPerScope?: number;
 }
+
+type ServerFactory = (req: http.IncomingMessage) => McpServer | Promise<McpServer>;
 
 /**
  * Host the MCP server over Streamable HTTP.
@@ -109,12 +121,20 @@ export function buildRebindingOptions(
 }
 
 export async function startHttpServer(
-  createServer: () => McpServer,
+  createServer: ServerFactory,
   opts: HttpServerOptions
 ): Promise<http.Server> {
   const host = opts.host ?? '127.0.0.1';
   buildRebindingOptions(host, opts.port, opts);
+  const admission = new RequestAdmission(
+    opts.maxConcurrentRequests ?? 500,
+    opts.maxQueuedRequests ?? 500,
+    opts.maxConcurrentPerScope ?? 50
+  );
   const httpServer = http.createServer((req, res) => {
+    // A socket can fail before admission attaches body listeners, including
+    // rejected requests with unread bodies. Keep terminal stream errors handled.
+    req.on('error', () => {});
     const address = httpServer.address();
     const port = typeof address === 'object' && address ? address.port : opts.port;
     const rebinding = buildRebindingOptions(host, port, opts);
@@ -136,7 +156,9 @@ export async function startHttpServer(
       res.end(JSON.stringify({ status: 'ok', version: SERVER_VERSION }));
       return;
     }
-    if (req.url !== '/' && req.url !== '/mcp') {
+    const tenantRoute =
+      opts.resolveTenant && /^\/tenants\/[A-Za-z0-9][A-Za-z0-9_-]{0,63}\/mcp$/.test(req.url ?? '');
+    if (req.url !== '/' && req.url !== '/mcp' && !tenantRoute) {
       res.writeHead(404);
       res.end();
       return;
@@ -149,48 +171,8 @@ export async function startHttpServer(
       return;
     }
 
-    const auth = extractAuthFromHeaders(req.headers);
-
-    const chunks: Buffer[] = [];
-    let size = 0;
-    let aborted = false;
-    req.on('data', (c: Buffer) => {
-      size += c.length;
-      if (size > MAX_BODY_BYTES) {
-        aborted = true;
-        if (!res.headersSent) {
-          res.statusCode = 413;
-          res.end();
-        }
-        req.destroy();
-        return;
-      }
-      chunks.push(c);
-    });
-
-    req.on('end', () => {
-      if (aborted) return;
-      let body: unknown;
-      const raw = Buffer.concat(chunks).toString('utf8');
-      try {
-        body = raw ? JSON.parse(raw) : undefined;
-      } catch {
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(
-          JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } })
-        );
-        return;
-      }
-      void handlePost(createServer, rebinding, auth, req, res, body);
-    });
-
-    req.on('error', (err) => {
-      console.error('[http-transport] request error:', err);
-      if (!res.headersSent) {
-        res.statusCode = 400;
-        res.end();
-      }
-    });
+    req.pause();
+    void acceptPost(createServer, opts, admission, rebinding, req, res);
   });
 
   await new Promise<void>((resolve, reject) => {
@@ -209,7 +191,7 @@ export async function startHttpServer(
 }
 
 async function handlePost(
-  createServer: () => McpServer,
+  createServer: ServerFactory,
   rebinding: RebindingOptions,
   auth: ReturnType<typeof extractAuthFromHeaders>,
   req: http.IncomingMessage,
@@ -224,17 +206,128 @@ async function handlePost(
   });
   let server: McpServer | undefined;
   try {
-    server = createServer();
+    server = await createServer(req);
     await server.connect(transport);
-    await runWithAuth(auth, () => transport.handleRequest(req, res, body));
+    await waitWithRequestSignal(runWithAuth(auth, () => transport.handleRequest(req, res, body)));
   } catch (err) {
-    console.error('[http-transport] handleRequest error:', err);
-    if (!res.headersSent) {
-      res.statusCode = 500;
-      res.end();
-    }
+    sendHttpError(res, err);
   } finally {
     await transport.close().catch(() => {});
     await server?.close().catch(() => {});
   }
+}
+
+async function acceptPost(
+  createServer: ServerFactory,
+  opts: HttpServerOptions,
+  admission: RequestAdmission,
+  rebinding: RebindingOptions,
+  req: http.IncomingMessage,
+  res: http.ServerResponse
+): Promise<void> {
+  const controller = new AbortController();
+  const disconnect = () => controller.abort(new DOMException('Client disconnected', 'AbortError'));
+  const close = () => {
+    if (!res.writableFinished) disconnect();
+  };
+  req.once('aborted', disconnect);
+  res.once('close', close);
+  let release: (() => void) | undefined;
+  try {
+    const auth = extractAuthFromHeaders(req.headers);
+    if (opts.resolveTenant) auth.tenantId = opts.resolveTenant(req);
+    if (
+      opts.requireAuth &&
+      (!auth.csrfToken || !(auth.cookies.get('.ASPXAUTH') || auth.cookies.get('BPMSESSIONID')))
+    ) {
+      throw new BpmApiError('Передайте BPMCSRF и cookies сессии BPMSoft.', 401);
+    }
+    const scope = runWithAuth(auth, getAuthCacheScope);
+    release = await admission.acquire(scope, controller.signal);
+    controller.signal.throwIfAborted();
+    const body = await readPostBody(req, controller.signal);
+    await runWithRequestSignal(controller.signal, () =>
+      runWithAuth(auth, () => handlePost(createServer, rebinding, auth, req, res, body))
+    );
+  } catch (error) {
+    if (!controller.signal.aborted) sendHttpError(res, error);
+  } finally {
+    req.removeListener('aborted', disconnect);
+    res.removeListener('close', close);
+    release?.();
+  }
+}
+
+async function readPostBody(req: http.IncomingMessage, signal: AbortSignal): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    const cleanup = () => {
+      req.removeListener('data', data);
+      req.removeListener('end', end);
+      req.removeListener('error', fail);
+      signal.removeEventListener('abort', abort);
+    };
+    const fail = (error: unknown) => {
+      cleanup();
+      reject(error);
+    };
+    const abort = () => fail(signal.reason);
+    const data = (chunk: Buffer) => {
+      size += chunk.length;
+      if (size > MAX_BODY_BYTES) {
+        req.pause();
+        fail(new BpmApiError('Тело запроса слишком большое.', 413));
+      } else chunks.push(chunk);
+    };
+    const end = () => {
+      cleanup();
+      const raw = Buffer.concat(chunks).toString('utf8');
+      try {
+        resolve(raw ? JSON.parse(raw) : undefined);
+      } catch {
+        reject(new BpmApiError('Parse error', 400));
+      }
+    };
+    req.on('data', data);
+    req.once('end', end);
+    req.once('error', fail);
+    signal.addEventListener('abort', abort, { once: true });
+    if (signal.aborted) abort();
+    else req.resume();
+  });
+}
+
+function sendHttpError(res: http.ServerResponse, error: unknown): void {
+  if (res.headersSent || res.destroyed) return;
+  const status =
+    error instanceof BpmApiError && error.httpStatus >= 400 && error.httpStatus <= 499
+      ? error.httpStatus
+      : 500;
+  const messages: Record<number, string> = {
+    400: 'Invalid request',
+    401: 'Authentication required',
+    403: 'Forbidden',
+    404: 'Not found',
+    413: 'Request too large',
+    429: 'Server busy; retry later',
+  };
+  const message = messages[status] ?? 'Internal server error';
+  res.writeHead(status, {
+    'Content-Type': 'application/json',
+    'Cache-Control': 'no-store',
+    ...(status === 429 ? { 'Retry-After': '1' } : {}),
+    // Stop reusing a connection with an unread/oversized request body.
+    Connection: 'close',
+  });
+  res.end(
+    JSON.stringify({
+      jsonrpc: '2.0',
+      id: null,
+      error: {
+        code: error instanceof BpmApiError && error.message === 'Parse error' ? -32700 : -32000,
+        message: error instanceof BpmApiError && error.message === 'Parse error' ? 'Parse error' : message,
+      },
+    })
+  );
 }

@@ -5,31 +5,41 @@
  * на заведомо неподдерживаемые конструкции. Поддержка batch ограничена сроком
  * жизни и контекстом подключения, пользователя и коллекции.
  *
- * Пока здесь один флаг — `tolower()` в $filter. На тестовом стенде такой фильтр не
+ * `tolower()` в $filter на тестовом стенде не
  * отклоняется кодом ответа: сервер отдаёт 200 и обрывает тело (см.
  * `isQueryUnsupportedError`). Раньше латч дублировался в lookup-резолвере и в
  * bpm_search_unified, а filter-compiler о нём не знал вовсе — из-за чего
  * оператор «содержит» в bpm_search_records падал сетевой ошибкой. Один общий
- * флаг закрывает все три пути сразу.
+ * флаг закрывает все три пути сразу, в пределах текущей сессии и стенда.
  */
 
-let tolowerUnsupported = false;
+import { getAuthCacheScope } from '../auth/request-context.js';
+
+const tolowerUnsupported = new Map<string, number>();
+const CAPABILITY_TTL_MS = 5 * 60 * 1000;
 
 /** Можно ли оборачивать поле в tolower() при построении $filter. */
 export function isTolowerSupported(): boolean {
-  return !tolowerUnsupported;
+  const scope = getAuthCacheScope();
+  const expires = tolowerUnsupported.get(scope);
+  if (expires && expires > Date.now()) return false;
+  tolowerUnsupported.delete(scope);
+  return true;
 }
 
-/** Инстанс не переварил tolower() — до конца жизни процесса работаем case-sensitive. */
+/** В этой сессии инстанс отклонил tolower(); повторная проверка возможна после TTL. */
 export function markTolowerUnsupported(): void {
-  if (tolowerUnsupported) return;
-  tolowerUnsupported = true;
+  if (!isTolowerSupported()) return;
+  const now = Date.now();
+  for (const [key, expires] of tolowerUnsupported) if (expires <= now) tolowerUnsupported.delete(key);
+  if (tolowerUnsupported.size >= 2000) tolowerUnsupported.delete(tolowerUnsupported.keys().next().value!);
+  tolowerUnsupported.set(getAuthCacheScope(), now + CAPABILITY_TTL_MS);
   console.error('[capabilities] tolower() не поддержан инстансом, перехожу на case-sensitive поиск');
 }
 
 /** Сброс — только для тестов. */
 export function resetServerCapabilities(): void {
-  tolowerUnsupported = false;
+  tolowerUnsupported.clear();
   batchSupport.clear();
 }
 

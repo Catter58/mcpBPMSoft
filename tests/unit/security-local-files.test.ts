@@ -4,14 +4,16 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtemp, writeFile, readFile, rm, symlink } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, realpath } from 'node:fs/promises';
 import * as fsp from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { checkLocalPath, registerStreamTools } from '../../src/tools/stream-tools.js';
+import { registerStreamTools } from '../../src/tools/stream-tools.js';
 import { buildRebindingOptions } from '../../src/server/http-transport.js';
 import type { ServiceContainer } from '../../src/tools/init-tool.js';
 import { runWithAuth } from '../../src/auth/request-context.js';
+import { saveDownload } from '../../src/utils/file-access.js';
+import { tenantStorageScope, userStorageScope } from '../../src/utils/tenant-scope.js';
 
 vi.mock('node:fs/promises', async (orig) => {
   const actual = await orig<typeof import('node:fs/promises')>();
@@ -26,6 +28,7 @@ interface ToolResult {
 type Handler = (args: Record<string, unknown>) => Promise<ToolResult>;
 
 const UUID = '11111111-2222-3333-4444-555555555555';
+const requestAuth = { csrfToken: 'test-csrf', cookies: new Map([['BPMSESSIONID', 'test-session']]) };
 
 function setup(maxSize = 1024) {
   const handlers = new Map<string, Handler>();
@@ -45,6 +48,7 @@ function setup(maxSize = 1024) {
       file_root: process.env.BPMSOFT_FILE_ROOT ?? root,
     },
     authManager: { ensureAuthenticated: vi.fn(async () => undefined) },
+    currentUser: { get: vi.fn(async () => ({ userId: UUID, userName: 'test-user' })) },
     metadataManager: {
       resolveCollectionReference: async (n: string) => ({ name: n }),
       resolveFieldReference: async (_collection: string, name: string) => ({ name }),
@@ -92,11 +96,16 @@ function setup(maxSize = 1024) {
       (args) =>
         process.env.MCP_TRANSPORT === 'stdio'
           ? handlers.get(n)!(args)
-          : runWithAuth(
-              { csrfToken: 'test-csrf', cookies: new Map([['BPMSESSIONID', 'test-session']]) },
-              () => handlers.get(n)!(args)
-            ),
+          : runWithAuth(requestAuth, () => handlers.get(n)!(args)),
     puts,
+    save: (name: string, data: Buffer) => runWithAuth(requestAuth, () => saveDownload(services, name, data)),
+    path: async (name: string) =>
+      join(
+        await realpath(services.config.file_root!),
+        tenantStorageScope(services.config),
+        userStorageScope(UUID),
+        name
+      ),
   };
 }
 
@@ -117,40 +126,6 @@ afterEach(async () => {
   process.env = { ...envBackup };
   await rm(root, { recursive: true, force: true });
   await rm(outside, { recursive: true, force: true });
-});
-
-describe('checkLocalPath', () => {
-  it('refuses any path in HTTP mode without BPMSOFT_FILE_ROOT', async () => {
-    const r = await checkLocalPath('/etc/passwd', false);
-    expect(r.ok).toBe(false);
-    if (!r.ok) expect(r.error).toContain('BPMSOFT_FILE_ROOT');
-  });
-
-  it('allows any path in stdio mode', async () => {
-    process.env.MCP_TRANSPORT = 'stdio';
-    expect(await checkLocalPath('/etc/passwd', false)).toEqual({ ok: true, path: '/etc/passwd' });
-  });
-
-  it('allows a path inside the root and refuses one outside', async () => {
-    process.env.BPMSOFT_FILE_ROOT = root;
-    await writeFile(join(root, 'a.txt'), 'x');
-    await writeFile(join(outside, 'b.txt'), 'x');
-    expect((await checkLocalPath(join(root, 'a.txt'), false)).ok).toBe(true);
-    expect((await checkLocalPath('a.txt', false)).ok).toBe(true);
-    expect((await checkLocalPath(join(outside, 'b.txt'), false)).ok).toBe(false);
-    expect((await checkLocalPath('../' + outside.split('/').pop() + '/b.txt', false)).ok).toBe(false);
-  });
-
-  it('refuses symlinks that escape the root (read and write)', async () => {
-    process.env.BPMSOFT_FILE_ROOT = root;
-    await writeFile(join(outside, 'secret'), 'x');
-    await symlink(join(outside, 'secret'), join(root, 'link'));
-    await symlink(outside, join(root, 'dirlink'));
-    expect((await checkLocalPath(join(root, 'link'), false)).ok).toBe(false);
-    expect((await checkLocalPath(join(root, 'link'), true)).ok).toBe(false);
-    expect((await checkLocalPath(join(root, 'dirlink', 'new.bin'), true)).ok).toBe(false);
-    expect((await checkLocalPath(join(root, 'new.bin'), true)).ok).toBe(true);
-  });
 });
 
 describe('upload tools', () => {
@@ -188,13 +163,13 @@ describe('upload tools', () => {
 
   it('checks size before reading the file', async () => {
     process.env.BPMSOFT_FILE_ROOT = root;
-    await writeFile(join(root, 'big.bin'), Buffer.alloc(2048));
-    const { h, puts } = setup(1024);
+    const { h, puts, save } = setup(1024);
+    await save('big.bin', Buffer.alloc(2048));
     const r = await h('bpm_field_upload')({
       collection: 'Contact',
       id: UUID,
       field: 'Photo',
-      file_path: join(root, 'big.bin'),
+      file_path: 'big.bin',
     });
     expect(r.isError).toBe(true);
     expect(r.content[0].text).toContain('превышает лимит');
@@ -223,9 +198,9 @@ describe('upload tools', () => {
 
   it('bpm_upload_file reads a file inside the root', async () => {
     process.env.BPMSOFT_FILE_ROOT = root;
-    await writeFile(join(root, 'a.txt'), 'hello');
-    const { h, puts } = setup();
-    const r = await h('bpm_upload_file')({ file_path: join(root, 'a.txt') });
+    const { h, puts, save } = setup();
+    await save('a.txt', Buffer.from('hello'));
+    const r = await h('bpm_upload_file')({ file_path: 'a.txt' });
     expect(r.isError).toBeUndefined();
     expect(r.structuredContent?.name).toBe('a.txt');
     expect(puts[0].toString()).toBe('hello');
@@ -249,13 +224,13 @@ describe('download tools', () => {
 
   it('bpm_field_download saves inside root and returns base64 in structuredContent only', async () => {
     process.env.BPMSOFT_FILE_ROOT = root;
-    const { h } = setup();
-    const target = join(root, 'x.bin');
+    const { h, path } = setup();
+    const target = await path('x.bin');
     const r = await h('bpm_field_download')({
       collection: 'Contact',
       id: UUID,
       field: 'Photo',
-      save_path: target,
+      save_path: 'x.bin',
       return_base64: true,
     });
     expect(r.isError).toBeUndefined();

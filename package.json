@@ -15,16 +15,14 @@
     "lint": "eslint \"src/**/*.ts\" \"tests/**/*.ts\"",
     "lint:fix": "eslint --fix \"src/**/*.ts\" \"tests/**/*.ts\"",
     "format": "prettier --write \"src/**/*.ts\" \"tests/**/*.ts\"",
-    "format:check": "prettier --check \"src/**/*.ts\" \"tests/**/*.ts\""
+    "format:check": "prettier --check \"src/**/*.ts\" \"tests/**/*.ts\"",
+    "check:release": "node scripts/check-release.mjs"
   },
   "files": [
     "build",
     "CHANGELOG.md",
-    "OPERATIONS.md",
-    "LIVE_VERIFICATION.md",
     "examples",
     ".env.example",
-    "DOCKER_RESOURCES.md",
     "benchmarks/docker-resources.json",
     "benchmarks/docker-build.json"
   ],

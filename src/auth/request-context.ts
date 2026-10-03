@@ -11,6 +11,8 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash } from 'node:crypto';
 
 export interface RequestAuth {
+  /** Validated identifier selected from the operator's tenant registry. */
+  tenantId?: string;
   /** BPMCSRF token from the incoming request header. */
   csrfToken?: string;
   /** Forwarded session cookies. */
@@ -89,6 +91,7 @@ export function getAuthCacheScope(): string {
   if (!auth) return '';
   if (!hasRequestAuth(auth)) return '';
   const context = JSON.stringify({
+    tenant: auth.tenantId ?? '',
     csrf: auth.csrfToken ?? '',
     cookies: [...auth.cookies.entries()].sort(([left], [right]) => left.localeCompare(right)),
   });

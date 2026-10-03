@@ -1,0 +1,16 @@
+{
+  "tenants": [
+    {
+      "id": "crm-a",
+      "url": "https://bpm-a.example.ru",
+      "odata_version": 4,
+      "platform": "net8"
+    },
+    {
+      "id": "crm-b",
+      "url": "https://bpm-b.example.ru",
+      "odata_version": 3,
+      "platform": "netframework"
+    }
+  ]
+}

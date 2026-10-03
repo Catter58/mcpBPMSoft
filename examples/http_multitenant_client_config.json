@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "bpmsoft-a": {
+      "type": "http",
+      "url": "https://mcp.example.ru/tenants/crm-a/mcp"
+    },
+    "bpmsoft-b": {
+      "type": "http",
+      "url": "https://mcp.example.ru/tenants/crm-b/mcp"
+    }
+  }
+}

@@ -5,6 +5,10 @@ coverage
 .gitignore
 .env
 .env.local
+.env.*
+files
+state
+tenants.local.json
 *.log
 .DS_Store
 .idea

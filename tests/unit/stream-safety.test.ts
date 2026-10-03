@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtemp, writeFile, rm, mkdir, symlink, readFile, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import type { ServiceContainer } from '../../src/tools/init-tool.js';
 import { registerStreamTools } from '../../src/tools/stream-tools.js';
@@ -10,6 +10,7 @@ import { ODataClient } from '../../src/client/odata-client.js';
 import { runWithAuth } from '../../src/auth/request-context.js';
 import { buildConfig } from '../../src/config.js';
 import { LookupResolver } from '../../src/lookup/lookup-resolver.js';
+import { saveDownload, uploadPath } from '../../src/utils/file-access.js';
 
 const A = 'aaaaaaaa-1111-4111-8111-111111111111';
 let directory: string;
@@ -402,15 +403,20 @@ describe('HTTP file exchange boundary', () => {
     const root = join(directory, 'files');
     await mkdir(root);
     env.services.config.file_root = root;
-    await writeFile(join(root, 'inside.bin'), 'inside-data');
+    env.services.currentUser = {
+      get: vi.fn(async () => ({ userId: A, userName: 'verified-user' })),
+    } as never;
+    await runWithAuth(auth, () => saveDownload(env.services, 'inside.bin', Buffer.from('inside-data')));
+    const userRoot = dirname(await runWithAuth(auth, () => uploadPath(env.services, 'inside.bin')));
     return {
       ...env,
       root,
+      userRoot,
       remoteCall: (name: string, args: Record<string, unknown>) =>
         runWithAuth(auth, () => env.call(name, args)),
     };
   }
-  it('reads a relative upload path inside the exchange root', async () => {
+  it('reads a relative upload path inside the verified user namespace', async () => {
     const env = await remoteSetup();
     const result = await env.remoteCall('bpm_upload_file', { file_path: 'inside.bin' });
     expect(result.isError).toBeUndefined();
@@ -430,7 +436,7 @@ describe('HTTP file exchange boundary', () => {
   });
   it('rejects an upload symlink escaping the exchange root', async () => {
     const env = await remoteSetup();
-    await symlink(file, join(env.root, 'leak.bin'));
+    await symlink(file, join(env.userRoot, 'leak.bin'));
     const result = await env.remoteCall('bpm_upload_file', { file_path: 'leak.bin' });
     expect(result.isError).toBe(true);
     expect(env.odataClient.createRecord).not.toHaveBeenCalled();
@@ -441,16 +447,16 @@ describe('HTTP file exchange boundary', () => {
     expect(
       (await env.remoteCall('bpm_download_file', { image_id: A, save_path: 'inside.bin' })).isError
     ).toBe(true);
-    expect(await readFile(join(env.root, 'inside.bin'), 'utf8')).toBe('inside-data');
+    expect(await readFile(join(env.userRoot, 'inside.bin'), 'utf8')).toBe('inside-data');
     expect(
       (await env.remoteCall('bpm_download_file', { image_id: A, save_path: 'new.bin' })).isError
     ).toBeFalsy();
-    expect(await readFile(join(env.root, 'new.bin'), 'utf8')).toBe('download-data');
-    expect((await stat(join(env.root, 'new.bin'))).mode & 0o777).toBe(0o600);
+    expect(await readFile(join(env.userRoot, 'new.bin'), 'utf8')).toBe('download-data');
+    expect((await stat(join(env.userRoot, 'new.bin'))).mode & 0o777).toBe(0o600);
   });
   it('rejects download parent symlinks and sibling-prefix paths outside the root', async () => {
     const env = await remoteSetup();
-    await symlink(directory, join(env.root, 'escape'));
+    await symlink(directory, join(env.userRoot, 'escape'));
     for (const path of ['escape/output.bin', join(directory, 'files-other', 'output.bin')])
       expect((await env.remoteCall('bpm_download_file', { image_id: A, save_path: path })).isError).toBe(
         true

@@ -1,7 +1,7 @@
 # CLAUDE.md
 
 Руководство для Claude Code (и других LLM-агентов) по работе с этим репозиторием.
-Сервер реализует MCP-интеграцию с BPMSoft OData API на TypeScript (ESM, Node 22+).
+Сервер реализует MCP-интеграцию с BPMSoft OData API на TypeScript (ESM, Node 22+), версия пакета 1.0.0, MCP SDK 1.29.
 
 ## Архитектура
 
@@ -13,7 +13,7 @@
    едином реестре `src/tools/registry.ts` — это единственный источник правды.
 2. **Service Container** — собирается в `init-tool.ts` (`initializeServices`/`createEmptyContainer`).
    Контейнер хранит `authManager`, `odataClient`, `lookupResolver`, `metadataManager`, `httpClient`
-   и `config`. Инструменты получают контейнер по ссылке и используют `notInitialized()` guard,
+   `currentUser`, `processEngine` и `config`. Инструменты получают контейнер по ссылке и используют `notInitialized()` guard,
    если сервер ещё не сконфигурирован.
 3. **ODataClient** — `src/client/odata-client.ts`. Строит URL-ы коллекций с учётом версии OData
    (v3/v4) и платформы (`net8`/`netframework`), сериализует параметры запроса (`$filter`,
@@ -22,19 +22,33 @@
    cookies, тайм-аутами, ретраями и проверкой origin. Здесь же — `buildHeaders(contentKind)`.
 5. **Типы** — `src/types/index.ts` (`BpmConfig`, `ODataVersion`, `PlatformType`, и пр.).
 
+HTTP-маршрут выбирает контейнер только через `src/server/tenant-registry.ts` — operator allowlist,
+никаких URL из аргументов tool. `src/server/tool-server.ts` переиспользует определения и скомпилированные
+схемы внутри контейнера одного стенда, но каждый HTTP-запрос получает отдельные SDK protocol/transport.
+`request-runtime.ts` владеет допуском HTTP, общим бюджетом read-only tool и отменой upstream;
+`operation-journal.ts` сохраняет намерения и исходы изменений, `operation-tool.ts` читает только свои записи.
+
 ## Модель авторизации и транспорт
 
 **Транспорт по умолчанию — Streamable HTTP** (порт `MCP_HTTP_PORT`, default 8007).
 Для локальной отладки: `MCP_TRANSPORT=stdio`.
 
 **Авторизация по умолчанию — per-request.**
-Каждый входящий HTTP-запрос должен нести заголовок `BPMCSRF` и cookie `.ASPXAUTH`,
-`BPMSESSIONID`, `CsrfToken`. Сервер извлекает их через AsyncLocalStorage и пробрасывает
-в OData-запросы к BPMSoft. Секреты на сервере не хранятся. Запрос без авторизации →
+Вызовы BPMSoft передают заголовок `BPMCSRF` и cookie сессии `.ASPXAUTH` или
+`BPMSESSIONID`; `CsrfToken`, когда он передан, также пробрасывается.
+Сервер извлекает авторизацию через AsyncLocalStorage и передаёт
+в OData-запросы к BPMSoft. Per-request cookies не становятся общей конфигурацией или журналом
+авторизации; кэши разделены по полному auth+tenant контексту. Журнал изменений хранит бизнес-намерения
+и receipts с удалением известных секретных полей и бинарных payload. Запрос без авторизации →
 `AuthRequiredError`. Эта модель аналогична mcp-proxy-server.
 
-**`BPMSOFT_URL` — единственная обязательная переменная среды.** Если не задана — сервер
-завершается с фатальной ошибкой при старте.
+**По умолчанию `BPMSOFT_URL` обязателен.** Сохраняются один стенд, `/mcp` и `/`;
+`BPMSOFT_TENANTS_FILE` без явного `BPMSOFT_MULTITENANT=true` игнорируется.
+
+**Несколько стендов — отдельный явный HTTP-режим.** Нужны `BPMSOFT_MULTITENANT=true` и
+`BPMSOFT_TENANTS_FILE` со списком `{id,url,odata_version?,platform?}`. Маршрут
+`/tenants/<id>/mcp` выбирает только ID allowlist; неизвестный ID → 404. `BPMSOFT_URL`
+не выбирает стенд в этом режиме. Общие env-креды и stdio запрещены. Файл читается при старте.
 
 **Env-creds — скрытый opt-in** (`BPMSOFT_ALLOW_ENV_CREDS=true`). При включении:
 
@@ -47,17 +61,19 @@
 
 При старте `src/index.ts`:
 
-1. `BPMSOFT_URL` проверяется; отсутствие → фатальная ошибка.
-2. `tryLoadConfigFromEnv()` собирает `BpmConfig` из `BPMSOFT_URL` (и опц.
-   `BPMSOFT_ODATA_VERSION`, `BPMSOFT_PLATFORM`).
+1. `loadTenantRegistry()` выбирает режим по явному флагу. Без него требуется `BPMSOFT_URL`;
+   в multi-режиме проверяется операторский JSON и создаются отдельные контейнеры стендов.
+2. `buildConfig()` проверяет URL, OData, платформу и числовые ограничения. Целевой origin
+   и base path разрешаются только из конфигурации стенда.
 3. Если `BPMSOFT_ALLOW_ENV_CREDS=true` — дополнительно подтягиваются
    `BPMSOFT_USERNAME` / `BPMSOFT_PASSWORD`; регистрируется `bpm_init`.
 4. Сервис-контейнер собирается сразу; авторизационный контекст каждого запроса
    хранится в AsyncLocalStorage и живёт ровно время одного MCP-вызова.
-5. Общая фабрика `src/server/tool-server.ts` регистрирует все группы инструментов,
-   включая аналитику, карточки, связи, дубли, текущего пользователя и готовые сценарии.
-6. На каждый MCP-вызов tool извлекает auth-контекст из ALS,
-   затем обращается к `odataClient` / `lookupResolver` / `metadataManager`.
+5. HTTP допускает запрос в пределах общей очереди и лимита auth+tenant scope до чтения тела;
+   после этого отдельный SDK server/transport получает переиспользуемые определения инструментов.
+6. На каждый MCP-вызов tool использует ALS, read-only бюджет или журнал изменений,
+   затем обращается к сервисам выбранного стенда. `bpm_get_operation` регистрируется только
+   при journal_root; в single-mode это opt-in, в multi-mode по умолчанию `./state/operations`.
 
 ## Контракт Content-Type / Accept
 
@@ -77,14 +93,38 @@
 
 ## Защитные инварианты
 
-- **SSRF-защита.** `HttpClient.setAllowedOrigin` фиксирует разрешённый origin при инициализации
-  config-а. Любой запрос за пределы этого origin'а отклоняется до `fetch`.
+- **SSRF-защита.** `HttpClient` фиксирует разрешённый origin из конфигурации подключения.
+  В мультитенантном режиме также проверяется base path приложения. Запросы и перенаправления
+  за соответствующие границы отклоняются.
 - **OData-инъекции.** `isSafeIdentifier` валидирует имена коллекций/полей до подстановки в
   `$filter`/URL. Не отключайте эту проверку и не строите фильтры конкатенацией строк —
   используйте утилиты из `src/client/odata-client.ts`.
-- **Лимиты контекста.** `bpm_get_records` по умолчанию НЕ автопагинирует и применяет
-  `max_records` (около 1000). Для полной выгрузки клиент должен явно передать
-  `auto_paginate=true` и/или больший `max_records`. Это защита от переполнения окна LLM.
+- **Лимиты ответа.** `bpm_get_records` по умолчанию НЕ автопагинирует: страница — 20 записей,
+  `top` и `max_records` не превышают 1000. При `auto_paginate=true` количество определяется
+  `max_records`, а не `top`. Общая обёртка отвергает полный JSON-результат инструмента с
+  `readOnlyHint=true` сверх 64 КиБ UTF-8, включая `structuredContent`, до и после текстового
+  сокращения. Возвращается `isError=true`, `code=response_too_large`, без данных и cursor.
+  Обработчики записей сохраняют подтверждения исхода; их результаты, файлы с `readOnlyHint=false`
+  и отдельно зарегистрированные ресурсы в этот предел не входят. Это ограничение одного ответа,
+  а не всей истории модели. Существующие лимиты текста и исходной выборки также сохраняются.
+- **Бюджет чтения.** Один `readOnlyHint=true` tool по умолчанию ограничен 120 секундами,
+  100 фактическими upstream попытками и 64 МиБ декодированных байт. Retries, redirects и
+  параллельные вызовы используют один бюджет. Exhaustion прекращает чтение с `budget_exceeded`;
+  обработчик не должен скрывать этот исход как полный успешный результат. Ресурсы и инструменты
+  с `readOnlyHint=false` не получают этот бюджет. Disconnect отменяет upstream ожидание, не откатывает запись.
+- **HTTP-допуск.** По умолчанию 500 активных, 500 ожидающих и 50 активных на полный auth+tenant
+  scope. Overload → HTTP 429 с Retry-After, до выполнения MCP-запроса. Не подменяйте scope
+  непроверенным пользовательским ID. `healthz` — только liveness без обращения к BPMSoft.
+- **Личные HTTP-файлы.** `src/utils/file-access.ts` — единственная политика допуска путей:
+  tenant hash включает настроенный ID и URL, user hash — UUID из BPMSoft current-user macro.
+  Cookies/header userId не определяют namespace. Каталоги 0700, файлы 0600, без symlinks/перезаписи;
+  общий корень не читается HTTP-клиентами. stdio сохраняет доверенные пути. CurrentUser cache
+  ограничен 2000 записями, TTL/LRU/singleflight; новый cookie подтверждается заново, но тот же UUID сохраняет файлы.
+- **Долговечные исходы.** При journal_root намерение/checkpoint сохраняются до upstream изменения,
+  receipts — после него. Недоступное сохранение до dispatch прекращает следующий этап. Запись с
+  `outcome_unknown` требует сверки состояния. `bpm_get_operation` читает только свой tenant/user
+  namespace, поддерживает own list и pages этапов. Журнал не replay/exactly-once/rollback;
+  подтверждения, проверка ETag и идемпотентность сохраняют собственные контракты.
 - **Защита массовых операций.** `bpm_update_by_filter` и `bpm_delete_by_filter` ничего не меняют
   без `expected_count`: такой вызов возвращает превью (число найденных и их Id). Если фактическое
   число не совпадает с `expected_count`, операция отменяется до начала изменений. Выполнение
@@ -133,8 +173,11 @@
 
 - Стек: **vitest** + **MSW** (`@vitest/coverage-v8`).
 - Запуск: `npm test` (один прогон), `npm run test:watch` (watch).
-- Файлы тестов лежат в `tests/`. Сетевые вызовы перехватываются MSW handler-ами —
-  никаких реальных HTTP-запросов в CI.
+- Файлы тестов лежат в `tests/`. BPMSoft моделируется через MSW или подменённый fetch;
+  HTTP-транспорт проверяется настоящими запросами к loopback, без внешнего стенда.
+- Проверки изоляции и восстановления используют полную производственную фабрику и MCP SDK
+  с моделируемым upstream. Нагрузочный тест 500 — проверка overlap/context isolation, не доказательство
+  вместимости реального стенда.
 
 ## Ограничения OData v3
 

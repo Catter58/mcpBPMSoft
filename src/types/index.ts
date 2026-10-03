@@ -28,6 +28,13 @@ export interface BpmConfig {
   max_file_size: number;
   /** Allowed server-side file directory for HTTP callers (default: ./files). */
   file_root?: string;
+  /** Operator-configured tenant; never a caller-supplied URL. */
+  tenant_id?: string;
+  /** Durable operation receipts, outside source control. */
+  journal_root?: string;
+  read_budget_timeout?: number;
+  read_budget_requests?: number;
+  read_budget_bytes?: number;
 }
 
 export interface AuthState {
@@ -225,6 +232,7 @@ export type ToolErrorCode =
   | 'validation'
   | 'network'
   | 'outcome_unknown'
+  | 'budget_exceeded'
   | 'concurrency_conflict'
   | 'concurrency_unsupported'
   | 'idempotency_conflict'

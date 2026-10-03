@@ -12,6 +12,12 @@
 import * as z from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { suggest } from '../utils/suggest.js';
+import { enforceReadResultBudget } from './response-budget.js';
+import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
+import type { ServiceContainer } from '../tools/init-tool.js';
+import { withOperationJournal } from './operation-journal.js';
+import { runWithReadBudget } from './request-runtime.js';
+import { BpmApiError, formatToolError } from '../utils/errors.js';
 
 /** Длиннее в одну строку лога не нужно: полный ответ агент и так получает. */
 const MAX_REASON_LENGTH = 300;
@@ -48,8 +54,8 @@ type ToolHandler = (...args: unknown[]) => unknown;
 /**
  * Потолок текста ответа модели. Больше — почти всегда выгрузка, которую надо было сузить
  * фильтром/select; обрезаем с объяснением, а не заливаем окно контекста.
- * ponytail: режется только text, structuredContent отдаётся целиком — ограничить и его,
- * если клиенты начнут пересылать его модели как есть.
+ * Это отдельный лимит представления текста. Для readOnlyHint=true полный результат
+ * дополнительно проверяется по JSON-байтам, включая structuredContent.
  */
 export const CHARACTER_LIMIT = 25_000;
 
@@ -97,6 +103,8 @@ const toolErrorSchema = z.looseObject({
   suggestions: z.array(z.string()).optional(),
   next_steps: z.array(z.string()).optional(),
   safe_to_retry: z.boolean().optional(),
+  response_bytes: z.number().int().nonnegative().optional(),
+  response_limit_bytes: z.number().int().positive().optional(),
 });
 
 function outputSchemaWithErrors(schema: unknown) {
@@ -167,24 +175,34 @@ export function describeToolError(outcome: unknown): string {
     const error = outcome as Error & { httpStatus?: unknown; code?: unknown; details?: unknown };
     return summarize(error.httpStatus, error.code, error.message, error.details);
   }
-  const content = (outcome as { content?: Array<{ type?: string; text?: string }> } | undefined)?.content;
-  const text = content?.find((part) => part.type === 'text')?.text ?? '';
-  try {
-    const body = JSON.parse(text) as Record<string, unknown> | null;
-    if (body && typeof body === 'object' && 'error' in body) {
-      return summarize(body.httpStatus, body.code, body.error, body.details);
+  const result = outcome as
+    | {
+        structuredContent?: Record<string, unknown>;
+        content?: Array<{ type?: string; text?: string }>;
+      }
+    | undefined;
+  const structured = result?.structuredContent;
+  if (structured && typeof structured.error === 'string')
+    return summarize(structured.httpStatus, structured.code, structured.error, structured.details);
+  const texts =
+    result?.content?.filter((part) => part.type === 'text' && typeof part.text === 'string') ?? [];
+  for (const part of texts) {
+    try {
+      const body = JSON.parse(part.text!) as Record<string, unknown> | null;
+      if (body && typeof body === 'object' && 'error' in body)
+        return summarize(body.httpStatus, body.code, body.error, body.details);
+    } catch {
+      // Human-readable text is used below when there is no error envelope.
     }
-  } catch {
-    // Не JSON — ниже возьмём текст как есть.
   }
-  return summarize(undefined, undefined, text);
+  return summarize(undefined, undefined, texts.find((part) => !part.text!.startsWith('operation_id:'))?.text);
 }
 
 /**
  * Оборачивает обработчики инструментов сервера замером времени.
  * Возвращает тот же экземпляр — вызывать до регистрации инструментов.
  */
-export function instrumentTools(server: McpServer): McpServer {
+export function instrumentTools(server: McpServer, services?: ServiceContainer): McpServer {
   const target = server as unknown as {
     registerTool: (name: string, config: unknown, handler: ToolHandler) => unknown;
     __instrumented?: boolean;
@@ -194,29 +212,59 @@ export function instrumentTools(server: McpServer): McpServer {
   const original = target.registerTool.bind(target);
 
   target.registerTool = (name: string, config: unknown, handler: ToolHandler) => {
-    const cfg = config as { inputSchema?: unknown; outputSchema?: unknown } | undefined;
+    const cfg = config as
+      | { inputSchema?: unknown; outputSchema?: unknown; annotations?: { readOnlyHint?: boolean } }
+      | undefined;
+    const readOnly = cfg?.annotations?.readOnlyHint === true;
     const output = cfg?.outputSchema ? outputSchemaWithErrors(cfg.outputSchema) : undefined;
     const wrapped = async (...args: unknown[]) => {
       const started = Date.now();
       try {
-        const result = await handler(...args);
-        const isError = Boolean((result as { isError?: boolean } | undefined)?.isError);
-        if (output && !isError) {
-          // Ветка ошибки не должна принимать повреждённый успешный ответ.
-          const parsed = await output.success.safeParseAsync(
-            (result as { structuredContent?: unknown } | undefined)?.structuredContent
-          );
-          if (!parsed.success)
-            throw new Error(`Output validation error: Tool ${name}: ${parsed.error.message}`);
-        }
+        const execute = async (): Promise<CallToolResult> => {
+          const result = (await handler(...args)) as CallToolResult;
+          if (output && !result.isError) {
+            const parsed = await output.success.safeParseAsync(result.structuredContent);
+            if (!parsed.success)
+              throw new Error(`Output validation error: Tool ${name}: ${parsed.error.message}`);
+          }
+          return result;
+        };
+        const result =
+          readOnly && services
+            ? await runWithReadBudget(
+                {
+                  timeoutMs: services.config?.read_budget_timeout ?? 120_000,
+                  maxRequests: services.config?.read_budget_requests ?? 100,
+                  maxBytes: services.config?.read_budget_bytes ?? 64 * 1024 * 1024,
+                },
+                execute
+              )
+            : services?.config?.journal_root && name !== 'bpm_init' && name !== 'bpm_download_file'
+              ? await withOperationJournal(services, name, args[0], execute)
+              : await execute();
+        // Reject the original read result, even if legacy text clipping could make it fit.
+        // Write/partial receipts must retain their structured outcomes after execution.
+        const budgeted = readOnly ? enforceReadResultBudget(result) : result;
+        const rendered = limitResultText(budgeted);
+        // Clipping adds a notice, so the final result needs the same complete budget.
+        const emitted = readOnly ? enforceReadResultBudget(rendered) : rendered;
+        const isError = Boolean((emitted as { isError?: boolean } | undefined)?.isError);
         const ms = Date.now() - started;
         record(name, ms, isError);
-        console.error(`[tool] ${name} ${ms}ms ${isError ? `error ${describeToolError(result)}` : 'ok'}`);
-        return limitResultText(result);
+        console.error(`[tool] ${name} ${ms}ms ${isError ? `error ${describeToolError(emitted)}` : 'ok'}`);
+        return emitted;
       } catch (error) {
         const ms = Date.now() - started;
         record(name, ms, true);
         console.error(`[tool] ${name} ${ms}ms threw ${describeToolError(error)}`);
+        if (error instanceof BpmApiError) {
+          const failure = formatToolError(error);
+          return {
+            content: [{ type: 'text', text: JSON.stringify(failure) }],
+            structuredContent: failure,
+            isError: true,
+          };
+        }
         throw error;
       }
     };

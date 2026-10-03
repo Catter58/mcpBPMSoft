@@ -6,6 +6,8 @@ coverage/
 !.env.example
 *.log
 files/
+state/
+tenants.local.json
 .DS_Store
 
 .idea/
@@ -15,3 +17,5 @@ files/
 *.pdf
 *.postman_collection.json
 docs/
+.omo/
+.superpowers/

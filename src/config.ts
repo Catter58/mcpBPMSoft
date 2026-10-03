@@ -117,6 +117,10 @@ export function buildConfig(
     request_timeout: parseIntEnv('BPMSOFT_REQUEST_TIMEOUT', DEFAULT_CONFIG.request_timeout),
     max_file_size: parseIntEnv('BPMSOFT_MAX_FILE_SIZE', DEFAULT_CONFIG.max_file_size),
     file_root: fileRoot,
+    journal_root: process.env.BPMSOFT_JOURNAL_ROOT || undefined,
+    read_budget_timeout: parseIntEnv('BPMSOFT_READ_BUDGET_TIMEOUT', 120_000),
+    read_budget_requests: parseIntEnv('BPMSOFT_READ_BUDGET_REQUESTS', 100),
+    read_budget_bytes: parseIntEnv('BPMSOFT_READ_BUDGET_BYTES', 64 * 1024 * 1024),
   };
 }
 

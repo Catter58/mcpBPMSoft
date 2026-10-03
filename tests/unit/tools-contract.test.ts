@@ -28,6 +28,7 @@ import { registerRegisterContactTool } from '../../src/workflows/register-contac
 import { registerLogActivityTool } from '../../src/workflows/log-activity.js';
 import { registerSetStatusTool } from '../../src/workflows/set-status.js';
 import { registerSearchUnifiedTool } from '../../src/workflows/search-unified.js';
+import { registerOperationTool } from '../../src/tools/operation-tool.js';
 
 async function listAllTools() {
   const server = new McpServer({ name: 'contract-test', version: '0.0.0' });
@@ -52,6 +53,7 @@ async function listAllTools() {
   registerLogActivityTool(server, container);
   registerSetStatusTool(server, container);
   registerSearchUnifiedTool(server, container);
+  registerOperationTool(server, container);
 
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: 'contract-client', version: '0.0.0' });

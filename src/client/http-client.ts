@@ -17,11 +17,23 @@
 import type { BpmConfig, HttpRequestOptions, HttpResponse, AuthState } from '../types/index.js';
 import { BpmApiError, parseODataError, AuthRequiredError } from '../utils/errors.js';
 import { getRequestAuth, hasRequestAuth } from '../auth/request-context.js';
+import {
+  beforeJournalMutation,
+  afterJournalMutation,
+  type JournalMutationHandle,
+} from '../server/operation-journal.js';
+import {
+  consumeReadBytes,
+  countUpstreamRequest,
+  getRequestSignal,
+  readBudgetExceeded,
+} from '../server/request-runtime.js';
 
 const MAX_RETRIES = 3;
 const MAX_REDIRECTS = 5;
 const RETRY_BASE_DELAY_MS = 1000;
 const MAX_RETRY_AFTER_SECONDS = 60; // hard cap to avoid pathological waits
+const MAX_STRUCTURED_RESPONSE_BYTES = 16 * 1024 * 1024;
 
 /** Auth resolved for a single request: a BPMCSRF token and the cookies to send. */
 type ResolvedAuth = { csrfToken: string | null; cookies: Map<string, string> };
@@ -102,10 +114,18 @@ export class HttpClient {
    * Perform an HTTP request with all BPMSoft-specific handling
    */
   async request<T = unknown>(options: HttpRequestOptions): Promise<HttpResponse<T>> {
+    const auth = getRequestAuth();
+    if (this.config.tenant_id && auth && auth.tenantId !== this.config.tenant_id) {
+      throw new BpmApiError('Контекст запроса не соответствует стенду BPMSoft.', 403);
+    }
     this.assertAllowedOrigin(options.url);
     const timeout = options.timeout ?? this.config.request_timeout;
     const timeoutSignal = AbortSignal.timeout(timeout);
-    const signal = options.signal ? AbortSignal.any([options.signal, timeoutSignal]) : timeoutSignal;
+    const signal = AbortSignal.any(
+      [timeoutSignal, options.signal, getRequestSignal()].filter(
+        (value): value is AbortSignal => value !== undefined
+      )
+    );
     return this.requestWithRetry<T>({ ...options, signal }, 0, false);
   }
 
@@ -122,6 +142,8 @@ export class HttpClient {
     if (cookieStr) headers['Cookie'] = cookieStr;
     const startedAt = Date.now();
     let dispatched = false;
+    let journal: JournalMutationHandle | undefined;
+    let journalSettled = false;
     try {
       options.signal?.throwIfAborted();
       const fetchOptions: RequestInit = {
@@ -135,8 +157,15 @@ export class HttpClient {
       }
       this.logRequest(options, headers);
       let currentUrl = options.url;
-      dispatched = true;
-      let response = await fetch(currentUrl, fetchOptions);
+      const dispatch = async (url: string): Promise<Response> => {
+        options.signal?.throwIfAborted();
+        countUpstreamRequest();
+        journal = await beforeJournalMutation({ ...options, url });
+        options.signal?.throwIfAborted();
+        dispatched = true;
+        return fetch(url, fetchOptions);
+      };
+      let response = await dispatch(currentUrl);
       let redirects = 0;
       while ([301, 302, 303, 307, 308].includes(response.status) && response.headers.get('location')) {
         // Reissuing a side effect at a redirect destination has no exactly-once guarantee.
@@ -145,14 +174,21 @@ export class HttpClient {
         const nextUrl = new URL(response.headers.get('location') as string, currentUrl).toString();
         this.assertAllowedOrigin(nextUrl);
         currentUrl = nextUrl;
-        response = await fetch(currentUrl, fetchOptions);
+        // Redirect bodies are irrelevant; release the connection without buffering them.
+        void response.body?.cancel().catch(() => {});
+        response = await dispatch(currentUrl);
       }
       this.extractCookies(response);
       let data: T;
       try {
         data = await this.decodeBody<T>(response, options);
       } catch (error) {
-        if (response.ok) throw error;
+        if (
+          response.ok ||
+          options.signal?.aborted ||
+          (error instanceof BpmApiError && error.code === 'budget_exceeded')
+        )
+          throw error;
         // The HTTP status still establishes a definite rejection even if the
         // platform's error envelope is malformed or empty.
         data = undefined as T;
@@ -169,6 +205,17 @@ export class HttpClient {
         ok: response.ok,
       };
       this.logResponse(options, httpResponse, Date.now() - startedAt);
+      journalSettled = true;
+      await afterJournalMutation(journal, {
+        status:
+          mutation && (response.status >= 500 || response.status === 408)
+            ? 'outcome_unknown'
+            : response.ok
+              ? 'completed'
+              : 'failed',
+        http_status: response.status,
+        receipt: data,
+      });
 
       // A definite auth rejection precedes execution; one re-login is safe.
       if (
@@ -212,18 +259,34 @@ export class HttpClient {
       }
       return httpResponse;
     } catch (error) {
-      if (error instanceof BpmApiError) throw error;
+      if (journal && !journalSettled) {
+        await afterJournalMutation(journal, {
+          status: dispatched ? 'outcome_unknown' : 'failed',
+          receipt: { error: error instanceof Error ? error.message : String(error) },
+        });
+      }
+      if (error instanceof BpmApiError && error.code !== 'budget_exceeded') throw error;
+      const signalError = options.signal?.aborted ? options.signal.reason : undefined;
+      const budgetError =
+        error instanceof BpmApiError && error.code === 'budget_exceeded'
+          ? error
+          : signalError instanceof BpmApiError && signalError.code === 'budget_exceeded'
+            ? signalError
+            : undefined;
       const interrupted =
         options.signal?.aborted ||
         (error instanceof Error && ['AbortError', 'TimeoutError'].includes(error.name));
       if (mutation && dispatched) {
         throw outcomeUnknown(
           interrupted ? 408 : 0,
-          interrupted
-            ? 'Запрос прерван или истёк таймаут.'
-            : 'Соединение прервано до получения корректного ответа.'
+          budgetError
+            ? budgetError.message
+            : interrupted
+              ? 'Запрос прерван или истёк таймаут.'
+              : 'Соединение прервано до получения корректного ответа.'
         );
       }
+      if (budgetError) throw budgetError;
       throw new BpmApiError(
         interrupted
           ? 'Запрос прерван или истёк таймаут.'
@@ -350,33 +413,55 @@ export class HttpClient {
       return {} as T;
     }
 
-    if (responseType === 'binary') {
-      const buf = await response.arrayBuffer();
-      return Buffer.from(buf) as unknown as T;
-    }
-    if (responseType === 'text') {
-      return (await response.text()) as unknown as T;
-    }
-    if (responseType === 'json') {
-      const text = await response.text();
-      return (text ? JSON.parse(text) : {}) as T;
-    }
-
-    // auto
     const contentType = (response.headers.get('content-type') || '').toLowerCase();
-    if (contentType.includes('application/json') || contentType.includes('odata')) {
-      const text = await response.text();
+    const binary =
+      responseType === 'binary' ||
+      (responseType === 'auto' &&
+        (contentType.includes('application/octet-stream') ||
+          contentType.includes('image/') ||
+          contentType.includes('application/pdf')));
+    const limit = binary ? this.config.max_file_size : MAX_STRUCTURED_RESPONSE_BYTES;
+    const body = await this.readResponseBody(response, limit, options.signal);
+    if (binary) return body as unknown as T;
+    const text = body.toString('utf8');
+    if (
+      responseType === 'json' ||
+      (responseType === 'auto' && (contentType.includes('application/json') || contentType.includes('odata')))
+    ) {
       return (text ? JSON.parse(text) : {}) as T;
     }
-    if (
-      contentType.includes('application/octet-stream') ||
-      contentType.includes('image/') ||
-      contentType.includes('application/pdf')
-    ) {
-      const buf = await response.arrayBuffer();
-      return Buffer.from(buf) as unknown as T;
+    return text as T;
+  }
+
+  private async readResponseBody(response: Response, limit: number, signal?: AbortSignal): Promise<Buffer> {
+    const declaredLength = Number(response.headers.get('content-length'));
+    if (Number.isFinite(declaredLength) && declaredLength > limit) {
+      void response.body?.cancel().catch(() => {});
+      throw readBudgetExceeded('Ответ BPMSoft превышает допустимый размер.');
     }
-    return (await response.text()) as unknown as T;
+    if (!response.body) return Buffer.alloc(0);
+    const reader = response.body.getReader();
+    const chunks: Buffer[] = [];
+    let size = 0;
+    try {
+      while (true) {
+        signal?.throwIfAborted();
+        const chunk = await abortable(reader.read(), signal);
+        if (chunk.done) break;
+        if (chunk.value.byteLength > limit - size) {
+          throw readBudgetExceeded('Ответ BPMSoft превышает допустимый размер.');
+        }
+        consumeReadBytes(chunk.value.byteLength);
+        size += chunk.value.byteLength;
+        chunks.push(Buffer.from(chunk.value));
+      }
+      signal?.throwIfAborted();
+      return Buffer.concat(chunks, size);
+    } finally {
+      // Do not await cancel: custom transports may not settle it on disconnect.
+      void reader.cancel().catch(() => {});
+      reader.releaseLock();
+    }
   }
 
   private async reauthenticate(): Promise<void> {
@@ -428,18 +513,28 @@ export class HttpClient {
   }
 
   private assertAllowedOrigin(url: string): void {
-    if (!this.allowedOrigin) return;
+    if (!this.allowedOrigin && !this.config.tenant_id) return;
     let parsed: URL;
     try {
       parsed = new URL(url);
     } catch {
       throw new BpmApiError(`Некорректный URL запроса: ${url}`, 0);
     }
-    if (parsed.origin !== this.allowedOrigin) {
-      throw new BpmApiError(
-        `URL ${parsed.origin} не соответствует разрешённому origin ${this.allowedOrigin}. Возможна попытка SSRF/перенаправления на сторонний хост.`,
-        0
-      );
+    const tenantUrl = this.config.tenant_id ? new URL(this.config.bpmsoft_url) : undefined;
+    const allowedOrigin = tenantUrl?.origin ?? this.allowedOrigin;
+    if (parsed.origin !== allowedOrigin) {
+      throw new BpmApiError(`URL запроса не соответствует разрешённому стенду BPMSoft.`, 0);
+    }
+    if (tenantUrl) {
+      const prefix = tenantUrl.pathname.replace(/\/+$/, '');
+      // Encoded separators can be decoded before routing by reverse proxies.
+      if (
+        (prefix && parsed.pathname !== prefix && !parsed.pathname.startsWith(`${prefix}/`)) ||
+        /%2f|%5c|%25/i.test(parsed.pathname) ||
+        parsed.pathname.includes('\\')
+      ) {
+        throw new BpmApiError('Путь запроса находится вне стенда BPMSoft.', 403);
+      }
     }
   }
 

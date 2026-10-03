@@ -30,6 +30,19 @@ export interface ToolDescriptor {
 
 export const TOOLS: ToolDescriptor[] = [
   {
+    name: 'bpm_get_operation',
+    title: 'Проверить сохранённый исход операции',
+    description:
+      'Читает журнал операции текущего пользователя на текущем стенде. Пример: {"operation_id":"<uuid из _meta>","stage_limit":20}. ' +
+      'Возвращает состояние, этапы и признаки requires_state_verification/safe_to_retry. ' +
+      'Для следующей страницы используйте next_stage_offset; include_receipt=true запрашивает сохранённый ответ. ' +
+      'Не повторяет и не продолжает изменения автоматически. outcome_unknown требует проверки данных в BPMSoft. ' +
+      'Доступен, когда включён журнал операций; чужие и отсутствующие UUID одинаково возвращают not_found.',
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    blurb: 'проверить журнал своей операции после сбоя, без повторной записи',
+    category: 'read',
+  },
+  {
     name: 'bpm_init',
     title: 'Подключиться к BPMSoft',
     description:
@@ -55,7 +68,9 @@ export const TOOLS: ToolDescriptor[] = [
       'продолжение — по cursor из ответа. Текстовый ответ — до 50 записей, по строке на запись (только ' +
       "непустые поля); остальное — в structuredContent или format='full'. Однозначные опечатки в коллекции и " +
       'полях (ContactCollection на v4, «Контакты», Nmae) исправляются автоматически — см. warnings. ' +
-      'Ответ: records + count/total_count/has_more/cursor.',
+      'Ответ: records + count/total_count/has_more/cursor. ' +
+      'Полный ответ ограничен 64 КиБ; response_too_large означает отказ без данных. Сузьте filter/select ' +
+      'и уменьшите top; при auto_paginate=true уменьшите max_records или отключите автопагинацию.',
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     blurb: 'получить записи коллекции (фильтр/select/expand/order/top/skip, безопасный лимит)',
     category: 'read',
@@ -107,6 +122,8 @@ export const TOOLS: ToolDescriptor[] = [
       'Текстовый ответ — до 50 записей, по строке на запись; однозначные опечатки в коллекции и полях ' +
       'исправляются автоматически — см. warnings. ' +
       'Ответ: compiled_filter, records, count/total_count/has_more/cursor. ' +
+      'Полный ответ ограничен 64 КиБ; response_too_large означает отказ без данных. Сузьте criteria/select ' +
+      'и уменьшите top; при auto_paginate=true уменьшите max_records или отключите автопагинацию. ' +
       'Состояние записи — одним критерием: op «открыт»/«закрыт»/«выиграна»/«проиграна» (open/closed/won/lost) по полю статуса или стадии или без field — сервер сам найдёт справочник состояния и его признаки (End, IsFinal, FinalStatus, Successful), например {"op": "открыт"}.',
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     blurb: 'поиск по criteria-DSL (RU/EN, авто-резолвинг полей, similar_to)',
@@ -423,11 +440,11 @@ export const TOOLS: ToolDescriptor[] = [
     description:
       'Загружает файл в хранилище SysImage (метаданные + бинарные данные) и опционально привязывает его ' +
       'к записи. Содержимое — content_base64 (с обязательным name) или file_path; file_path работает только ' +
-      'в stdio-режиме или внутри каталога BPMSOFT_FILE_ROOT на хосте MCP-сервера. ' +
+      'в stdio или по относительному пути внутри личного каталога пользователя и стенда в BPMSOFT_FILE_ROOT. ' +
       'Пример: {"content_base64": "<base64 настоящего GIF>", "name": "photo.gif", "target_collection": "Contact", ' +
       '"target_id": "<uuid>", "target_field": "PhotoId"} — все три target-параметра вместе. ' +
       'Для полей изображений передавайте настоящее изображение: имя файла и MIME-тип не меняют формат содержимого. ' +
-      'image_id или idempotency_key закрепляют UUID загрузки. При частичном результате возвращаются выполненные шаги и UUID для продолжения. В HTTP file_path находится внутри BPMSOFT_FILE_ROOT. ' +
+      'image_id или idempotency_key закрепляют UUID загрузки. При частичном результате возвращаются выполненные шаги и UUID для продолжения. В HTTP file_path находится в личном каталоге подтверждённого пользователя на выбранном стенде. ' +
       'Для других бинарных полей сущностей используйте bpm_field_upload; допустимый формат зависит от поля и правил платформы.',
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
     blurb: 'загрузить файл (через SysImage)',
@@ -439,7 +456,7 @@ export const TOOLS: ToolDescriptor[] = [
     description:
       'Скачивает бинарные данные из SysImage по UUID. return_base64=true возвращает содержимое в ' +
       'structuredContent.content_base64 (в пределах лимита размера); save_path сохраняет на хост MCP-сервера ' +
-      '(только stdio-режим или внутри BPMSOFT_FILE_ROOT); без них — метаданные и размер. ' +
+      '(в stdio или по относительному пути внутри личного каталога пользователя и стенда); без них — метаданные и размер. ' +
       'Пример: {"image_id": "<uuid>", "return_base64": true}. ' +
       'Чтение произвольного бинарного поля сущности — bpm_field_download.',
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
@@ -465,7 +482,7 @@ export const TOOLS: ToolDescriptor[] = [
     description:
       'GET бинарных данных из поля сущности ({Collection}({id})/{Field}). return_base64=true возвращает ' +
       'содержимое в structuredContent.content_base64 (в пределах лимита размера); save_path сохраняет файл на ' +
-      'хост MCP-сервера (только stdio-режим или внутри BPMSOFT_FILE_ROOT); без них — размер. ' +
+      'хост MCP-сервера (в stdio или по относительному пути внутри личного каталога пользователя и стенда); без них — размер. ' +
       'Пример: {"collection": "Contact", "id": "<uuid>", "field": "Photo", "return_base64": true}. ' +
       'Параметр id принимает UUID или название записи.',
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
