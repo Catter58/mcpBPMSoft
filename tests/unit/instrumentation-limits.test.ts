@@ -218,7 +218,13 @@ describe('полный JSON-бюджет read-only ответа', () => {
           outcomes: [{ id: 'created-id', state: 'succeeded' }],
         },
       };
-      expect(await callResult(completed, { readOnlyHint })).toEqual(completed);
+      const completedResult = await callResult(completed, { readOnlyHint });
+      expect(completedResult.structuredContent).toMatchObject({
+        ...completed.structuredContent,
+        next_action: { kind: 'complete', requires_user_input: false },
+      });
+      expect((completedResult.content as Array<{ text: string }>)[0].text).toContain('Write completed');
+      expect((completedResult.content as Array<{ text: string }>)[0].text).toContain('Next action:');
       const partial: CallToolResult = {
         content: [{ type: 'text', text: 'Partial write' }],
         structuredContent: {
@@ -230,7 +236,12 @@ describe('полный JSON-бюджет read-only ответа', () => {
         },
         isError: true,
       };
-      expect(await callResult(partial, { readOnlyHint })).toEqual(partial);
+      const partialResult = await callResult(partial, { readOnlyHint });
+      expect(partialResult.structuredContent).toMatchObject({
+        ...partial.structuredContent,
+        next_action: { kind: 'ask_user', requires_user_input: true },
+      });
+      expect((partialResult.content as Array<{ text: string }>)[0].text).toContain('Partial write');
     }
   );
 });

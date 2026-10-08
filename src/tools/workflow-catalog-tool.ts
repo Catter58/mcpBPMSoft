@@ -1,12 +1,10 @@
 /**
  * MCP Tool: bpm_workflow_catalog
  *
- * Возвращает каталог типичных пользовательских сценариев работы с BPMSoft +
- * карту основных сущностей и их связей. Для LLM это «карта местности» —
- * быстрая ориентация в начале сессии без перебора bpm_get_collections.
+ * Возвращает каталог типичных задач, рекомендуемых инструментов, связей сущностей
+ * и ограничений, известных MCP-серверу. Это ориентир, а не схема конкретного инстанса.
  *
- * Контент статичный (не требует сетевых вызовов), берётся из проектной
- * документации BPMSoft 1.8 и сверен с коробочной конфигурацией тестового стенда.
+ * Сценарии и связи статичны; значения лимитов берутся из текущей конфигурации сервера.
  */
 
 import * as z from 'zod';
@@ -70,7 +68,7 @@ const SCENARIOS: WorkflowScenario[] = [
     user_intent: '«Покажи карточку Иванова», «что в этой задаче», «детали по сделке».',
     recommended_tools: ['bpm_record_card', 'bpm_get_record'],
     notes:
-      'Оба принимают название записи вместо UUID — искать Id отдельно не нужно. bpm_record_card — карточка 360° со связанными разделами, файлами и лентой.',
+      'Оба принимают название записи вместо UUID — искать Id отдельно не нужно; при наличии уникального бизнес-ключа можно задать match_by как 1–8 точных полей с AND-семантикой. bpm_record_card — карточка 360° со связанными разделами, файлами и лентой.',
   },
   {
     id: 'mass-update',
@@ -78,7 +76,7 @@ const SCENARIOS: WorkflowScenario[] = [
     user_intent: '«Закрой все заявки старше года», «обнови менеджера у этих клиентов», «переведи в архив».',
     recommended_tools: ['bpm_update_by_filter'],
     notes:
-      'Первый вызов без expected_count сам показывает число и названия найденных записей; повторите с этим expected_count — при несовпадении операция отменится.',
+      'Без expected_count первый вызов показывает число и названия. Передайте точный expected_count, чтобы получить план; после показа списка и явного подтверждения пользователя повторите с confirm=true и confirmation_token из плана. Если снимок изменился, проверьте возвращённые поля и новый preview/token и запросите подтверждение повторно; автоматически ничего не записывается.',
   },
   {
     id: 'mass-delete',
@@ -86,7 +84,7 @@ const SCENARIOS: WorkflowScenario[] = [
     user_intent: 'Запрос на массовое удаление (требует подтверждения пользователя!).',
     recommended_tools: ['bpm_delete_by_filter'],
     notes:
-      'Первый вызов возвращает список «Название (Id)» — покажите его пользователю; после согласия повторите с expected_count и confirm=true.',
+      'Получите план точных записей, покажите список «Название (Id)» и дождитесь явного подтверждения пользователя. Только затем повторите с expected_count, confirm=true и confirmation_token из плана. Stale-конфликт покажет изменившиеся значения и новый план; получите отдельное подтверждение перед повтором.',
   },
   {
     id: 'attach-file',
@@ -215,15 +213,36 @@ const ENTITY_GRAPH: { entities: string[]; relations: EntityRelation[] } = {
   ],
 };
 
-const LIMITS = [
-  'Максимум строк в одном OData-ответе: 20 000.',
-  'Запись через OData не запускает расчёты страницы: суммы строк заказа/счёта и итог заказа сервер MCP считает сам, при прямой записи они остались бы нулевыми.',
-  'Номер заказа (Number) присваивается автоматически — не передавайте его без просьбы пользователя.',
-  'Несколько записей — одним вызовом bpm_batch_*: сервер сам шлёт $batch (до 100 подзапросов в пакете) или по одному, если $batch не работает (в т.ч. OData v3). Параллельные вызовы bpm_create_record не нужны.',
-  'Размер файла на загрузку: 10 МБ (настраивается через BPMSOFT_MAX_FILE_SIZE).',
-  'OData v3 EntitySet с суффиксом Collection (ContactCollection); v4 — без (Contact).',
-  'Lookup-поля: v4 — суффикс Id (CityId), v3 — без суффикса (City).',
-];
+const INSTANCE_SCOPE_NOTE =
+  'Схема и бизнес-правила зависят от инстанса. Проверьте наличие коллекций и полей через bpm_get_collections и bpm_get_schema; для обзора используйте bpm_describe_instance.';
+
+function getLimits(services: ServiceContainer): string[] {
+  const limits = [
+    'Лимиты строк и размер ответа OData могут зависеть от инстанса; при чтении уточняйте filter, select и используйте cursor.',
+    'Для распознанных сервером строк заказа или счёта MCP-инструменты рассчитывают поддерживаемые суммы; проверьте фактическую схему через bpm_get_schema.',
+    'Если номер документа в инстансе присваивается автоматически, не передавайте его без просьбы пользователя; проверьте правила конкретной коллекции.',
+    'Для нескольких записей используйте bpm_batch_*; проверяйте итоги и ошибки по каждому элементу. Массовые обновления и удаления требуют показа плана и отдельного подтверждения.',
+  ];
+  const config = services.config;
+  if (config && Number.isFinite(config.max_batch_size)) {
+    limits.push(
+      `Размер одного блока $batch в текущей конфигурации сервера: ${config.max_batch_size} операций.`
+    );
+  }
+  if (config && Number.isFinite(config.max_file_size)) {
+    limits.push(`Максимальный размер файла в текущей конфигурации сервера: ${config.max_file_size} байт.`);
+  }
+  if (config?.odata_version === 3) {
+    limits.push(
+      'При OData v3 имена EntitySet и lookup-полей могут отличаться от OData v4; используйте схему инстанса.'
+    );
+  } else if (config?.odata_version === 4) {
+    limits.push(
+      'При OData v4 имена EntitySet и lookup-полей могут отличаться от OData v3; используйте схему инстанса.'
+    );
+  }
+  return limits;
+}
 
 const scenarioShape = z.object({
   id: z.string(),
@@ -233,7 +252,7 @@ const scenarioShape = z.object({
   notes: z.string().optional(),
 });
 
-export function registerWorkflowCatalogTool(server: McpServer, _services: ServiceContainer): void {
+export function registerWorkflowCatalogTool(server: McpServer, services: ServiceContainer): void {
   const meta = getTool('bpm_workflow_catalog');
   server.registerTool(
     meta.name,
@@ -257,6 +276,7 @@ export function registerWorkflowCatalogTool(server: McpServer, _services: Servic
             ),
           })
           .optional(),
+        scope_note: z.string().optional(),
         limits: z.array(z.string()).optional(),
       },
       annotations: meta.annotations,
@@ -283,12 +303,20 @@ export function registerWorkflowCatalogTool(server: McpServer, _services: Servic
           };
         }
         return {
-          content: [{ type: 'text', text: renderScenario(sc) }],
-          structuredContent: { scenario: sc },
+          content: [{ type: 'text', text: `${renderScenario(sc)}\n\n${INSTANCE_SCOPE_NOTE}` }],
+          structuredContent: { scenario: sc, scope_note: INSTANCE_SCOPE_NOTE },
         };
       }
 
-      const lines: string[] = ['# Каталог сценариев работы с BPMSoft', '', '## Типичные сценарии', ''];
+      const limits = getLimits(services);
+      const lines: string[] = [
+        '# Каталог типичных сценариев',
+        '',
+        INSTANCE_SCOPE_NOTE,
+        '',
+        '## Типичные сценарии',
+        '',
+      ];
       for (const sc of SCENARIOS) {
         lines.push(renderScenario(sc));
         lines.push('');
@@ -303,15 +331,16 @@ export function registerWorkflowCatalogTool(server: McpServer, _services: Servic
         lines.push(`  ${r.from} → ${r.to} (${r.via}) — ${r.meaning}`);
       }
       lines.push('');
-      lines.push('## Ограничения BPMSoft 1.8');
-      for (const l of LIMITS) lines.push(`  • ${l}`);
+      lines.push('## Возможности и ограничения текущей конфигурации');
+      for (const l of limits) lines.push(`  • ${l}`);
 
       return {
         content: [{ type: 'text', text: lines.join('\n') }],
         structuredContent: {
           scenarios: SCENARIOS,
           entity_graph: ENTITY_GRAPH,
-          limits: LIMITS,
+          scope_note: INSTANCE_SCOPE_NOTE,
+          limits,
         },
       };
     }

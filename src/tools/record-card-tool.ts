@@ -13,7 +13,8 @@ import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import type { ServiceContainer } from './init-tool.js';
 import { formatToolError } from '../utils/errors.js';
 import { getTool } from './registry.js';
-import { notInitialized, resolveCollectionName, resolveRecordId } from './_guards.js';
+import { notInitialized, resolveCollectionName, resolveRecordTarget } from './_guards.js';
+import { matchBySchema, matchedByShape } from './_schemas.js';
 import { guidLiteral } from '../utils/odata.js';
 import { compactRecord } from '../utils/compact.js';
 import {
@@ -64,7 +65,8 @@ export function registerRecordCardTool(server: McpServer, services: ServiceConta
       description: meta.description,
       inputSchema: {
         collection: z.string().describe('Коллекция записи: имя (Contact, Account) или русское название'),
-        id: z.string().describe('UUID записи или её название (Name/Title) — Id сервер найдёт сам'),
+        id: z.string().optional().describe('UUID записи или её название (Name/Title) — Id сервер найдёт сам'),
+        match_by: matchBySchema.optional(),
         related_limit: z
           .number()
           .int()
@@ -76,6 +78,7 @@ export function registerRecordCardTool(server: McpServer, services: ServiceConta
       outputSchema: {
         collection: z.string(),
         id: z.string(),
+        matched_by: matchedByShape.optional(),
         name: z.string(),
         record: z.record(z.string(), z.unknown()),
         related: z.array(sectionShape),
@@ -91,7 +94,8 @@ export function registerRecordCardTool(server: McpServer, services: ServiceConta
       try {
         await services.authManager.ensureAuthenticated();
         const collection = await resolveCollectionName(services, params.collection);
-        const { id } = await resolveRecordId(services, collection, params.id);
+        const target = await resolveRecordTarget(services, collection, params);
+        const { id } = target;
         const limit = params.related_limit ?? 5;
         const version = services.config.odata_version;
         const entity = collection.replace(/Collection$/, '');
@@ -243,6 +247,7 @@ export function registerRecordCardTool(server: McpServer, services: ServiceConta
           structuredContent: {
             collection,
             id,
+            ...(target.matched_by ? { matched_by: target.matched_by } : {}),
             name,
             record: fields,
             related,

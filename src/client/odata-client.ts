@@ -44,6 +44,16 @@ export interface NormalizedCollection<T> {
   count?: number;
 }
 
+interface PageBoundary {
+  start: number;
+  end: number;
+  url: string;
+  continuation?: string;
+}
+
+// Keep pagination bookkeeping out of the public OData response shape.
+const pageBoundariesByResponse = new WeakMap<object, PageBoundary[]>();
+
 export interface WriteOptions {
   expectedEtag?: string;
   returnRepresentation?: boolean;
@@ -109,25 +119,30 @@ export class ODataClient {
     const result = await this.readPage<T>(initialUrl);
     let delivered = 0;
     let page = result;
+    let pageUrl = initialUrl;
     const values: T[] = [];
+    const boundaries: PageBoundary[] = [];
     const visited = new Set<string>([initialUrl]);
     while (true) {
       const remaining = limit - delivered;
       const accepted = page.value.slice(0, remaining);
+      const start = delivered;
       values.push(...accepted);
       delivered += accepted.length;
       let continuation = page['@odata.nextLink'];
       if (accepted.length < page.value.length) {
-        // A backend may ignore $top. Advance from the original stable query,
-        // rather than skipping the unreturned tail of this server page.
-        continuation = offsetContinuation(initialUrl, (query?.$skip ?? 0) + delivered);
+        // A backend may ignore $top. Advance within this exact server page so
+        // token-based links and in-page offsets remain valid.
+        continuation = continuationAfter(pageUrl, accepted.length);
       }
+      boundaries.push({ start, end: delivered, url: pageUrl, continuation });
       result['@odata.nextLink'] = continuation;
       if (!autoPaginate || !continuation || delivered >= limit) break;
       const nextUrl = this.validateNextLink(collection, continuation);
       if (visited.has(nextUrl))
         throw new BpmApiError('Сервер вернул повторяющуюся ссылку пагинации.', 502, collection);
       visited.add(nextUrl);
+      pageUrl = nextUrl;
       page = await this.readPage<T>(nextUrl);
       if (page.warnings?.length)
         result.warnings = [...new Set([...(result.warnings ?? []), ...page.warnings])];
@@ -135,6 +150,7 @@ export class ODataClient {
     }
     result.value = values;
     if (!result['@odata.nextLink']) delete result['@odata.nextLink'];
+    pageBoundariesByResponse.set(result, boundaries);
     return result;
   }
 
@@ -157,6 +173,9 @@ export class ODataClient {
       } else result['@odata.nextLink'] = offsetContinuation(url, skip + limit);
       result.value = result.value.slice(0, limit);
     }
+    pageBoundariesByResponse.set(result, [
+      { start: 0, end: result.value.length, url, continuation: result['@odata.nextLink'] },
+    ]);
     return result;
   }
 
@@ -976,6 +995,25 @@ function offsetContinuation(url: string, skip: number): string {
   next.searchParams.set('$skip', String(skip));
   next.searchParams.set('$orderby', stableOrder(next.searchParams.get('$orderby') ?? undefined));
   return next.toString();
+}
+
+/** Build a continuation at an offset within the current query page. */
+export function continuationAfter(url: string, offset: number): string {
+  if (!Number.isSafeInteger(offset) || offset < 0) throw new Error('Некорректное смещение продолжения');
+  const parsed = new URL(url);
+  if (parsed.searchParams.has('$skiptoken')) return withPageOffset(url, offset);
+  return offsetContinuation(url, Number(parsed.searchParams.get('$skip') ?? 0) + offset);
+}
+
+/** Get the exact continuation after a prefix of an aggregated OData response. */
+export function continuationForResult(response: object, returnedCount: number, fallbackUrl: string): string {
+  const boundaries = pageBoundariesByResponse.get(response);
+  const boundary = boundaries?.find((page) => returnedCount > page.start && returnedCount <= page.end);
+  if (!boundary) return continuationAfter(fallbackUrl, returnedCount);
+  const pageOffset = returnedCount - boundary.start;
+  return pageOffset === boundary.end - boundary.start
+    ? (boundary.continuation ?? continuationAfter(boundary.url, pageOffset))
+    : continuationAfter(boundary.url, pageOffset);
 }
 
 function withPageOffset(url: string, offset: number): string {

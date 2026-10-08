@@ -10,7 +10,7 @@ import type { CurrentUser } from '../user/current-user.js';
 
 const ME_TOKENS = new Set(['@me', 'me', 'я', 'мне', 'меня', 'текущий пользователь']);
 
-export function isMeMacro(value: unknown): value is string {
+export function isMeMacro(value: unknown): boolean {
   return typeof value === 'string' && ME_TOKENS.has(value.trim().toLowerCase());
 }
 

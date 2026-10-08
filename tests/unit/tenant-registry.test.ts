@@ -150,3 +150,103 @@ describe('cross-tenant session state cannot be reused', () => {
     });
   });
 });
+
+describe('confirmation freshness conflicts', () => {
+  it('returns changed fields for the same intent and exact target set', () => {
+    const registry = new TenantRegistry(
+      [{ id: 'fresh', config: buildConfig('https://fresh.example') }],
+      true
+    );
+    const services = registry.get('fresh');
+    const intent = { updates: [{ id: 'record-1', data: { Score: 4 } }] };
+    const before = { index: 0, id: 'record-1', values: { Score: 3, Name: 'Before' } };
+    const token = createConfirmationPlan(services, { plan: 1 }, { intent, snapshots: [before] });
+    const result = consumeConfirmationPlan(
+      services,
+      token,
+      { plan: 2 },
+      {
+        intent,
+        snapshots: [{ index: 0, id: 'record-1', values: { Score: 3, Name: 'After', OwnerId: undefined } }],
+      }
+    );
+    expect(result?.changed).toEqual([
+      {
+        index: 0,
+        id: 'record-1',
+        fields: [
+          { field: 'Name', before: 'Before', current: 'After' },
+          { field: 'OwnerId', before: undefined, current: undefined },
+        ],
+      },
+    ]);
+  });
+
+  it('does not refresh a changed intent or retargeted/removed rows', () => {
+    const registry = new TenantRegistry(
+      [{ id: 'fresh2', config: buildConfig('https://fresh2.example') }],
+      true
+    );
+    const services = registry.get('fresh2');
+    const intent = { updates: [{ id: 'record-1', data: { Score: 4 } }] };
+    const snapshot = { index: 0, id: 'record-1', values: { Score: 3 } };
+    const token = createConfirmationPlan(services, { plan: 1 }, { intent, snapshots: [snapshot] });
+    expect(() =>
+      consumeConfirmationPlan(
+        services,
+        token,
+        { plan: 2 },
+        {
+          intent: { updates: [{ id: 'record-1', data: { Score: 9 } }] },
+          snapshots: [snapshot],
+        }
+      )
+    ).toThrow();
+    expect(() =>
+      consumeConfirmationPlan(
+        services,
+        token,
+        { plan: 2 },
+        {
+          intent,
+          snapshots: [{ index: 0, id: 'different-record', values: { Score: 3 } }],
+        }
+      )
+    ).toThrow();
+    expect(() => consumeConfirmationPlan(services, token, { plan: 2 }, { intent, snapshots: [] })).toThrow();
+  });
+
+  it('does not accept a changed relative operation just because it normalizes to the same absolute value', () => {
+    const registry = new TenantRegistry(
+      [{ id: 'fresh3', config: buildConfig('https://fresh3.example') }],
+      true
+    );
+    const services = registry.get('fresh3');
+    const snapshot = { index: 0, id: 'record-1', values: { Score: 5 } };
+    const token = createConfirmationPlan(
+      services,
+      { plan: 1 },
+      {
+        intent: {
+          updates: [{ id: 'record-1', operations: [{ field: 'Score', op: 'increment', amount: 1 }] }],
+        },
+        acceptedIntents: [{ updates: [{ id: 'record-1', data: { Score: 6 } }] }],
+        snapshots: [snapshot],
+      }
+    );
+    expect(() =>
+      consumeConfirmationPlan(
+        services,
+        token,
+        { plan: 2 },
+        {
+          intent: {
+            updates: [{ id: 'record-1', operations: [{ field: 'Score', op: 'increment', amount: 2 }] }],
+          },
+          acceptedIntents: [{ updates: [{ id: 'record-1', data: { Score: 6 } }] }],
+          snapshots: [{ index: 0, id: 'record-1', values: { Score: 4 } }],
+        }
+      )
+    ).toThrow();
+  });
+});

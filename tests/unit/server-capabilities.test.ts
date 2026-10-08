@@ -1,8 +1,10 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { BpmApiError, isQueryUnsupportedError } from '../../src/utils/errors.js';
 import {
   isTolowerSupported,
   markTolowerUnsupported,
+  getRelationshipReadSupport,
+  setRelationshipReadSupport,
   resetServerCapabilities,
 } from '../../src/utils/server-capabilities.js';
 import { containsExpression } from '../../src/utils/odata.js';
@@ -59,5 +61,22 @@ describe('латч tolower', () => {
     expect(containsExpression('Name', 'Иванов', 3, { caseInsensitive: true })).toBe(
       "substringof('Иванов', Name)"
     );
+  });
+});
+
+describe('read-path capability cache', () => {
+  it('scopes exact strategies and expires observations', () => {
+    vi.useFakeTimers();
+    try {
+      setRelationshipReadSupport('instance:user:Account/Activity:filter', false);
+      setRelationshipReadSupport('instance:user:Account/Activity:exists', true);
+      expect(getRelationshipReadSupport('instance:user:Account/Activity:filter')).toBe(false);
+      expect(getRelationshipReadSupport('instance:user:Account/Activity:exists')).toBe(true);
+      expect(getRelationshipReadSupport('other:user:Account/Activity:filter')).toBeUndefined();
+      vi.advanceTimersByTime(5 * 60 * 1000 + 1);
+      expect(getRelationshipReadSupport('instance:user:Account/Activity:filter')).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

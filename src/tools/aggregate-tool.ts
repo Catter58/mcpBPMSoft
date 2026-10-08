@@ -22,12 +22,23 @@ import { criterionSchema } from './_schemas.js';
 import { getRecordsWithLookupNames, displayKeyFor } from '../utils/display.js';
 import type { Criterion } from '../utils/filter-compiler.js';
 import {
+  addDecimal,
+  compareDecimal,
+  decimal,
+  decimalText,
+  divideDecimal,
+  multiplyDecimal,
+  subtractDecimal,
+  type Decimal,
+} from '../utils/decimal.js';
+import {
   bucketLabel,
   bucketLabelsInRange,
   calendarRange,
   previousPeriodRange,
   resolveTimeZone,
   zonedParts,
+  parseDateValue,
   type CalendarPeriod,
   type DateRange,
 } from '../utils/datetime.js';
@@ -84,11 +95,19 @@ interface GroupAcc {
   counts: Map<string, number>;
   mins: Map<string, number>;
   maxs: Map<string, number>;
+  exactSums: Map<string, Decimal>;
+  exactMins: Map<string, Decimal>;
+  exactMaxs: Map<string, Decimal>;
 }
 
 export interface Delta {
   count: number;
   count_pct: number | null;
+  overall_difference: number;
+  contribution_pct: number | null;
+  scope: 'global' | 'observed_scan';
+  partial: boolean;
+  null_reasons?: Record<string, string>;
 }
 
 export interface AggregateGroup {
@@ -100,6 +119,19 @@ export interface AggregateGroup {
   previous_count?: number;
   previous_metrics?: Record<string, number | null>;
   delta?: Delta;
+  metric_deltas?: Record<string, MetricDelta>;
+}
+
+export interface MetricDelta {
+  current: string | null;
+  previous: string | null;
+  difference: string | null;
+  percent_change: string | null;
+  overall_difference: string | null;
+  contribution_pct: string | null;
+  scope: 'global' | 'observed_scan';
+  partial: boolean;
+  null_reasons?: Record<string, string>;
 }
 
 export function registerAggregateTool(server: McpServer, services: ServiceContainer): void {
@@ -150,7 +182,9 @@ export function registerAggregateTool(server: McpServer, services: ServiceContai
         compare_previous: z
           .boolean()
           .optional()
-          .describe('Посчитать и предыдущий период той же длины (нужен period): previous_count и delta'),
+          .describe(
+            'Посчитать предыдущий период той же длины (нужен period): изменения и вклад count/sum по группам; значения и дельты метрик округляются до 12 знаков, проценты — до 6'
+          ),
         max_records: z
           .number()
           .int()
@@ -169,6 +203,7 @@ export function registerAggregateTool(server: McpServer, services: ServiceContai
         timezone: z.string().optional(),
         period: rangeSchema.optional(),
         previous_period: rangeSchema.optional(),
+        metric_comparison_scope: z.enum(['global', 'observed_scan']).optional(),
         scanned: z.number().int(),
         truncated: z.boolean(),
         groups: z.array(
@@ -180,7 +215,33 @@ export function registerAggregateTool(server: McpServer, services: ServiceContai
             metrics: z.record(z.string(), z.number().nullable()),
             previous_count: z.number().int().optional(),
             previous_metrics: z.record(z.string(), z.number().nullable()).optional(),
-            delta: z.object({ count: z.number().int(), count_pct: z.number().nullable() }).optional(),
+            delta: z
+              .object({
+                count: z.number().int(),
+                count_pct: z.number().nullable(),
+                overall_difference: z.number().int(),
+                contribution_pct: z.number().nullable(),
+                scope: z.enum(['global', 'observed_scan']),
+                partial: z.boolean(),
+                null_reasons: z.record(z.string(), z.string()).optional(),
+              })
+              .optional(),
+            metric_deltas: z
+              .record(
+                z.string(),
+                z.object({
+                  current: z.string().nullable(),
+                  previous: z.string().nullable(),
+                  difference: z.string().nullable(),
+                  percent_change: z.string().nullable(),
+                  overall_difference: z.string().nullable(),
+                  contribution_pct: z.string().nullable(),
+                  scope: z.enum(['global', 'observed_scan']),
+                  partial: z.boolean(),
+                  null_reasons: z.record(z.string(), z.string()).optional(),
+                })
+              )
+              .optional(),
           })
         ),
       },
@@ -332,9 +393,9 @@ export function registerAggregateTool(server: McpServer, services: ServiceContai
           align = (bucket) => (bucket === undefined ? undefined : (map.get(bucket) ?? bucket));
         }
 
-        const result = buildGroups(current.groups, previous?.groups, metrics, align);
         const scanned = current.scanned + (previous?.scanned ?? 0);
         const truncated = current.truncated || Boolean(previous?.truncated);
+        const result = buildGroups(current.groups, previous?.groups, metrics, align, !truncated);
 
         const header =
           `Агрегация ${collection}${effectiveFilter ? ` (условие: ${effectiveFilter})` : ''}: ` +
@@ -362,6 +423,7 @@ export function registerAggregateTool(server: McpServer, services: ServiceContai
             timezone: timeZone,
             period: range ? iso(range) : undefined,
             previous_period: previousRange ? iso(previousRange) : undefined,
+            metric_comparison_scope: previousRange ? (truncated ? 'observed_scan' : 'global') : undefined,
             scanned,
             truncated,
             groups: result,
@@ -391,12 +453,7 @@ function dateLiteral(date: Date, odataVersion: 3 | 4): string {
 }
 
 /** Значение даты из ответа: ISO-строка (v4) или /Date(ms)/ (v3); пустое и мусор — null. */
-export function parseDateValue(raw: unknown): Date | null {
-  if (raw === null || raw === undefined || raw === '') return null;
-  const legacy = typeof raw === 'string' ? /^\/Date\((-?\d+)/.exec(raw) : null;
-  const date = legacy ? new Date(Number(legacy[1])) : new Date(raw as string);
-  return Number.isNaN(date.getTime()) ? null : date;
-}
+export { parseDateValue };
 
 function describeRange(range: DateRange, timeZone: string): string {
   const day = (d: Date) => {
@@ -438,6 +495,12 @@ export function accumulate(
     group.counts.set(m.label, (group.counts.get(m.label) ?? 0) + 1);
     group.mins.set(m.label, Math.min(group.mins.get(m.label) ?? value, value));
     group.maxs.set(m.label, Math.max(group.maxs.get(m.label) ?? value, value));
+    const exact = decimal(rawValue as number | string);
+    group.exactSums.set(m.label, addDecimal(group.exactSums.get(m.label) ?? decimal(0), exact));
+    const previousMin = group.exactMins.get(m.label);
+    const previousMax = group.exactMaxs.get(m.label);
+    if (!previousMin || compareDecimal(exact, previousMin) < 0) group.exactMins.set(m.label, exact);
+    if (!previousMax || compareDecimal(exact, previousMax) > 0) group.exactMaxs.set(m.label, exact);
   }
 }
 
@@ -451,15 +514,32 @@ function emptyGroup(key: string | null, label: string, bucket: string | undefine
     counts: new Map(),
     mins: new Map(),
     maxs: new Map(),
+    exactSums: new Map(),
+    exactMins: new Map(),
+    exactMaxs: new Map(),
   };
 }
 
 /** Изменение к предыдущему периоду; процент округлён до десятых, при нуле «было» — null. */
-export function computeDelta(count: number, previousCount: number): Delta {
+export function computeDelta(
+  count: number,
+  previousCount: number,
+  complete = true,
+  overallDifference?: number
+): Delta {
   const diff = count - previousCount;
+  const denominator = overallDifference ?? diff;
+  const reasons: Record<string, string> = {};
+  if (previousCount === 0) reasons.count_pct = 'baseline_zero';
+  if (denominator === 0) reasons.contribution_pct = 'overall_delta_zero';
   return {
     count: diff,
     count_pct: previousCount === 0 ? null : Math.round((diff / previousCount) * 1000) / 10,
+    overall_difference: denominator,
+    contribution_pct: denominator === 0 ? null : Math.round((diff / denominator) * 100_000_000) / 1_000_000,
+    scope: complete ? 'global' : 'observed_scan',
+    partial: !complete,
+    ...(Object.keys(reasons).length ? { null_reasons: reasons } : {}),
   };
 }
 
@@ -472,7 +552,8 @@ export function buildGroups(
   current: Map<string, GroupAcc>,
   previous: Map<string, GroupAcc> | undefined,
   metrics: Metric[],
-  align: (bucket: string | undefined) => string | undefined = (b) => b
+  align: (bucket: string | undefined) => string | undefined = (b) => b,
+  complete = true
 ): AggregateGroup[] {
   const values = (g: GroupAcc) => Object.fromEntries(metrics.map((m) => [m.label, metricValue(g, m)]));
   const pairs = new Map<string, { now: GroupAcc; before?: GroupAcc }>();
@@ -484,8 +565,11 @@ export function buildGroups(
     pair.before = g;
     pairs.set(mapKey, pair);
   }
+  const overallCountDifference =
+    [...current.values()].reduce((sum, group) => sum + group.count, 0) -
+    [...(previous?.values() ?? [])].reduce((sum, group) => sum + group.count, 0);
 
-  return [...pairs.values()]
+  const rows = [...pairs.values()]
     .sort((a, b) => compareBuckets(a.now.bucket, b.now.bucket) || b.now.count - a.now.count)
     .map(({ now, before }) => {
       const group: AggregateGroup = {
@@ -501,9 +585,122 @@ export function buildGroups(
         ...group,
         previous_count: was.count,
         previous_metrics: values(was),
-        delta: computeDelta(now.count, was.count),
+        delta: computeDelta(now.count, was.count, complete, overallCountDifference),
+        metric_deltas: {},
       };
     });
+  if (!previous) return rows;
+  const alignedPrevious = new Map<string, GroupAcc>();
+  for (const group of previous.values())
+    alignedPrevious.set(groupMapKey(align(group.bucket), group.key), group);
+
+  for (const metric of metrics) {
+    const snapshots = rows.map((row) => {
+      const now = current.get(groupMapKey(row.bucket, row.key)) ?? emptyGroup(row.key, row.label, row.bucket);
+      const before =
+        alignedPrevious.get(groupMapKey(row.bucket, row.key)) ?? emptyGroup(row.key, row.label, row.bucket);
+      const currentValue = exactMetricValue(now, metric);
+      const previousValue = exactMetricValue(before, metric);
+      const difference = exactMetricDifference(now, before, metric);
+      const percentChange = exactMetricPercentChange(now, before, metric);
+      return { row, before, currentValue, previousValue, difference, percentChange };
+    });
+    const differences = snapshots.map(({ difference }) => difference);
+    const totalDifference =
+      metric.op === 'sum' && differences.every((value) => value !== null)
+        ? differences.reduce((sum, value) => addDecimal(sum, value!), decimal(0))
+        : null;
+
+    for (let i = 0; i < snapshots.length; i++) {
+      const { row, before, currentValue, previousValue } = snapshots[i];
+      const difference = differences[i];
+      const reasons: Record<string, string> = {};
+      const percentChange = snapshots[i].percentChange;
+      if (!currentValue || !previousValue) reasons.difference = 'missing_metric_value';
+      if (!currentValue || !previousValue) reasons.percent_change = 'missing_metric_value';
+      else if (
+        metric.op === 'avg'
+          ? (before.exactSums.get(metric.label)?.units ?? 0n) === 0n
+          : previousValue.units === 0n
+      )
+        reasons.percent_change = 'baseline_zero';
+      let contribution: Decimal | null = null;
+      if (metric.op !== 'sum') reasons.contribution_pct = 'contribution_requires_sum_metric';
+      else if (!difference || !totalDifference) reasons.contribution_pct = 'missing_metric_value_group';
+      else if (totalDifference.units === 0n) reasons.contribution_pct = 'overall_delta_zero';
+      else contribution = divideDecimal(multiplyDecimal(difference, decimal(100)), totalDifference, 6);
+      row.metric_deltas![metric.label] = {
+        current: currentValue ? decimalText(currentValue) : null,
+        previous: previousValue ? decimalText(previousValue) : null,
+        difference: difference ? decimalText(difference) : null,
+        percent_change: percentChange ? decimalText(percentChange) : null,
+        overall_difference: totalDifference ? decimalText(totalDifference) : null,
+        contribution_pct: contribution ? decimalText(contribution) : null,
+        scope: complete ? 'global' : 'observed_scan',
+        partial: !complete,
+        ...(Object.keys(reasons).length ? { null_reasons: reasons } : {}),
+      };
+    }
+  }
+  return rows;
+}
+
+function exactMetricDifference(now: GroupAcc, before: GroupAcc, metric: Metric): Decimal | null {
+  if (metric.op !== 'avg') {
+    const currentValue = exactMetricValue(now, metric);
+    const previousValue = exactMetricValue(before, metric);
+    return currentValue && previousValue ? subtractDecimal(currentValue, previousValue) : null;
+  }
+  const currentCount = now.counts.get(metric.label) ?? 0;
+  const previousCount = before.counts.get(metric.label) ?? 0;
+  const currentSum = now.exactSums.get(metric.label);
+  const previousSum = before.exactSums.get(metric.label);
+  if (currentCount === 0 || previousCount === 0 || !currentSum || !previousSum) return null;
+  const numerator = subtractDecimal(
+    multiplyDecimal(currentSum, decimal(previousCount)),
+    multiplyDecimal(previousSum, decimal(currentCount))
+  );
+  return divideDecimal(numerator, decimal(currentCount * previousCount), 12);
+}
+
+function exactMetricPercentChange(now: GroupAcc, before: GroupAcc, metric: Metric): Decimal | null {
+  if (metric.op !== 'avg') {
+    const difference = exactMetricDifference(now, before, metric);
+    const previousValue = exactMetricValue(before, metric);
+    return difference && previousValue && previousValue.units !== 0n
+      ? divideDecimal(multiplyDecimal(difference, decimal(100)), absDecimal(previousValue), 6)
+      : null;
+  }
+  const currentCount = now.counts.get(metric.label) ?? 0;
+  const previousCount = before.counts.get(metric.label) ?? 0;
+  const currentSum = now.exactSums.get(metric.label);
+  const previousSum = before.exactSums.get(metric.label);
+  if (currentCount === 0 || previousCount === 0 || !currentSum || !previousSum || previousSum.units === 0n)
+    return null;
+  const numerator = subtractDecimal(
+    multiplyDecimal(currentSum, decimal(previousCount)),
+    multiplyDecimal(previousSum, decimal(currentCount))
+  );
+  const denominator = multiplyDecimal(previousSum, decimal(currentCount));
+  return divideDecimal(multiplyDecimal(numerator, decimal(100)), absDecimal(denominator), 6);
+}
+
+function exactMetricValue(group: GroupAcc, metric: Metric): Decimal | null {
+  const numericCount = group.counts.get(metric.label) ?? 0;
+  if (metric.op === 'sum' && group.count === 0) return decimal(0);
+  if (numericCount === 0) return null;
+  if (metric.op === 'sum') return group.exactSums.get(metric.label) ?? null;
+  if (metric.op === 'avg') {
+    const sum = group.exactSums.get(metric.label);
+    return sum ? divideDecimal(sum, decimal(numericCount), 12) : null;
+  }
+  if (metric.op === 'min') return group.exactMins.get(metric.label) ?? null;
+  if (metric.op === 'max') return group.exactMaxs.get(metric.label) ?? null;
+  return null;
+}
+
+function absDecimal(value: Decimal): Decimal {
+  return { ...value, units: value.units < 0n ? -value.units : value.units };
 }
 
 function compareBuckets(a: string | undefined, b: string | undefined): number {
@@ -526,6 +723,17 @@ function formatGroupLine(g: AggregateGroup, metrics: Metric[], grouped: boolean)
   const metricText = metrics
     .map((m) => {
       const value = `${g.metrics[m.label] ?? '—'}`;
+      const comparison = g.metric_deltas?.[m.label];
+      if (comparison) {
+        const contribution =
+          m.op === 'sum' && comparison.contribution_pct !== null
+            ? `, вклад ${comparison.contribution_pct}%`
+            : '';
+        return (
+          `, ${m.label}: ${comparison.previous ?? '—'} → ${comparison.current ?? '—'} (Δ ${comparison.difference ?? '—'}` +
+          `${comparison.percent_change === null ? '' : `, ${comparison.percent_change}%`}${contribution})`
+        );
+      }
       return g.previous_metrics
         ? `, ${m.label}: ${g.previous_metrics[m.label] ?? '—'} → ${value}`
         : `, ${m.label}=${value}`;

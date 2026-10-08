@@ -15,6 +15,7 @@ import { formatToolError } from '../utils/errors.js';
 import { getTool } from './registry.js';
 import { notInitialized, resolveCollectionName } from './_guards.js';
 import { lookupCandidateShape } from './_schemas.js';
+import { classifyRequiredCreateField } from '../utils/write-safety.js';
 
 /** Сколько имён коллекций отдавать без явного limit. */
 const COLLECTIONS_LIMIT = 100;
@@ -119,6 +120,8 @@ export function registerSchemaTools(server: McpServer, services: ServiceContaine
           entity: z.string(),
           property_count: z.number().int(),
           lookup_count: z.number().int(),
+          collection_navigation_count: z.number().int(),
+          collection_navigations: z.array(z.object({ name: z.string(), target_collection: z.string() })),
           has_captions: z.boolean(),
           required_fields: z.array(requiredFieldShape),
           caller_required_fields: z.array(requiredFieldShape),
@@ -161,6 +164,9 @@ export function registerSchemaTools(server: McpServer, services: ServiceContaine
           ];
 
           const hasCaptions = metadata.properties.some((p) => p.caption);
+          const collectionNavigations = (metadata.navigationProperties ?? [])
+            .filter((navigation) => navigation.isCollection)
+            .map((navigation) => ({ name: navigation.name, target_collection: navigation.targetCollection }));
           const unknownRequirements = metadata.properties
             .filter((p) => p.required === undefined)
             .map((p) => p.name);
@@ -176,7 +182,7 @@ export function registerSchemaTools(server: McpServer, services: ServiceContaine
               caption: p.caption ?? null,
               type: p.type,
               provided_by_server:
-                p.defaultHint?.providedByServer === true ||
+                classifyRequiredCreateField(p, {}) === 'provided_by_server' ||
                 ((metadata.keyFields ?? ['Id']).includes(p.name) && p.type === 'Edm.Guid'),
               default_hint: p.defaultHint ?? null,
             }));
@@ -228,6 +234,11 @@ export function registerSchemaTools(server: McpServer, services: ServiceContaine
               );
             }
           }
+          if (collectionNavigations.length > 0) {
+            lines.push('', 'Коллекционные навигации (для criteria exists/not_exists в OData v4):');
+            for (const navigation of collectionNavigations)
+              lines.push(`  - ${navigation.name} → ${navigation.target_collection}`);
+          }
 
           const propertyPairs = metadata.properties.map((p) => ({
             name: p.name,
@@ -249,6 +260,8 @@ export function registerSchemaTools(server: McpServer, services: ServiceContaine
               entity: metadata.name,
               property_count: metadata.properties.length,
               lookup_count: metadata.lookupFields.length,
+              collection_navigation_count: collectionNavigations.length,
+              collection_navigations: collectionNavigations,
               has_captions: hasCaptions,
               required_fields: requiredFields,
               caller_required_fields: callerRequiredFields,

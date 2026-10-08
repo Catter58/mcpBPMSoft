@@ -16,8 +16,8 @@ describe('coerceValue', () => {
     });
     expect(c('2026-09-25 15:00', 'Edm.DateTimeOffset', MSK).value).toBe('2026-09-25T12:00:00Z');
     expect(c('25.09.2026 15:00', 'Edm.DateTimeOffset', MSK).value).toBe('2026-09-25T12:00:00Z');
-    expect(c('25.09.2026', 'Edm.DateTimeOffset', MSK).value).toBe('2026-09-24T21:00:00Z');
-    expect(c('2026-09-25', 'Edm.DateTimeOffset', MSK).value).toBe('2026-09-24T21:00:00Z');
+    expect(c('25.09.2026', 'Edm.DateTimeOffset', MSK).value).toBe('2026-09-25T09:00:00Z');
+    expect(c('2026-09-25', 'Edm.DateTimeOffset', MSK).value).toBe('2026-09-25T09:00:00Z');
     // DST: летом Берлин +2, зимой +1.
     expect(c('2026-07-01T10:00', 'Edm.DateTimeOffset', 'Europe/Berlin').value).toBe('2026-07-01T08:00:00Z');
     expect(c('2026-01-01T10:00', 'Edm.DateTimeOffset', 'Europe/Berlin').value).toBe('2026-01-01T09:00:00Z');
@@ -29,14 +29,46 @@ describe('coerceValue', () => {
       expect(needsTimeZone(v, 'Edm.DateTimeOffset')).toBe(false);
     }
     expect(needsTimeZone('25.09.2026', 'Edm.DateTimeOffset')).toBe(true);
+    expect(needsTimeZone('25.09.2026', 'Edm.Date')).toBe(false);
+    expect(needsTimeZone('2026-09-25', 'Edm.Date')).toBe(false);
+    expect(needsTimeZone('сегодня', 'Edm.Date')).toBe(true);
+    expect(needsTimeZone('через 1 день', 'Edm.DateTimeOffset')).toBe(true);
     expect(needsTimeZone('да', 'Edm.Boolean')).toBe(false);
+  });
+
+  it('локальное время в DST gap/fold отклоняется, а относительные дни используют captured now', () => {
+    expect(() => c('2026-03-29T02:30', 'Edm.DateTimeOffset', 'Europe/Berlin')).toThrow();
+    expect(() => c('2026-10-25T02:30', 'Edm.DateTimeOffset', 'Europe/Berlin')).toThrow();
+    const now = new Date('2026-09-22T22:30:00Z');
+    expect(coerceValue('F', 'сегодня', 'Edm.DateTimeOffset', MSK, { now }).value).toBe(
+      '2026-09-23T09:00:00Z'
+    );
+    expect(coerceValue('F', '2026-09-25', 'Edm.DateTimeOffset', MSK).value).toBe('2026-09-25T09:00:00Z');
+    expect(coerceValue('F', 'послезавтра', 'Edm.DateTimeOffset', MSK, { now }).value).toBe(
+      '2026-09-25T09:00:00Z'
+    );
+    expect(coerceValue('F', 'сейчас', 'Edm.DateTimeOffset', undefined, { now }).value).toBe(
+      '2026-09-22T22:30:00Z'
+    );
+    expect(coerceValue('F', 'через 30 минут', 'Edm.DateTimeOffset', undefined, { now }).value).toBe(
+      '2026-09-22T23:00:00Z'
+    );
+    expect(coerceValue('F', 'через 10080 минут', 'Edm.DateTimeOffset', undefined, { now }).value).toBe(
+      '2026-09-29T22:30:00Z'
+    );
+    expect(() => coerceValue('F', 'через 10081 минут', 'Edm.DateTimeOffset', MSK, { now })).toThrow();
+    expect(() => coerceValue('F', 'через 2 часа', 'Edm.Date', MSK, { now })).toThrow();
+    const beforeDst = new Date('2026-03-28T12:00:00Z');
+    expect(
+      coerceValue('F', 'через 1 день', 'Edm.DateTimeOffset', 'Europe/Berlin', { now: beforeDst }).value
+    ).toBe('2026-03-29T10:00:00Z');
   });
 
   it('DateTimeOffset/Date: «сегодня»/«завтра 15:00» в поясе пользователя', () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-09-22T22:30:00Z')); // в Москве уже 23 сентября
     expect(c('завтра 15:00', 'Edm.DateTimeOffset', MSK).value).toBe('2026-09-24T12:00:00Z');
-    expect(c('Сегодня', 'Edm.DateTimeOffset', MSK).value).toBe('2026-09-22T21:00:00Z');
+    expect(c('Сегодня', 'Edm.DateTimeOffset', MSK).value).toBe('2026-09-23T09:00:00Z');
     expect(c('сегодня', 'Edm.Date', MSK).value).toBe('2026-09-23');
   });
 
@@ -148,5 +180,33 @@ describe('resolveDataLookups: приведение по типу колонки'
     ]);
     expect(res.notes).toHaveLength(0);
     expect(currentUser.get).toHaveBeenCalledTimes(1);
+  });
+
+  it('макрос «я» fail-closed для отсутствующего Contact и неподдерживаемого lookup', async () => {
+    const metadata = {
+      ...mm,
+      async getEntityMetadata() {
+        return {
+          properties: [
+            { name: 'OwnerId', type: 'Edm.Guid', isLookup: true },
+            { name: 'CityId', type: 'Edm.Guid', isLookup: true },
+          ],
+        };
+      },
+      async getLookupInfo(_c: string, field: string) {
+        return field === 'OwnerId'
+          ? { lookupCollection: 'Contact', displayColumn: 'Name' }
+          : { lookupCollection: 'City', displayColumn: 'Name' };
+      },
+    };
+    const getRecords = vi.fn(async () => ({ value: [] }));
+    const resolver = new LookupResolver(cfg, { getRecords } as never, metadata as never, {
+      currentUser: { get: vi.fn(async () => ({ userId: 'user-1' })) } as never,
+    });
+    await expect(resolver.resolveDataLookups('Activity', { OwnerId: 'я' })).rejects.toThrow(/контакт/i);
+    await expect(resolver.resolveDataLookups('Activity', { CityId: '@me' })).rejects.toThrow(
+      /нельзя разрешить/i
+    );
+    expect(getRecords).not.toHaveBeenCalled();
   });
 });

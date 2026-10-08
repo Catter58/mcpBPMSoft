@@ -128,24 +128,44 @@ describe('100000-row OData collection through the production MCP server', () => 
     expect(metrics.result_bytes).toBeLessThanOrEqual(RESPONSE_LIMIT);
   });
 
-  it.each([
-    {
-      label: '1000 selected full records',
-      args: {
-        collection: 'Contact',
-        select: 'Id,Name,Email,Amount,Category',
-        auto_paginate: true,
-        max_records: 1000,
-        format: 'full',
-        count: true,
-      },
-    },
-    {
-      label: '20 Unicode records with wide fields',
-      args: { collection: 'Contact', top: 20, select: '*', format: 'full', count: true },
-    },
-  ])('rejects $label as a whole without silently returning a smaller page', async ({ args }) => {
-    const { result, metrics } = await session.call('bpm_get_records', args);
+  it('returns byte-bounded auto-pages and continues exactly once through cursor-only calls', async () => {
+    let cursor: string | undefined;
+    const delivered: string[] = [];
+    for (let page = 0; page < 3; page++) {
+      const { result, metrics } = await session.call(
+        'bpm_get_records',
+        cursor
+          ? { cursor }
+          : {
+              collection: 'Contact',
+              select: 'Id,Name,Email,Amount,Category',
+              auto_paginate: true,
+              max_records: 1000,
+              format: 'full',
+              count: true,
+            }
+      );
+      expect(result.isError).toBeFalsy();
+      expect(result.structuredContent).toMatchObject({ total_count: 100000, has_more: true });
+      expect(metrics.result_bytes).toBeLessThanOrEqual(RESPONSE_LIMIT);
+      const ids = result.structuredContent.records.map((record: { Id: string }) => record.Id);
+      expect(metrics.data_request_count).toBeGreaterThanOrEqual(1);
+      expect(metrics.fetched_rows).toBeGreaterThanOrEqual(ids.length);
+      expect(metrics.fetched_rows).toBeLessThanOrEqual(1000);
+      expect(ids.length).toBeGreaterThan(0);
+      delivered.push(...ids);
+      cursor = result.structuredContent.cursor;
+      expect(cursor).toEqual(expect.any(String));
+    }
+    expect(delivered).toEqual(delivered.map((_, index) => recordId(index + 1)));
+
+    const { result, metrics } = await session.call('bpm_get_records', {
+      collection: 'Contact',
+      top: 20,
+      select: '*',
+      format: 'full',
+      count: true,
+    });
     expect(result.isError).toBe(true);
     expect(result.structuredContent).toMatchObject({
       success: false,
@@ -158,6 +178,30 @@ describe('100000-row OData collection through the production MCP server', () => 
     expect(result.structuredContent).not.toHaveProperty('cursor');
     expect(metrics.result_bytes).toBeLessThanOrEqual(RESPONSE_LIMIT);
   });
+
+  it.each([64, 12_000])(
+    'bounds fetched and returned rows for %i-byte synthetic Notes fields',
+    async (notesBytes) => {
+      const synthetic = await createSyntheticSession({ notesBytes }, runtime);
+      try {
+        const { result, metrics } = await synthetic.call('bpm_get_records', {
+          collection: 'Contact',
+          select: 'Id,Name,Notes',
+          auto_paginate: true,
+          max_records: 1000,
+          format: 'full',
+        });
+        expect(result.isError).toBeFalsy();
+        expect(metrics.result_bytes).toBeLessThanOrEqual(RESPONSE_LIMIT);
+        expect(metrics.returned_rows).toBeGreaterThan(0);
+        expect(metrics.fetched_rows).toBeGreaterThanOrEqual(metrics.returned_rows);
+        expect(metrics.fetched_rows).toBeLessThanOrEqual(1000);
+        expect(metrics.data_request_count).toBeGreaterThanOrEqual(1);
+      } finally {
+        await synthetic.close();
+      }
+    }
+  );
 
   it('rejects a single oversized field while preserving the raw 512KiB guard', async () => {
     for (const [notesBytes, expectedCode] of [

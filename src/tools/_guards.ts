@@ -6,9 +6,18 @@ import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import type { ServiceContainer } from './init-tool.js';
 import type { ResolvedLookupNote } from '../lookup/lookup-resolver.js';
 import type { MetadataManager } from '../metadata/metadata-manager.js';
-import { LookupResolutionError, UnknownCollectionError } from '../utils/errors.js';
+import {
+  BpmApiError,
+  LookupResolutionError,
+  UnknownCollectionError,
+  UnknownFieldError,
+} from '../utils/errors.js';
 import { getDisplayColumn, fieldCorrectionNote } from '../utils/display.js';
-import { compileFilter, type CompileResult, type Criterion } from '../utils/filter-compiler.js';
+import { compileFilter, type CompileResult, type CriterionNode } from '../utils/filter-compiler.js';
+import { createResolutionContext, type ResolutionContext } from '../lookup/resolution-context.js';
+import type { EntityProperty } from '../types/index.js';
+import { literalizeFieldValue } from '../utils/field-values.js';
+import { assertSafeIdentifier } from '../utils/odata.js';
 
 const initializationError = {
   success: false,
@@ -177,6 +186,176 @@ export async function resolveRecordId(
   });
 }
 
+export interface MatchByCriterion {
+  field: string;
+  value: unknown;
+}
+
+export interface ResolvedRecordTarget {
+  id: string;
+  matched?: string;
+  matched_by?: {
+    fields: Array<{ field: string; caption: string; type: string }>;
+    values: Record<string, unknown>;
+  };
+}
+
+/** Resolve a record by its existing UUID/name input or by a unique exact business-key conjunction. */
+export async function resolveRecordTarget(
+  services: ServiceContainer,
+  collection: string,
+  target: { id?: string; match_by?: MatchByCriterion[] },
+  options: { fuzzy?: boolean } = {}
+): Promise<ResolvedRecordTarget> {
+  const hasId = typeof target.id === 'string' && target.id.trim().length > 0;
+  const hasMatchBy = target.match_by !== undefined;
+  if (hasId === hasMatchBy)
+    throw new BpmApiError('Передайте ровно один параметр: id или match_by.', 400, collection);
+  if (hasId) return resolveRecordId(services, collection, target.id!, options);
+
+  const criteria = target.match_by!;
+  if (criteria.length < 1 || criteria.length > 8)
+    throw new BpmApiError('match_by должен содержать от 1 до 8 полей.', 400, collection);
+
+  const metadata = await services.metadataManager.getEntityMetadata(collection);
+  const properties = new Map(metadata.properties.map((property) => [property.name, property]));
+  const seen = new Set<string>();
+  const canonical: Array<{ property: EntityProperty; value: unknown }> = [];
+  const input: Record<string, unknown> = {};
+  for (const criterion of criteria) {
+    const reference = await services.metadataManager.resolveFieldReference(collection, criterion.field);
+    if (!reference.name)
+      throw new UnknownFieldError(
+        criterion.field,
+        collection,
+        'suggestions' in reference ? reference.suggestions : []
+      );
+    const property = properties.get(reference.name);
+    if (!property) throw new UnknownFieldError(criterion.field, collection, []);
+    assertSafeIdentifier(property.name, 'match_by.field');
+    if (property.name === 'Id' || metadata.keyFields?.includes(property.name))
+      throw new BpmApiError(
+        'Для match_by передавайте бизнес-поля; UUID записи задаётся через id.',
+        400,
+        collection
+      );
+    if (['Edm.Binary', 'Edm.Stream'].includes(property.type) || property.type.startsWith('Collection('))
+      throw new BpmApiError(
+        `Поле ${property.caption ?? property.name} нельзя использовать в match_by.`,
+        400,
+        collection
+      );
+    if (seen.has(property.name))
+      throw new BpmApiError(
+        `Поле ${property.caption ?? property.name} повторяется в match_by.`,
+        400,
+        collection
+      );
+    seen.add(property.name);
+    input[property.name] = criterion.value;
+    canonical.push({ property, value: criterion.value });
+  }
+
+  const lookupValues: Record<string, unknown> = {};
+  const nonLookupValues: Record<string, unknown> = {};
+  for (const { property, value } of canonical) {
+    if (!property.isLookup || typeof value !== 'string' || UUID_RE.test(value.trim())) {
+      (property.isLookup ? lookupValues : nonLookupValues)[property.name] = value;
+      continue;
+    }
+    const info = await services.metadataManager.getLookupInfo(collection, property.name);
+    if (!info)
+      throw new BpmApiError(
+        `Для точного match_by поля ${property.caption ?? property.name} передайте UUID справочного значения.`,
+        400,
+        collection
+      );
+    const result = await services.lookupResolver.resolve(info.lookupCollection, value, info.displayColumn, {
+      fuzzy: false,
+    });
+    if (!result.resolved || !result.id)
+      throw new LookupResolutionError(info.displayColumn, value, result.matchCount, result.candidates, {
+        lookupCollection: info.lookupCollection,
+        displayColumn: info.displayColumn,
+      });
+    lookupValues[property.name] = result.id;
+  }
+  const resolved = await services.lookupResolver.resolveDataLookups(
+    collection,
+    nonLookupValues,
+    createResolutionContext(services.currentUser)
+  );
+  const normalizedValues = { ...resolved.data, ...lookupValues };
+  const where = canonical.map(({ property }) => {
+    const value = normalizedValues[property.name];
+    const literal = literalizeFieldValue(value, property, services.config.odata_version, collection);
+    return `${property.name} eq ${literal}`;
+  });
+  const displayColumn = (await getDisplayColumn(services.metadataManager, collection)) ?? 'Name';
+  const select = [...new Set(['Id', displayColumn, ...canonical.map(({ property }) => property.name)])].join(
+    ','
+  );
+  const response = await services.odataClient.getRecords<Record<string, unknown>>(
+    collection,
+    { $filter: where.map((part) => `(${part})`).join(' and '), $select: select, $top: 2 },
+    true,
+    2
+  );
+  const candidates = response.value.map((record) => ({
+    id: String(record.Id),
+    displayValue: `${String(record[displayColumn] ?? record.Id)} — ${canonical
+      .map(({ property }) => `${property.caption ?? property.name}: ${String(record[property.name] ?? '∅')}`)
+      .join('; ')}`,
+  }));
+  const searchValue = canonical
+    .map(
+      ({ property }) =>
+        `${property.caption ?? property.name}=${String(normalizedValues[property.name] ?? 'null')}`
+    )
+    .join(' AND ');
+  if (!response.value.length)
+    throw new LookupResolutionError(
+      criteria.map((criterion) => criterion.field).join(' + '),
+      searchValue,
+      0,
+      [],
+      {
+        lookupCollection: collection,
+        displayColumn,
+      }
+    );
+  if (
+    response.value.length !== 1 ||
+    response['@odata.nextLink'] ||
+    (response as unknown as { __next?: string }).__next
+  )
+    throw new LookupResolutionError(
+      criteria.map((criterion) => criterion.field).join(' + '),
+      searchValue,
+      2,
+      candidates,
+      {
+        lookupCollection: collection,
+        displayColumn,
+      }
+    );
+
+  const record = response.value[0];
+  return {
+    id: String(record.Id),
+    matched_by: {
+      fields: canonical.map(({ property }) => ({
+        field: property.name,
+        caption: property.caption ?? property.name,
+        type: property.type,
+      })),
+      values: Object.fromEntries(
+        canonical.map(({ property }) => [property.name, normalizedValues[property.name]])
+      ),
+    },
+  };
+}
+
 /**
  * criteria-DSL → $filter с поясом и «я» текущего пользователя. Общий путь для
  * поиска, подсчёта и массовых операций, чтобы модель нигде не собирала $filter руками.
@@ -184,16 +363,11 @@ export async function resolveRecordId(
 export async function compileCriteria(
   services: ServiceContainer,
   collection: string,
-  criteria: Criterion[],
+  criteria: CriterionNode[],
   join?: 'and' | 'or',
-  options: { autoCorrect?: boolean } = {}
+  options: { autoCorrect?: boolean; resolutionContext?: ResolutionContext } = {}
 ): Promise<CompileResult> {
-  let timeZone: string | undefined;
-  try {
-    timeZone = (await services.currentUser.get()).timeZoneId || undefined;
-  } catch {
-    // DataService недоступен — считаем в поясе сервера.
-  }
+  const resolutionContext = options.resolutionContext ?? createResolutionContext(services.currentUser);
   const notes: string[] = [];
   const compiled = await compileFilter(criteria, {
     collection,
@@ -202,8 +376,7 @@ export async function compileCriteria(
       : services.metadataManager,
     odataVersion: services.config.odata_version,
     join,
-    timeZone,
-    currentUser: services.currentUser,
+    resolutionContext,
     lookupResolver: services.lookupResolver,
   });
   compiled.warnings.unshift(...new Set(notes));

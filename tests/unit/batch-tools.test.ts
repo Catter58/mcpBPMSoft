@@ -22,6 +22,8 @@ interface State {
   bulk: Req[][];
   filters: string[];
   rows: Array<Record<string, unknown>>;
+  responseOverrides?: Array<Record<string, unknown>>;
+  mode?: 'batch' | 'single';
 }
 
 function setup(rows: Array<Record<string, unknown>> = []): { state: State; tool: (n: string) => Handler } {
@@ -30,6 +32,7 @@ function setup(rows: Array<Record<string, unknown>> = []): { state: State; tool:
     { name: 'Id', type: 'Edm.Guid' },
     { name: 'Name', type: 'Edm.String' },
     { name: 'Email', type: 'Edm.String' },
+    { name: 'Total', type: 'Edm.Decimal' },
   ];
   const services = {
     config: { odata_version: 4 },
@@ -77,20 +80,22 @@ function setup(rows: Array<Record<string, unknown>> = []): { state: State; tool:
       executeBulk: async (requests: Req[]) => {
         state.bulk.push(requests);
         return {
-          mode: 'batch',
-          responses: requests.map((r, i) =>
-            r.body?.Name === 'FAIL'
-              ? {
-                  id: String(i + 1),
-                  status: 400,
-                  body: { error: { code: '', message: 'Поле Name обязательно' } },
-                }
-              : {
-                  status: r.method === 'POST' ? 201 : 204,
-                  id: String(i + 1),
-                  body: r.method === 'POST' ? { Id: r.body?.Id } : null,
-                }
-          ),
+          mode: state.mode ?? 'batch',
+          responses:
+            state.responseOverrides ??
+            requests.map((r, i) =>
+              r.body?.Name === 'FAIL'
+                ? {
+                    id: String(i + 1),
+                    status: 400,
+                    body: { error: { code: '', message: 'Поле Name обязательно' } },
+                  }
+                : {
+                    status: r.method === 'POST' ? 201 : 204,
+                    id: String(i + 1),
+                    body: r.method === 'POST' ? { Id: r.body?.Id } : null,
+                  }
+            ),
         };
       },
     },
@@ -102,6 +107,7 @@ function setup(rows: Array<Record<string, unknown>> = []): { state: State; tool:
   );
   return {
     state,
+    raw: (n: string, args: Record<string, unknown>) => handlers.get(n)!(args),
     tool: (n) => async (args) => {
       const handler = handlers.get(n)!;
       const shouldConfirm =
@@ -226,6 +232,86 @@ describe('bpm_batch_create', () => {
 });
 
 describe('bpm_batch_update', () => {
+  it('returns only definitely unexecuted items in retry_args with original index mapping and absolute values', async () => {
+    const ids = [
+      ALPHA,
+      BETA,
+      'aaaaaaaa-0000-0000-0000-000000000003',
+      'aaaaaaaa-0000-0000-0000-000000000004',
+      'aaaaaaaa-0000-0000-0000-000000000005',
+    ];
+    const { state, tool } = setup(
+      ids.map((Id, index) => ({ Id, Name: index === 4 ? 'Already filled' : `Name ${index}`, Total: 10 }))
+    );
+    state.responseOverrides = [
+      { id: '1', status: 204 },
+      { id: '2', status: 400, body: { error: { message: 'failed' } } },
+      { id: '3', status: 424, state: 'not_executed' },
+      { id: '4', status: 0, state: 'outcome_unknown' },
+    ];
+    const result = await tool('bpm_batch_update')({
+      collection: 'Account',
+      updates: [
+        { id: ids[0], data: { Name: 'changed' } },
+        { id: ids[1], data: { Name: 'FAIL' } },
+        { id: ids[2], data: {}, operations: [{ field: 'Total', op: 'increment', amount: 1 }] },
+        { id: ids[3], data: { Name: 'unknown' } },
+        { id: ids[4], data: {}, operations: [{ field: 'Name', op: 'set_if_empty', value: 'ignored' }] },
+      ],
+      continue_on_error: false,
+    });
+    expect(result.structuredContent?.safe_retry_indices).toEqual([2]);
+    expect(result.structuredContent?.retry_args).toEqual({
+      collection: 'Account',
+      updates: [{ id: ids[2], data: { Total: '11' } }],
+      continue_on_error: false,
+    });
+    expect(result.content[0].text).toContain(
+      'используйте готовые retry_args для нового превью и подтверждения'
+    );
+    expect(result.content[0].text).not.toContain('continue_on_error=true');
+    expect(result.content[0].text).not.toContain('outcome_unknown');
+  });
+
+  it('describes single-request execution without inferring why batch mode was unavailable', async () => {
+    const { state, tool } = setup([{ Id: ALPHA, Name: 'Alpha', Total: 10 }]);
+    state.mode = 'single';
+    const result = await tool('bpm_batch_update')({
+      collection: 'Account',
+      updates: [{ id: ALPHA, data: { Name: 'Changed' } }],
+    });
+    expect(result.content[0].text).toContain('Способ: по одному запросу');
+    expect(result.content[0].text).not.toContain('на инстансе не работает');
+  });
+
+  it('executes the exact normalized absolute preview with its confirmation token', async () => {
+    const { state, raw } = setup();
+    const preview = await raw('bpm_batch_update', {
+      collection: 'Account',
+      updates: [{ id: ALPHA, data: { Name: 'Changed' } }],
+    });
+    const normalized = preview.structuredContent?.normalized_args as Record<string, unknown>;
+    const result = await raw('bpm_batch_update', {
+      ...normalized,
+      confirm: true,
+      confirmation_token: preview.structuredContent?.confirmation_token,
+    });
+    expect(state.bulk).toHaveLength(1);
+    expect(state.bulk[0][0].body).toEqual({ Name: 'Changed' });
+    expect(result.isError).toBe(false);
+  });
+
+  it('does not send an empty PATCH when set_if_empty finds a populated field', async () => {
+    const { state, raw } = setup([{ Id: ALPHA, Name: 'Existing' }]);
+    const result = await raw('bpm_batch_update', {
+      collection: 'Account',
+      updates: [{ id: ALPHA, data: {}, operations: [{ field: 'Name', op: 'set_if_empty', value: 'New' }] }],
+    });
+    expect(state.bulk).toHaveLength(0);
+    expect(result.structuredContent?.no_changes).toEqual([0]);
+    expect(result.structuredContent?.failed).toBe(0);
+  });
+
   it('resolves names to Id; a miss is a per-item error with continue_on_error', async () => {
     const { state, tool } = setup();
     const r = await tool('bpm_batch_update')({

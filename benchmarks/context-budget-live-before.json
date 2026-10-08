@@ -2,7 +2,7 @@
   "schema_version": 1,
   "mode": "live-read-only",
   "measured_at": "2026-10-02T10:53:08.202Z",
-  "origin": "https://bpm9.cummik.ru",
+  "origin": "[redacted]",
   "collection": "SysProcessLog",
   "actual_population": 41960,
   "model_invoked": false,

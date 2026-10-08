@@ -44,6 +44,58 @@ describe('MetadataManager.parseMetadataXml', () => {
     expect(navArr.find((n) => n['@_Name'] === 'City')).toBeDefined();
   });
 
+  it('exposes only metadata-bound v4 collection navigations for presence filters', async () => {
+    const xml = `<edmx:Edmx><edmx:DataServices><Schema Namespace="BPMSoft">
+      <EntityType Name="Contact"><Property Name="Id" Type="Edm.Guid"/><NavigationProperty Name="Activities" Type="Collection(BPMSoft.Activity)"/></EntityType>
+      <EntityType Name="Activity"><Property Name="Id" Type="Edm.Guid"/></EntityType>
+      <EntityContainer><EntitySet Name="Contact" EntityType="BPMSoft.Contact"><NavigationPropertyBinding Path="Activities" Target="Activity"/></EntitySet><EntitySet Name="Activity" EntityType="BPMSoft.Activity"/></EntityContainer>
+    </Schema></edmx:DataServices></edmx:Edmx>`;
+    const manager = new MetadataManager(makeCfg(), {
+      async getMetadataXml() {
+        return xml;
+      },
+    } as never);
+    expect(await manager.getCollectionNavigationInfo('Contact', 'Activities')).toEqual({
+      name: 'Activities',
+      targetCollection: 'Activity',
+      isCollection: true,
+    });
+    expect(await manager.getCollectionNavigationInfo('Contact', 'GuessedActivities')).toBeNull();
+    const mismatchedBinding = new MetadataManager(makeCfg(), {
+      async getMetadataXml() {
+        return xml.replace('Target="Activity"', 'Target="Contact"');
+      },
+    } as never);
+    expect(await mismatchedBinding.getCollectionNavigationInfo('Contact', 'Activities')).toBeNull();
+  });
+
+  it('treats declared single and composite key fields as non-nullable', async () => {
+    const xml = `<edmx:Edmx><edmx:DataServices><Schema Namespace="BPMSoft">
+      <EntityType Name="Account"><Key><PropertyRef Name="Id"/></Key>
+        <Property Name="Id" Type="Edm.Guid"/><Property Name="Name" Type="Edm.String"/></EntityType>
+      <EntityType Name="Activity"><Key><PropertyRef Name="TenantId"/><PropertyRef Name="Code"/></Key>
+        <Property Name="TenantId" Type="Edm.Guid"/><Property Name="Code" Type="Edm.String" Nullable="true"/>
+        <Property Name="Description" Type="Edm.String"/></EntityType>
+      <EntityContainer><EntitySet Name="Account" EntityType="BPMSoft.Account"/><EntitySet Name="Activity" EntityType="BPMSoft.Activity"/></EntityContainer>
+    </Schema></edmx:DataServices></edmx:Edmx>`;
+    const manager = new MetadataManager(makeCfg(), {
+      async getMetadataXml() {
+        return xml;
+      },
+    } as never);
+
+    const account = await manager.getEntityMetadata('Account');
+    expect(account.keyFields).toEqual(['Id']);
+    expect(account.properties.find((property) => property.name === 'Id')?.nullable).toBe(false);
+    expect(account.properties.find((property) => property.name === 'Name')?.nullable).toBe(true);
+
+    const activity = await manager.getEntityMetadata('Activity');
+    expect(activity.keyFields).toEqual(['TenantId', 'Code']);
+    expect(activity.properties.find((property) => property.name === 'TenantId')?.nullable).toBe(false);
+    expect(activity.properties.find((property) => property.name === 'Code')?.nullable).toBe(false);
+    expect(activity.properties.find((property) => property.name === 'Description')?.nullable).toBe(true);
+  });
+
   it('returns empty maps when EDMX has no DataServices', () => {
     const mgr = new MetadataManager(makeCfg(), {} as never, {} as never);
     const parsed = mgr.parseMetadataXml('<root/>');

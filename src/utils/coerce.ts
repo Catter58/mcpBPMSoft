@@ -9,7 +9,7 @@
 
 import { coerceFieldValue } from './field-values.js';
 import { BpmApiError } from './errors.js';
-import { calendarRange, resolveTimeZone, zoneOffsetMinutes } from './datetime.js';
+import { calendarRange, resolveTimeZone, zoneOffsetMinutes, zonedParts } from './datetime.js';
 
 /** Пометка о приведённом значении: что пришло и что ушло в BPMSoft. */
 export interface CoercedValueNote {
@@ -17,6 +17,13 @@ export interface CoercedValueNote {
   input: unknown;
   output: unknown;
   type: string;
+}
+
+export interface CoerceOptions {
+  /** Frozen operation time for relative calendar expressions. */
+  now?: Date;
+  /** Local hour used when a DateTime value contains a date but no time. */
+  defaultHour?: number;
 }
 
 const INT_TYPES = new Set(['Edm.Int16', 'Edm.Int32', 'Edm.Int64', 'Edm.Byte', 'Edm.SByte']);
@@ -34,6 +41,7 @@ const RELATIVE_DAYS: Record<string, 'today' | 'tomorrow' | 'yesterday'> = {
   today: 'today',
   tomorrow: 'tomorrow',
   yesterday: 'yesterday',
+  послезавтра: 'tomorrow',
 };
 
 const ISO_WITH_OFFSET_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})$/i;
@@ -41,13 +49,30 @@ const ISO_LOCAL_RE = /^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2}))
 const RU_DATE_RE = /^(\d{1,2})\.(\d{1,2})\.(\d{4})(?:[ ,T]+(\d{1,2}):(\d{2})(?::(\d{2}))?)?$/;
 const RELATIVE_RE = /^(\S+)(?:\s+(?:в\s+)?(\d{1,2}):(\d{2}))?$/i;
 
+/** True when a supported datetime phrase names a calendar day but no clock time. */
+export function isCalendarDateOnly(value: unknown): boolean {
+  if (typeof value !== 'string') return false;
+  const text = value.trim();
+  if (!text) return false;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(text) || /^\d{1,2}\.\d{1,2}\.\d{4}$/.test(text)) return true;
+  if (/^(сегодня|завтра|послезавтра|вчера|today|tomorrow|yesterday)$/i.test(text)) return true;
+  return /^через\s+\d{1,5}\s+д(?:ень|ня|ней)$/i.test(text);
+}
+
 /** Нужен ли для приведения часовой пояс пользователя (чтобы не ходить за ним зря). */
 export function needsTimeZone(value: unknown, edmType: string): boolean {
-  return (
-    typeof value === 'string' &&
-    (edmType === DATETIME_TYPE || edmType === 'Edm.DateTime' || edmType === DATE_TYPE) &&
-    !ISO_WITH_OFFSET_RE.test(value.trim())
-  );
+  if (typeof value !== 'string') return false;
+  const text = value.trim();
+  if (ISO_WITH_OFFSET_RE.test(text)) return false;
+  if (edmType !== DATETIME_TYPE && edmType !== 'Edm.DateTime' && edmType !== DATE_TYPE) return false;
+  const relative = text.match(RELATIVE_RE);
+  const isRelative = Boolean(relative && RELATIVE_DAYS[relative[1].toLowerCase()]);
+  const duration = text.match(/^через\s+\d{1,5}\s+(мин(?:ут(?:а|ы)?)?|час(?:а|ов)?|д(?:ень|ня|ней))$/i);
+  const isCalendarDuration = Boolean(duration && duration[1].toLowerCase().startsWith('д'));
+  if (edmType === DATE_TYPE) return isRelative;
+  // A calendar date without a clock is local for DateTimeOffset, while a
+  // date-only Edm.Date is just a calendar value and needs no timezone.
+  return isRelative || isCalendarDuration || ISO_LOCAL_RE.test(text) || RU_DATE_RE.test(text);
 }
 
 /**
@@ -58,7 +83,8 @@ export function coerceValue(
   field: string,
   value: unknown,
   edmType: string,
-  timeZone?: string
+  timeZone?: string,
+  options: CoerceOptions = {}
 ): { value: unknown; changed: boolean } {
   if (value === null || value === undefined) return { value, changed: false };
   const known =
@@ -84,8 +110,8 @@ export function coerceValue(
         nullable: true,
         isLookup: false,
       });
-  } else if (edmType === DATE_TYPE) out = toDate(value, timeZone);
-  else out = toDateTimeOffset(value, timeZone);
+  } else if (edmType === DATE_TYPE) out = toDate(value, timeZone, options.now);
+  else out = toDateTimeOffset(value, timeZone, options.now, options.defaultHour ?? 12);
 
   if (out === undefined) throw coercionError(field, value, edmType);
   return { value: out, changed: out !== value };
@@ -110,7 +136,7 @@ function normalizeNumber(value: unknown): string | number | undefined {
   return /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/.test(text) ? text : undefined;
 }
 
-function toDate(value: unknown, timeZone?: string): string | undefined {
+function toDate(value: unknown, timeZone?: string, now: Date = new Date()): string | undefined {
   if (typeof value !== 'string') return undefined;
   const s = value.trim();
   if (/^\d{4}-\d{2}-\d{2}$/.test(s))
@@ -118,14 +144,46 @@ function toDate(value: unknown, timeZone?: string): string | undefined {
   const ru = s.match(RU_DATE_RE);
   if (ru && ru[4] === undefined) return ymd(+ru[3], +ru[2], +ru[1]);
   const rel = s.match(RELATIVE_RE);
-  const period = rel && rel[2] === undefined ? RELATIVE_DAYS[rel[1].toLowerCase()] : undefined;
-  return period ? relativeDay(period, resolveTimeZone(timeZone)) : undefined;
+  const phrase = rel && rel[2] === undefined ? rel[1].toLowerCase() : undefined;
+  const period = phrase ? RELATIVE_DAYS[phrase] : undefined;
+  if (!period) return undefined;
+  const tz = resolveTimeZone(timeZone);
+  return phrase === 'послезавтра' ? relativeDayAfterTomorrow(tz, now) : relativeDay(period, tz, now);
 }
 
-function toDateTimeOffset(value: unknown, timeZone?: string): string | undefined {
+function toDateTimeOffset(
+  value: unknown,
+  timeZone?: string,
+  now: Date = new Date(),
+  defaultHour = 12
+): string | undefined {
   if (value instanceof Date) return Number.isNaN(value.getTime()) ? undefined : isoZ(value);
   if (typeof value !== 'string') return undefined;
   const s = value.trim();
+  if (/^(сейчас|now)$/i.test(s)) return isoZ(now);
+  const duration = s.match(/^через\s+(\d{1,5})\s+(мин(?:ут(?:а|ы)?)?|час(?:а|ов)?|д(?:ень|ня|ней))$/i);
+  if (duration) {
+    const amount = Number(duration[1]);
+    const unit = duration[2].toLowerCase();
+    const max = unit.startsWith('м') ? 10_080 : unit.startsWith('ч') ? 168 : 365;
+    if (amount < 1 || amount > max) return undefined;
+    if (unit.startsWith('д')) {
+      const tz = resolveTimeZone(timeZone);
+      const today = zonedParts(calendarRange('today', tz, now).from, tz);
+      const target = new Date(Date.UTC(today.year, today.month - 1, today.day + amount));
+      return localToUtc(
+        target.getUTCFullYear(),
+        target.getUTCMonth() + 1,
+        target.getUTCDate(),
+        defaultHour,
+        0,
+        0,
+        tz
+      );
+    }
+    const multiplier = unit.startsWith('м') ? 60_000 : 3_600_000;
+    return isoZ(new Date(now.getTime() + amount * multiplier));
+  }
   if (ISO_WITH_OFFSET_RE.test(s)) {
     try {
       coerceFieldValue(s, { name: 'date', type: 'Edm.DateTimeOffset', nullable: false, isLookup: false });
@@ -137,41 +195,88 @@ function toDateTimeOffset(value: unknown, timeZone?: string): string | undefined
 
   const tz = resolveTimeZone(timeZone);
   const iso = s.match(ISO_LOCAL_RE);
-  if (iso) return localToUtc(+iso[1], +iso[2], +iso[3], +(iso[4] ?? 0), +(iso[5] ?? 0), +(iso[6] ?? 0), tz);
+  if (iso)
+    return localToUtc(
+      +iso[1],
+      +iso[2],
+      +iso[3],
+      +(iso[4] ?? defaultHour),
+      +(iso[5] ?? 0),
+      +(iso[6] ?? 0),
+      tz
+    );
   const ru = s.match(RU_DATE_RE);
-  if (ru) return localToUtc(+ru[3], +ru[2], +ru[1], +(ru[4] ?? 0), +(ru[5] ?? 0), +(ru[6] ?? 0), tz);
+  if (ru)
+    return localToUtc(+ru[3], +ru[2], +ru[1], +(ru[4] ?? defaultHour), +(ru[5] ?? 0), +(ru[6] ?? 0), tz);
   const rel = s.match(RELATIVE_RE);
   const period = rel ? RELATIVE_DAYS[rel[1].toLowerCase()] : undefined;
   if (rel && period) {
-    const [y, m, d] = relativeDay(period, tz).split('-').map(Number);
-    return localToUtc(y, m, d, +(rel[2] ?? 0), +(rel[3] ?? 0), 0, tz);
+    const day =
+      rel[1].toLowerCase() === 'послезавтра'
+        ? relativeDayAfterTomorrow(tz, now)
+        : relativeDay(period, tz, now);
+    const [y, m, d] = day.split('-').map(Number);
+    return localToUtc(y, m, d, +(rel[2] ?? defaultHour), +(rel[3] ?? 0), 0, tz);
   }
   return undefined;
 }
 
 /** «сегодня»/«завтра»/«вчера» в поясе → 'YYYY-MM-DD'. */
-function relativeDay(period: 'today' | 'tomorrow' | 'yesterday', tz: string): string {
+function relativeDay(period: 'today' | 'tomorrow' | 'yesterday', tz: string, now: Date = new Date()): string {
   // Полночь в поясе + 12 ч гарантированно лежит внутри нужных суток.
-  const noon = new Date(calendarRange(period, tz).from.getTime() + 12 * 3600000);
+  const noon = new Date(calendarRange(period, tz, now).from.getTime() + 12 * 3600000);
   return new Intl.DateTimeFormat('en-CA', { timeZone: tz }).format(noon);
 }
 
+function relativeDayAfterTomorrow(tz: string, now: Date): string {
+  const range = calendarRange('tomorrow', tz, now);
+  const instant = new Date(range.to.getTime() + 12 * 3600000);
+  return new Intl.DateTimeFormat('en-CA', { timeZone: tz }).format(instant);
+}
+
 /** Местное время пояса → UTC ISO с Z; смещение уточняется на сам момент (DST). */
-function localToUtc(
+export function localToUtc(
   y: number,
   mo: number,
   d: number,
   h: number,
   mi: number,
   sec: number,
-  tz: string
+  tz: string,
+  millisecond = 0
 ): string | undefined {
-  if (!validYmd(y, mo, d) || h > 23 || mi > 59 || sec > 59) return undefined;
-  const guess = Date.UTC(y, mo - 1, d, h, mi, sec);
-  const offset = zoneOffsetMinutes(new Date(guess), tz);
-  const corrected = guess - offset * 60000;
-  const refined = zoneOffsetMinutes(new Date(corrected), tz);
-  return isoZ(new Date(refined === offset ? corrected : guess - refined * 60000));
+  if (!validYmd(y, mo, d) || h > 23 || mi > 59 || sec > 59 || millisecond < 0 || millisecond > 999)
+    return undefined;
+  const guess = Date.UTC(y, mo - 1, d, h, mi, sec, millisecond);
+  // Try nearby offsets and retain only instants that map back to the exact
+  // requested wall clock. Gaps and folds are ambiguous, so reject both.
+  const offsets = new Set<number>();
+  for (let delta = -36; delta <= 36; delta += 6)
+    offsets.add(zoneOffsetMinutes(new Date(guess + delta * 3600000), tz));
+  const matches = [...offsets]
+    .map((offset) => guess - offset * 60000)
+    .filter((instant) => {
+      const p = new Intl.DateTimeFormat('en-CA', {
+        timeZone: tz,
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        hour12: false,
+      }).formatToParts(new Date(instant));
+      const values = Object.fromEntries(p.map((part) => [part.type, part.value]));
+      return (
+        +values.year === y &&
+        +values.month === mo &&
+        +values.day === d &&
+        +(values.hour === '24' ? '0' : values.hour) === h &&
+        +values.minute === mi &&
+        +values.second === sec
+      );
+    });
+  return matches.length === 1 ? isoZ(new Date(matches[0])) : undefined;
 }
 
 function validYmd(y: number, m: number, d: number): boolean {

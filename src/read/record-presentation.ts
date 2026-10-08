@@ -3,6 +3,7 @@ import type { EntityMetadata, EntityProperty } from '../types/index.js';
 import { UnknownCollectionError, UnknownFieldError } from '../utils/errors.js';
 import { isGuid } from '../utils/odata.js';
 import { resolveFieldPath } from '../utils/filter-compiler.js';
+import { createResolutionContext } from '../lookup/resolution-context.js';
 
 const EMPTY_ID = '00000000-0000-0000-0000-000000000000';
 const DEFAULT_FIELDS = [
@@ -102,12 +103,23 @@ export async function readOrder(
   return items.join(',');
 }
 
-function displayScalar(value: unknown, property?: EntityProperty): string | number | boolean | null {
+function displayScalar(
+  value: unknown,
+  property?: EntityProperty,
+  timeZone = 'UTC'
+): string | number | boolean | null {
   if (value === null || value === undefined || value === EMPTY_ID) return null;
   if (property?.type.startsWith('Edm.Date') && typeof value === 'string') {
     const date = new Date(value);
     if (Number.isFinite(date.getTime()) && date.getUTCFullYear() > 1) {
-      return `${new Intl.DateTimeFormat('ru-RU', { dateStyle: 'short', timeStyle: 'short', timeZone: 'UTC' }).format(date)} UTC`;
+      const dateOnly = property.type === 'Edm.Date';
+      const formatted = new Intl.DateTimeFormat(
+        'ru-RU',
+        dateOnly
+          ? { dateStyle: 'short', timeZone: 'UTC' }
+          : { dateStyle: 'short', timeStyle: 'short', timeZone }
+      ).format(date);
+      return dateOnly ? formatted : `${formatted} ${timeZone}`;
     }
     return null;
   }
@@ -136,6 +148,19 @@ export async function presentRecords(
   }
   const references = new Map<string, string>();
   const warnings: string[] = [];
+  let timeZone = 'UTC';
+  const hasDateTime = records.some((record) =>
+    Object.entries(record).some(
+      ([field, value]) => typeof value === 'string' && properties.get(field)?.type.startsWith('Edm.DateTime')
+    )
+  );
+  if (hasDateTime) {
+    try {
+      timeZone = (await createResolutionContext(services.currentUser).getTimeZone()).timeZone;
+    } catch {
+      warnings.push('Часовой пояс пользователя недоступен; время показано в UTC.');
+    }
+  }
   if (resolveReferences) {
     const groups = new Map<string, { property: EntityProperty; ids: Set<string> }>();
     for (const record of records)
@@ -196,7 +221,7 @@ export async function presentRecords(
         property?.lookupCollection && typeof value === 'string'
           ? references.get(`${property.lookupCollection}:${value}`)
           : undefined;
-      result[label] = reference ?? displayScalar(value, property);
+      result[label] = reference ?? displayScalar(value, property, timeZone);
     }
     return result;
   });

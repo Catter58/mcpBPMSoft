@@ -1,4 +1,5 @@
 import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
+import { READ_FORMATS, type RenderFormat } from './render.js';
 
 const SIGNING_KEY = randomBytes(32);
 const TTL_MS = 30 * 60 * 1000;
@@ -13,6 +14,12 @@ export interface CursorState {
   expand?: string;
   count?: boolean;
   top?: number;
+  /** Internal paging mode inherited by cursor-only read calls. */
+  autoPaginate?: boolean;
+  /** Text presentation selected on the original read call. */
+  format?: RenderFormat;
+  /** Lookup/reference presentation selected on the original read call. */
+  resolveReferences?: boolean;
   skip: number;
   nextLink?: string;
   criteria?: unknown;
@@ -40,6 +47,12 @@ function validate(state: unknown): asserts state is CursorState {
   }
   if (obj.count !== undefined && typeof obj.count !== 'boolean')
     throw new Error('Невалидный cursor: некорректный count');
+  if (obj.autoPaginate !== undefined && typeof obj.autoPaginate !== 'boolean')
+    throw new Error('Невалидный cursor: некорректный autoPaginate');
+  if (obj.format !== undefined && !READ_FORMATS.includes(obj.format as RenderFormat))
+    throw new Error('Невалидный cursor: некорректный format');
+  if (obj.resolveReferences !== undefined && typeof obj.resolveReferences !== 'boolean')
+    throw new Error('Невалидный cursor: некорректный resolveReferences');
 }
 
 /** Signed continuation, bound to the connection and caller supplied by the tool. */

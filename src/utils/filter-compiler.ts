@@ -19,10 +19,11 @@
 import { getDisplayColumn } from './display.js';
 import { calendarRange, resolveTimeZone, zonedMidnightUtc, type CalendarPeriod } from './datetime.js';
 import { isMeMacro, meIdFor } from './me-macro.js';
-import { coerceValue } from './coerce.js';
+import { coerceValue, needsTimeZone } from './coerce.js';
 import type { CurrentUser } from '../user/current-user.js';
 import type { MetadataManager } from '../metadata/metadata-manager.js';
 import type { LookupResolver } from '../lookup/lookup-resolver.js';
+import type { ResolutionContext } from '../lookup/resolution-context.js';
 import type { EntityProperty } from '../types/index.js';
 import { BpmApiError, LookupResolutionError, UnknownFieldError } from './errors.js';
 import { containsExpression, escapeODataString, isSafeIdentifier } from './odata.js';
@@ -47,6 +48,13 @@ export interface Criterion {
   value_to?: unknown;
 }
 
+/** Bounded boolean groups accepted alongside the legacy flat leaf array. */
+export type CriterionNode =
+  | Criterion
+  | { and: CriterionNode[] }
+  | { or: CriterionNode[] }
+  | { not: CriterionNode };
+
 export interface CompileOptions {
   collection: string;
   metadataManager: MetadataManager;
@@ -54,6 +62,7 @@ export interface CompileOptions {
   lookupResolver?: Pick<LookupResolver, 'resolve'>;
   timeZone?: string;
   currentUser?: { get(): Promise<CurrentUser> };
+  resolutionContext?: ResolutionContext;
   /** How to combine multiple criteria. Default 'and'. */
   join?: 'and' | 'or';
 }
@@ -89,6 +98,8 @@ type CanonicalOp =
   | 'between'
   | 'not_contains'
   | 'similar_to'
+  | 'exists'
+  | 'not_exists'
   | StateOp
   | CalendarPeriod;
 
@@ -140,6 +151,8 @@ const OP_ALIASES: Record<string, CanonicalOp> = {
   // fuzzy similarity (кавычки/орг-формы/регистр игнорируются)
   'похоже на': 'similar_to',
   similar_to: 'similar_to',
+  exists: 'exists',
+  not_exists: 'not_exists',
   // календарные периоды в часовом поясе пользователя, а не в UTC
   сегодня: 'today',
   today: 'today',
@@ -214,18 +227,68 @@ const CALENDAR_PERIODS: CalendarPeriod[] = [
   'this_year',
 ];
 
-export async function compileFilter(criteria: Criterion[], options: CompileOptions): Promise<CompileResult> {
+const MAX_CRITERIA_NODES = 100;
+const MAX_CRITERIA_DEPTH = 8;
+
+export async function compileFilter(
+  criteria: CriterionNode[],
+  options: CompileOptions
+): Promise<CompileResult> {
   if (!Array.isArray(criteria))
     throw new BpmApiError('criteria должен быть массивом условий.', 400, options.collection);
   if (criteria.length === 0) {
     return { filter: '', used_fields: [], warnings: [] };
   }
 
+  let nodeCount = 0;
+  const compileNode = async (node: CriterionNode, depth: number): Promise<string> => {
+    nodeCount++;
+    if (nodeCount > MAX_CRITERIA_NODES)
+      throw new BpmApiError(`criteria содержит больше ${MAX_CRITERIA_NODES} узлов.`, 400, options.collection);
+    if (depth > MAX_CRITERIA_DEPTH)
+      throw new BpmApiError(
+        `Вложенность criteria не должна превышать ${MAX_CRITERIA_DEPTH}.`,
+        400,
+        options.collection
+      );
+    if (!node || typeof node !== 'object' || Array.isArray(node))
+      throw new BpmApiError(
+        'Каждый элемент criteria должен быть условием или логической группой.',
+        400,
+        options.collection
+      );
+    const keys = Object.keys(node);
+    const groupKey = ['and', 'or', 'not'].find((key) => Object.hasOwn(node, key));
+    if (groupKey) {
+      if (keys.length !== 1)
+        throw new BpmApiError(
+          'Логическая группа должна содержать только один из and/or/not.',
+          400,
+          options.collection
+        );
+      if (groupKey === 'not')
+        return `(not (${await compileNode((node as { not: CriterionNode }).not, depth + 1)}))`;
+      const children =
+        groupKey === 'and' ? (node as { and: CriterionNode[] }).and : (node as { or: CriterionNode[] }).or;
+      if (!Array.isArray(children) || children.length === 0)
+        throw new BpmApiError(
+          `Группа ${groupKey} должна содержать непустой массив.`,
+          400,
+          options.collection
+        );
+      const separator = groupKey === 'and' ? ' and ' : ' or ';
+      const parts: string[] = [];
+      for (const child of children) parts.push(await compileNode(child, depth + 1));
+      return `(${parts.map((part) => `(${part})`).join(separator)})`;
+    }
+    if (keys.some((key) => !['field', 'op', 'value', 'value_to'].includes(key)))
+      throw new BpmApiError('Критерий содержит неизвестные свойства.', 400, options.collection);
+    return compileLeaf(node as Criterion);
+  };
   const used: UsedField[] = [];
   const warnings: string[] = [];
-  const expressions: string[] = [];
-
-  for (let criterion of criteria) {
+  const compileLeaf = async (criterionInput: Criterion): Promise<string> => {
+    let criterion = criterionInput;
     if (!criterion || typeof criterion.op !== 'string') {
       throw new BpmApiError(
         'Каждый criterion должен быть объектом вида {field: string, op: string, value?: any}.',
@@ -235,27 +298,93 @@ export async function compileFilter(criteria: Criterion[], options: CompileOptio
     }
 
     const op = canonicalOp(criterion.op);
+    if (op === 'exists' || op === 'not_exists') {
+      if (
+        typeof criterion.field !== 'string' ||
+        !criterion.field.trim() ||
+        criterion.value !== undefined ||
+        criterion.value_to !== undefined
+      )
+        throw new BpmApiError(
+          `Оператор ${op} требует только field с именем коллекционной навигации.`,
+          400,
+          options.collection
+        );
+      if (options.odataVersion !== 4)
+        throw new BpmApiError(
+          'Проверка наличия связанной коллекции поддерживается только в OData v4.',
+          400,
+          options.collection
+        );
+      const nav = criterion.field.trim();
+      if (!isSafeIdentifier(nav))
+        throw new BpmApiError(
+          'Имя коллекционной навигации должно быть точным безопасным идентификатором из $metadata.',
+          400,
+          options.collection
+        );
+      const navigation = await options.metadataManager.getCollectionNavigationInfo(options.collection, nav);
+      if (!navigation)
+        throw new BpmApiError(
+          `Коллекционная навигация "${nav}" не подтверждена метаданными; укажите точное имя навигации из $metadata.`,
+          400,
+          options.collection
+        );
+      const targetMetadata = await options.metadataManager.getEntityMetadata(navigation.targetCollection);
+      const targetKey = targetMetadata.keyFields?.find((key) => {
+        if (!isSafeIdentifier(key)) return false;
+        const property = targetMetadata.properties.find((item) => item.name === key);
+        return property !== undefined && property.nullable === false;
+      });
+      if (!targetKey)
+        throw new BpmApiError(
+          `Невозможно проверить наличие связанной коллекции "${nav}": у целевой коллекции "${navigation.targetCollection}" нет подтверждённого безопасного обязательного ключевого поля в $metadata.`,
+          400,
+          options.collection
+        );
+      used.push({ input: criterion.field, resolved: nav });
+      const predicate = `${nav}/any(related: related/${targetKey} ne null)`;
+      return op === 'exists' ? predicate : `not (${predicate})`;
+    }
     if (STATE_OPS.includes(op as StateOp)) {
       const state = await compileState(criterion, op as StateOp, options);
       used.push(state.used);
       warnings.push(state.note);
-      expressions.push(state.expr);
-      continue;
+      return state.expr;
     }
     if (typeof criterion.field !== 'string')
       throw new BpmApiError('Укажите field в условии.', 400, options.collection);
     const reference = await resolveFieldPath(criterion.field, options);
-    criterion = await substituteMe(criterion, reference, options);
-    const resolved = await resolveExpressionField(reference, op, options, criterion);
+    const leafOptions = { ...options };
+    const dateValues = [
+      ...(Array.isArray(criterion.value) ? criterion.value : [criterion.value]),
+      criterion.value_to,
+    ];
+    const needsContext =
+      isDateType(reference.property.type) &&
+      op !== 'is_null' &&
+      op !== 'is_not_null' &&
+      (CALENDAR_PERIODS.includes(op as CalendarPeriod) ||
+        ((op === 'in_last_days' || op === 'in_last_hours') && reference.property.type === 'Edm.Date') ||
+        dateValues.some((value) => needsTimeZone(value, reference.property.type)) ||
+        (reference.property.type === 'Edm.Date' && dateValues.some((value) => value instanceof Date)));
+    if (needsContext && options.resolutionContext) {
+      leafOptions.timeZone = (await options.resolutionContext.getTimeZone()).timeZone;
+    }
+    criterion = await substituteMe(criterion, reference, leafOptions);
+    const resolved = await resolveExpressionField(reference, op, leafOptions, criterion);
 
     used.push({
       input: criterion.field ?? reference.path,
       resolved: resolved.path,
       caption: resolved.caption,
     });
-    const expr = await buildExpression(resolved, op, criterion, options);
-    expressions.push(expr);
-  }
+    const expr = await buildExpression(resolved, op, criterion, leafOptions);
+    return expr;
+  };
+
+  const expressions: string[] = [];
+  for (const criterion of criteria) expressions.push(await compileNode(criterion, 0));
 
   const join = options.join === 'or' ? ' or ' : ' and ';
   // Wrap individual expressions in parens only when there's more than one,
@@ -368,9 +497,17 @@ async function substituteMe(
   options: CompileOptions
 ): Promise<Criterion> {
   const values = Array.isArray(criterion.value) ? criterion.value : [criterion.value];
-  if (!resolved.lookupCollection || !options.currentUser || !values.some(isMeMacro)) return criterion;
+  if (
+    !resolved.lookupCollection ||
+    (!options.currentUser && !options.resolutionContext) ||
+    !values.some(isMeMacro)
+  )
+    return criterion;
 
-  const meId = meIdFor(resolved.lookupCollection, await options.currentUser.get());
+  const user = options.resolutionContext
+    ? await options.resolutionContext.getCurrentUser()
+    : await options.currentUser!.get();
+  const meId = meIdFor(resolved.lookupCollection, user);
   if (!meId) return criterion;
   const swap = (v: unknown) => (isMeMacro(v) ? meId : v);
   return {
@@ -572,7 +709,10 @@ async function buildExpression(
       value = `${part('year')}-${part('month')}-${part('day')}`;
     }
     if (isDateType(property.type))
-      value = coerceValue(property.name, value, property.type, options.timeZone).value;
+      value = coerceValue(property.name, value, property.type, options.timeZone, {
+        ...(options.resolutionContext ? { now: options.resolutionContext.now } : {}),
+        ...(isDateOnly(value) ? { defaultHour: 0 } : {}),
+      }).value;
     return literalizeFieldValue(value, property, options.odataVersion, field.collection);
   };
   const stringValue = (): string => {
@@ -586,7 +726,11 @@ async function buildExpression(
     return value;
   };
   if (CALENDAR_PERIODS.includes(op as CalendarPeriod)) {
-    const range = calendarRange(op as CalendarPeriod, resolveTimeZone(options.timeZone));
+    const range = calendarRange(
+      op as CalendarPeriod,
+      resolveTimeZone(options.timeZone),
+      options.resolutionContext?.now
+    );
     return `${path} ge ${await literal(range.from)} and ${path} lt ${await literal(range.to)}`;
   }
   switch (op) {
@@ -634,7 +778,10 @@ async function buildExpression(
     case 'in_last_days':
     case 'in_last_hours': {
       const amount = numericValue(criterion.value, op);
-      const since = new Date(Date.now() - amount * (op === 'in_last_days' ? 86400000 : 3600000));
+      const since = new Date(
+        (options.resolutionContext?.now.getTime() ?? Date.now()) -
+          amount * (op === 'in_last_days' ? 86400000 : 3600000)
+      );
       return `${path} ge ${await literal(since)}`;
     }
     case 'between': {

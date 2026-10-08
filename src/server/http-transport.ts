@@ -56,6 +56,7 @@ import { RequestAdmission, runWithRequestSignal, waitWithRequestSignal } from '.
 import { SERVER_VERSION } from '../version.js';
 
 const MAX_BODY_BYTES = 4 * 1024 * 1024;
+const BODY_RECEIVE_TIMEOUT_MS = 30_000;
 
 export interface HttpServerOptions {
   port: number;
@@ -262,7 +263,12 @@ async function readPostBody(req: http.IncomingMessage, signal: AbortSignal): Pro
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     let size = 0;
+    const timeout = setTimeout(() => {
+      req.pause();
+      fail(new BpmApiError('Тело запроса не получено вовремя.', 408));
+    }, BODY_RECEIVE_TIMEOUT_MS);
     const cleanup = () => {
+      clearTimeout(timeout);
       req.removeListener('data', data);
       req.removeListener('end', end);
       req.removeListener('error', fail);
@@ -307,6 +313,7 @@ function sendHttpError(res: http.ServerResponse, error: unknown): void {
   const messages: Record<number, string> = {
     400: 'Invalid request',
     401: 'Authentication required',
+    408: 'Request body timed out',
     403: 'Forbidden',
     404: 'Not found',
     413: 'Request too large',

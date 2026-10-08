@@ -22,6 +22,8 @@ import { isMeMacro, meIdFor } from '../utils/me-macro.js';
 import { coerceValue, needsTimeZone, type CoercedValueNote } from '../utils/coerce.js';
 import { isTolowerSupported, markTolowerUnsupported } from '../utils/server-capabilities.js';
 import { coerceFieldValue, UUID_RE } from '../utils/field-values.js';
+import { createResolutionContext, type ResolutionContext } from './resolution-context.js';
+export type { ResolutionContext } from './resolution-context.js';
 
 interface CandidatePage {
   candidates: LookupCandidate[];
@@ -46,6 +48,16 @@ export interface ResolvedData {
   data: Record<string, unknown>;
   notes: ResolvedLookupNote[];
   coerced: CoercedValueNote[];
+  origins: Array<{ field: string; source: 'caller' | 'normalized' | 'lookup' | 'current_user' }>;
+}
+
+export interface ResolutionFieldError {
+  rawKey: string;
+  canonicalField?: string;
+  error: unknown;
+}
+export interface ResolvedDataWithErrors extends ResolvedData {
+  errors: ResolutionFieldError[];
 }
 
 const DEFAULT_CACHE_MAX = 1000;
@@ -64,6 +76,10 @@ export class LookupResolver {
   ) {
     this.maxCacheSize = options.maxCacheSize ?? DEFAULT_CACHE_MAX;
     this.currentUser = options.currentUser;
+  }
+
+  createResolutionContext(now: Date = new Date()): ResolutionContext {
+    return createResolutionContext(this.currentUser, now);
   }
 
   async resolve(
@@ -202,7 +218,23 @@ export class LookupResolver {
    *
    * Detects lookup fields and resolves human-readable values to UUIDs.
    */
-  async resolveDataLookups(collection: string, data: Record<string, unknown>): Promise<ResolvedData> {
+  async resolveDataLookups(
+    collection: string,
+    data: Record<string, unknown>,
+    context?: ResolutionContext
+  ): Promise<ResolvedData>;
+  async resolveDataLookups(
+    collection: string,
+    data: Record<string, unknown>,
+    context: ResolutionContext,
+    options: { collectErrors: true }
+  ): Promise<ResolvedDataWithErrors>;
+  async resolveDataLookups(
+    collection: string,
+    data: Record<string, unknown>,
+    context: ResolutionContext = this.createResolutionContext(),
+    options?: { collectErrors?: boolean }
+  ): Promise<ResolvedData | ResolvedDataWithErrors> {
     // Схему тянем заранее: неверная коллекция должна падать сразу, а не на
     // первом же поле, и дальше все резолвы полей идут по прогретому кэшу.
     const entityMeta = await this.metadataManager.getEntityMetadata(collection);
@@ -226,29 +258,15 @@ export class LookupResolver {
       })
     );
 
-    // Пояс пользователя — один раз на вызов и только если его требует хоть одна дата.
-    let timeZonePromise: Promise<string | undefined> | undefined;
-    const userTimeZone = (): Promise<string | undefined> => {
-      timeZonePromise ??= (async () => {
-        if (!this.currentUser) return undefined;
-        try {
-          return (await this.currentUser.get()).timeZoneId || undefined;
-        } catch {
-          return undefined; // DataService недоступен — считаем в поясе сервера.
-        }
-      })();
-      return timeZonePromise;
-    };
-
     // Поля независимы друг от друга, поэтому резолвим их параллельно. На
     // bpm_batch_create из сотни записей последовательный обход давал сотни
     // запросов друг за другом; кэш спасал только со второй записи.
-    const entries = await Promise.all(
+    const settled = await Promise.allSettled(
       normalized.map(async ({ rawKey, value, normalizedKey, prop }) => {
         // Не-lookup колонка с известным типом: приводим значение («да», «25.09.2026 15:00»).
         if (!prop.isLookup) {
-          const tz = needsTimeZone(value, prop.type) ? await userTimeZone() : undefined;
-          const c = coerceValue(normalizedKey, value, prop.type, tz);
+          const tz = needsTimeZone(value, prop.type) ? (await context.getTimeZone()).timeZone : undefined;
+          const c = coerceValue(normalizedKey, value, prop.type, tz, { now: context.now, defaultHour: 12 });
           // Неизменённое значение (строка, Guid, уже верный тип) идёт обычным путём ниже.
           if (c.changed) {
             const coerced = { field: normalizedKey, input: value, output: c.value, type: prop.type };
@@ -257,28 +275,62 @@ export class LookupResolver {
               value: coerceFieldValue(c.value, prop, collection),
               note: null,
               coerced,
+              origin: 'normalized' as const,
             };
           }
         }
 
         if (typeof value !== 'string' || UUID_RE.test(value.trim())) {
-          return { key: normalizedKey, value: coerceFieldValue(value, prop, collection), note: null };
+          return {
+            key: normalizedKey,
+            value: coerceFieldValue(value, prop, collection),
+            note: null,
+            origin: 'caller' as const,
+          };
         }
 
         const lookupInfo = await this.metadataManager.getLookupInfo(collection, normalizedKey);
         if (!lookupInfo) {
-          return { key: normalizedKey, value: coerceFieldValue(value, prop, collection), note: null };
+          if (prop.isLookup && isMeMacro(value))
+            throw new BpmApiError('Макрос «я» нельзя разрешить для этого lookup-поля.', 400, collection);
+          return {
+            key: normalizedKey,
+            value: coerceFieldValue(value, prop, collection),
+            note: null,
+            origin: 'caller' as const,
+          };
         }
 
         // «я» / @me в Owner, Author и т. п. — текущий пользователь, без поиска по имени.
-        if (isMeMacro(value) && this.currentUser) {
-          const meId = meIdFor(lookupInfo.lookupCollection, await this.currentUser.get());
-          if (meId) return { key: normalizedKey, value: meId, note: null };
+        if (isMeMacro(value)) {
+          if (
+            lookupInfo.lookupCollection.replace(/Collection$/, '') !== 'Contact' &&
+            lookupInfo.lookupCollection.replace(/Collection$/, '') !== 'SysAdminUnit'
+          ) {
+            throw new BpmApiError(
+              `Макрос «я» нельзя разрешить для справочника ${lookupInfo.lookupCollection}.`,
+              400,
+              collection
+            );
+          }
+          const meId = meIdFor(lookupInfo.lookupCollection, await context.getCurrentUser());
+          if (!meId)
+            throw new BpmApiError(
+              'У текущего пользователя не указан контакт для lookup-поля.',
+              400,
+              collection
+            );
+          return { key: normalizedKey, value: meId, note: null, origin: 'current_user' as const };
         }
 
         // Пустая строка в lookup-поле — это «очистить связь», а не значение для поиска.
         if (value.trim() === '') {
-          return { key: normalizedKey, value: coerceFieldValue(null, prop, collection), note: null };
+          return {
+            key: normalizedKey,
+            value: coerceFieldValue(null, prop, collection),
+            note: null,
+            origin: 'lookup' as const,
+          };
         }
 
         const lookupResult = await this.resolve(
@@ -298,7 +350,7 @@ export class LookupResolver {
                   matchType: lookupResult.matchType ?? ('contains' as const),
                 }
               : null;
-          return { key: normalizedKey, value: lookupResult.id, note };
+          return { key: normalizedKey, value: lookupResult.id, note, origin: 'lookup' as const };
         }
 
         // Значение не разрешилось — обогащаем ошибку допустимыми значениями
@@ -318,13 +370,26 @@ export class LookupResolver {
     const resolved: Record<string, unknown> = {};
     const notes: ResolvedLookupNote[] = [];
     const coerced: CoercedValueNote[] = [];
-    for (const entry of entries) {
+    const origins: ResolvedData['origins'] = [];
+    const errors: ResolutionFieldError[] = [];
+    for (let index = 0; index < settled.length; index++) {
+      const result = settled[index];
+      if (result.status === 'rejected') {
+        if (!options?.collectErrors) throw result.reason;
+        const field = normalized[index];
+        errors.push({ rawKey: field.rawKey, canonicalField: field.normalizedKey, error: result.reason });
+        continue;
+      }
+      const entry = result.value;
       resolved[entry.key] = entry.value;
+      origins.push({ field: entry.key, source: entry.origin ?? 'caller' });
       if (entry.note) notes.push(entry.note as ResolvedLookupNote);
       if ('coerced' in entry && entry.coerced) coerced.push(entry.coerced);
     }
 
-    return { data: resolved, notes, coerced };
+    return options?.collectErrors
+      ? { data: resolved, notes, coerced, origins, errors }
+      : { data: resolved, notes, coerced, origins };
   }
 
   /** Выборка первых значений справочника для контекста ошибок (ошибки сети глотаются). */

@@ -4,7 +4,7 @@
  * handler closure; services are lightweight stubs.
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { registerSetStatusTool } from '../../src/workflows/set-status.js';
 import { registerRegisterContactTool } from '../../src/workflows/register-contact.js';
@@ -62,12 +62,23 @@ const METAS: Record<string, EntityMetadata> = {
   Account: meta('Account', [str('Name')]),
   Activity: meta('Activity', [
     { ...str('Title'), required: true, requirementSource: 'entity_schema_designer' },
+    { ...str('StartDate'), type: 'Edm.DateTimeOffset' },
+    { ...str('DueDate'), type: 'Edm.DateTimeOffset' },
     lookup('OwnerId', 'Contact'),
+    {
+      ...lookup('TypeId', 'ActivityType'),
+      defaultHint: {
+        source: 'constant',
+        providedByServer: true,
+        value: 'fbe0acdc-cfc0-df11-b00f-001d60e938c6',
+      },
+    },
     lookup('ActivityCategoryId', 'ActivityCategory'),
     lookup('AccountId', 'Account'),
     lookup('StatusId', 'ActivityStatus'),
     lookup('EmailSendStatusId', 'EmailSendStatus'),
   ]),
+  ActivityCategory: meta('ActivityCategory', [str('Name'), lookup('ActivityTypeId', 'ActivityType')]),
 };
 
 interface Stub {
@@ -137,7 +148,12 @@ function buildStub(
   } as ServiceContainer['config'];
   const currentUser = {
     async get() {
-      return { userId: CURRENT_USER, userName: 'Test user', contactId: CURRENT_CONTACT };
+      return {
+        userId: CURRENT_USER,
+        userName: 'Test user',
+        contactId: CURRENT_CONTACT,
+        timeZoneId: 'Europe/Moscow',
+      };
     },
   } as unknown as ServiceContainer['currentUser'];
   // Use the real field preparation path; only the lookup search API is stubbed.
@@ -274,6 +290,12 @@ describe('findOrCreate (fuzzy)', () => {
 });
 
 describe('bpm_log_activity', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-10-07T09:00:00+03:00'));
+  });
+  afterEach(() => vi.useRealTimers());
+
   it('picks the same-named category whose ActivityTypeId matches the default type', async () => {
     const stub = buildStub(
       {
@@ -287,12 +309,12 @@ describe('bpm_log_activity', () => {
           ],
         },
       },
-      (c) =>
+      (c, filter) =>
         c === 'ActivityCategory'
           ? [
               { Id: CALL_CATEGORY_CALL, ActivityTypeId: 'e1831dec-cfc0-df11-b00f-001d60e938c6' },
               { Id: CALL_CATEGORY_TASK, ActivityTypeId: 'fbe0acdc-cfc0-df11-b00f-001d60e938c6' },
-            ]
+            ].filter((row) => !filter || filter.includes(row.Id))
           : []
     );
     const res = await handler(registerLogActivityTool, stub)({ title: 'Позвонить', type: 'Звонок' });
@@ -312,5 +334,21 @@ describe('bpm_log_activity', () => {
       related_id: 'Ромашка',
     });
     expect(stub.created[0].data).toMatchObject({ OwnerId: CURRENT_CONTACT, AccountId: ACCOUNT_EXISTING });
+  });
+
+  it('uses a related OwnerId as the slot owner before checking availability', async () => {
+    const stub = buildStub({});
+    const res = await handler(
+      registerLogActivityTool,
+      stub
+    )({
+      title: 'Call',
+      related_collection: 'Contact',
+      related_id: CONTACT_EXISTING,
+      related_field: 'OwnerId',
+    });
+    expect(res.isError).toBeUndefined();
+    expect(stub.created[0].data.OwnerId).toBe(CONTACT_EXISTING);
+    expect(stub.queries.find((query) => query.collection === 'Activity')?.filter).toContain(CONTACT_EXISTING);
   });
 });

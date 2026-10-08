@@ -224,9 +224,9 @@ describe('previousPeriodRange', () => {
 
 describe('сравнение с предыдущим периодом', () => {
   it('computeDelta: разница и процент, при нуле «было» процента нет', () => {
-    expect(computeDelta(6, 4)).toEqual({ count: 2, count_pct: 50 });
-    expect(computeDelta(1, 3)).toEqual({ count: -2, count_pct: -66.7 });
-    expect(computeDelta(3, 0)).toEqual({ count: 3, count_pct: null });
+    expect(computeDelta(6, 4)).toMatchObject({ count: 2, count_pct: 50, overall_difference: 2 });
+    expect(computeDelta(1, 3)).toMatchObject({ count: -2, count_pct: -66.7, overall_difference: -2 });
+    expect(computeDelta(3, 0)).toMatchObject({ count: 3, count_pct: null, contribution_pct: 100 });
   });
 
   it('buildGroups сопоставляет интервалы по порядку и сохраняет группы, которых больше нет', () => {
@@ -250,8 +250,69 @@ describe('сравнение с предыдущим периодом', () => {
       ['2026-09-15', 'Борис', 1, 0],
       [NO_DATE_BUCKET, 'Анна', 0, 1],
     ]);
-    expect(groups[0].delta).toEqual({ count: 1, count_pct: 100 });
-    expect(groups[1].delta).toEqual({ count: -1, count_pct: -100 });
+    expect(groups[0].delta).toMatchObject({ count: 1, count_pct: 100, overall_difference: 1 });
+    expect(groups[1].delta).toMatchObject({ count: -1, count_pct: -100, overall_difference: 1 });
+  });
+
+  it('metric deltas use exact decimals, expose net contribution, and mark partial/null semantics', () => {
+    const metrics = [
+      { op: 'sum' as const, field: 'Value', label: 'sum(Value)' },
+      { op: 'avg' as const, field: 'Value', label: 'avg(Value)' },
+    ];
+    const current = new Map();
+    const previous = new Map();
+    accumulate(current, { Segment: 'A', Value: '0.1' }, 'Segment', undefined, metrics);
+    accumulate(current, { Segment: 'A', Value: '0.2' }, 'Segment', undefined, metrics);
+    accumulate(previous, { Segment: 'A', Value: '0.1' }, 'Segment', undefined, metrics);
+    accumulate(current, { Segment: 'B', Value: '3' }, 'Segment', undefined, metrics);
+    accumulate(previous, { Segment: 'B', Value: '4' }, 'Segment', undefined, metrics);
+    accumulate(current, { Segment: 'C', Value: '5' }, 'Segment', undefined, metrics);
+
+    const groups = buildGroups(current, previous, metrics, undefined, false);
+    const a = groups.find((g) => g.key === 'A')!;
+    const b = groups.find((g) => g.key === 'B')!;
+    const c = groups.find((g) => g.key === 'C')!;
+    expect(a.metric_deltas?.['sum(Value)']).toMatchObject({
+      current: '0.3',
+      previous: '0.1',
+      difference: '0.2',
+      percent_change: '200',
+      overall_difference: '4.2',
+      contribution_pct: '4.761905',
+      scope: 'observed_scan',
+      partial: true,
+    });
+    expect(b.metric_deltas?.['sum(Value)']?.difference).toBe('-1');
+    expect(c.metric_deltas?.['sum(Value)']).toMatchObject({
+      current: '5',
+      previous: '0',
+      difference: '5',
+      percent_change: null,
+      null_reasons: { percent_change: 'baseline_zero' },
+    });
+    expect(a.metric_deltas?.['avg(Value)']).toMatchObject({
+      current: '0.15',
+      previous: '0.1',
+      difference: '0.05',
+      percent_change: '50',
+      contribution_pct: null,
+      null_reasons: { contribution_pct: 'contribution_requires_sum_metric' },
+    });
+    expect(a.delta).toMatchObject({ contribution_pct: 50, overall_difference: 2, scope: 'observed_scan' });
+    expect(c.delta).toMatchObject({ contribution_pct: 50, overall_difference: 2 });
+  });
+
+  it('computes average delta and percent before rounding either period average', () => {
+    const metric = [{ op: 'avg' as const, field: 'Value', label: 'avg(Value)' }];
+    const current = new Map();
+    const previous = new Map();
+    accumulate(current, { Segment: 'A', Value: '1.0000001' }, 'Segment', undefined, metric);
+    accumulate(previous, { Segment: 'A', Value: '1' }, 'Segment', undefined, metric);
+    const [group] = buildGroups(current, previous, metric);
+    expect(group.metric_deltas?.['avg(Value)']).toMatchObject({
+      difference: '0.0000001',
+      percent_change: '0.00001',
+    });
   });
 
   it('без сравнения полей previous нет, сортировка по count', () => {
@@ -270,6 +331,8 @@ describe('сравнение с предыдущим периодом', () => {
     expect(parseDateValue('/Date(0)/')?.toISOString()).toBe('1970-01-01T00:00:00.000Z');
     expect(parseDateValue(null)).toBeNull();
     expect(parseDateValue('мусор')).toBeNull();
+    expect(parseDateValue('2026-99-01')).toBeNull();
+    expect(parseDateValue('2026-02-31')).toBeNull();
   });
 });
 

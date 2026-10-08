@@ -18,8 +18,9 @@ import { getTool } from '../tools/registry.js';
 import { notInitialized, resolveRecordId } from '../tools/_guards.js';
 import { guidLiteral } from '../utils/odata.js';
 import { getRecordsWithLookupNames, displayKeyFor } from '../utils/display.js';
-import { calendarRange, resolveTimeZone, zonedParts, zonedMidnightUtc } from '../utils/datetime.js';
+import { calendarRange, zonedParts, zonedMidnightUtc } from '../utils/datetime.js';
 import { isMeMacro } from '../utils/me-macro.js';
+import { createResolutionContext } from '../lookup/resolution-context.js';
 
 const DAY_MS = 86_400_000;
 const FETCH_CAP = 500;
@@ -106,6 +107,7 @@ export function registerMyAgendaTool(server: McpServer, services: ServiceContain
       outputSchema: {
         owner: z.object({ id: z.string(), name: z.string() }),
         time_zone: z.string(),
+        time_zone_source: z.enum(['profile', 'environment']),
         now: z.string(),
         counts: z.object({ overdue: z.number().int(), today: z.number().int(), upcoming: z.number().int() }),
         overdue: z.array(itemShape),
@@ -135,8 +137,9 @@ export function registerMyAgendaTool(server: McpServer, services: ServiceContain
         const limit = params.limit ?? 20;
         const days = params.days ?? 7;
 
-        const user = await services.currentUser.get();
-        const timeZone = resolveTimeZone(user.timeZoneId || undefined);
+        const resolutionContext = createResolutionContext(services.currentUser);
+        const user = await resolutionContext.getCurrentUser();
+        const { timeZone, source: timeZoneSource } = await resolutionContext.getTimeZone();
 
         let ownerId: string;
         let ownerName: string;
@@ -152,7 +155,7 @@ export function registerMyAgendaTool(server: McpServer, services: ServiceContain
           ownerName = resolved.matched ?? params.owner;
         }
 
-        const now = new Date();
+        const now = resolutionContext.now;
         const todayEnd = calendarRange('today', timeZone, now).to;
         const local = zonedParts(now, timeZone);
         const horizon = zonedMidnightUtc(local.year, local.month, local.day + days + 1, timeZone);
@@ -252,6 +255,7 @@ export function registerMyAgendaTool(server: McpServer, services: ServiceContain
           structuredContent: {
             owner: { id: ownerId, name: ownerName },
             time_zone: timeZone,
+            time_zone_source: timeZoneSource,
             now: now.toISOString(),
             counts: {
               overdue: split.overdue.length,

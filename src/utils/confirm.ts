@@ -23,6 +23,23 @@ interface ConfirmationPlan {
   scope: string;
   fingerprint: string;
   expiresAt: number;
+  freshness?: {
+    intents: string[];
+    snapshots: Array<{ index: number; id: string; values: Record<string, unknown> }>;
+  };
+}
+
+export interface ConfirmationFreshness {
+  intent: unknown;
+  acceptedIntents?: unknown[];
+  snapshots: Array<{ index: number; id: string; values: Record<string, unknown> }>;
+}
+export interface ConfirmationConflict {
+  changed: Array<{
+    index: number;
+    id: string;
+    fields: Array<{ field: string; before: unknown; current: unknown }>;
+  }>;
 }
 
 const plans = new WeakMap<ServiceContainer, Map<string, ConfirmationPlan>>();
@@ -41,7 +58,7 @@ export function operationFingerprint(value: unknown): string {
     return item;
   };
   return createHash('sha256')
-    .update(JSON.stringify(canonical(value)))
+    .update(JSON.stringify(canonical(value)) ?? '"__undefined__"')
     .digest('hex');
 }
 
@@ -52,7 +69,11 @@ export function operationScope(services: ServiceContainer): string {
   });
 }
 
-export function createConfirmationPlan(services: ServiceContainer, operation: unknown): string {
+export function createConfirmationPlan(
+  services: ServiceContainer,
+  operation: unknown,
+  freshness?: ConfirmationFreshness
+): string {
   let store = plans.get(services);
   if (!store) {
     store = new Map();
@@ -67,6 +88,14 @@ export function createConfirmationPlan(services: ServiceContainer, operation: un
     scope: operationScope(services),
     fingerprint: operationFingerprint(operation),
     expiresAt: now + 10 * 60_000,
+    ...(freshness
+      ? {
+          freshness: {
+            intents: [freshness.intent, ...(freshness.acceptedIntents ?? [])].map(operationFingerprint),
+            snapshots: structuredClone(freshness.snapshots),
+          },
+        }
+      : {}),
   });
   return token;
 }
@@ -74,8 +103,9 @@ export function createConfirmationPlan(services: ServiceContainer, operation: un
 export function consumeConfirmationPlan(
   services: ServiceContainer,
   token: string | undefined,
-  operation: unknown
-): void {
+  operation: unknown,
+  freshness?: ConfirmationFreshness
+): ConfirmationConflict | undefined {
   const store = plans.get(services);
   const plan = token ? store?.get(token) : undefined;
   if (!plan || plan.expiresAt <= Date.now()) {
@@ -84,13 +114,52 @@ export function consumeConfirmationPlan(
       400
     );
   }
-  if (plan.scope !== operationScope(services) || plan.fingerprint !== operationFingerprint(operation)) {
+  if (plan.scope !== operationScope(services)) {
     throw new BpmApiError(
-      'Операция или записи изменились после предварительного просмотра. Получите и подтвердите новый план.',
+      'Подключение или пользователь изменились после предварительного просмотра. Получите новый план.',
       409
     );
   }
+  if (plan.fingerprint !== operationFingerprint(operation)) {
+    if (
+      !plan.freshness ||
+      !freshness ||
+      !plan.freshness.intents.includes(operationFingerprint(freshness.intent))
+    )
+      throw new BpmApiError(
+        'Операция или записи изменились после предварительного просмотра. Получите и подтвердите новый план.',
+        409
+      );
+    const old = new Map(plan.freshness.snapshots.map((snapshot) => [snapshot.index, snapshot]));
+    if (
+      freshness.snapshots.length !== plan.freshness.snapshots.length ||
+      freshness.snapshots.some((snapshot) => old.get(snapshot.index)?.id !== snapshot.id)
+    )
+      throw new BpmApiError(
+        'Целевые записи изменились после предварительного просмотра. Получите новый план.',
+        409
+      );
+    const changed = freshness.snapshots.flatMap((snapshot) => {
+      const prior = old.get(snapshot.index)!;
+      const fields = [...new Set([...Object.keys(prior.values), ...Object.keys(snapshot.values)])]
+        .filter(
+          (field) =>
+            Object.hasOwn(prior.values, field) !== Object.hasOwn(snapshot.values, field) ||
+            operationFingerprint(prior.values[field]) !== operationFingerprint(snapshot.values[field])
+        )
+        .map((field) => ({ field, before: prior.values[field], current: snapshot.values[field] }));
+      return fields.length ? [{ index: snapshot.index, id: snapshot.id, fields }] : [];
+    });
+    if (!changed.length)
+      throw new BpmApiError(
+        'Операция изменилась после предварительного просмотра. Получите новый план.',
+        409
+      );
+    store!.delete(token!);
+    return { changed };
+  }
   store!.delete(token!);
+  return undefined;
 }
 
 export function confirmationRequired(params: { confirm?: boolean }): boolean {

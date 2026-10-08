@@ -41,7 +41,14 @@ interface Calls {
   updated: Array<{ id: string; data: Record<string, unknown> }>;
 }
 
-function setup(opts: { ambiguous?: boolean; failUpdateIds?: string[]; failDeleteIds?: string[] } = {}): {
+function setup(
+  opts: {
+    ambiguous?: boolean;
+    failUpdateIds?: string[];
+    failDeleteIds?: string[];
+    failPresentation?: boolean;
+  } = {}
+): {
   handler: (name: string) => Handler;
   calls: Calls;
 } {
@@ -74,7 +81,11 @@ function setup(opts: { ambiguous?: boolean; failUpdateIds?: string[]; failDelete
     async resolveCollectionReference(input: string) {
       return { name: input };
     },
+    async resolveFieldReference(_collection: string, input: string) {
+      return { name: input };
+    },
     async getEntityMetadata() {
+      if (opts.failPresentation) throw new Error('metadata unavailable');
       return { properties: [{ name: 'Id' }, { name: 'Name' }], lookupFields: [] };
     },
   };
@@ -170,6 +181,21 @@ describe('bpm_create_record / bpm_update_record: компактный текст
     });
     expect(res.content[0].text).not.toContain('Найдена запись по имени');
     expect(res.structuredContent?.matched).toBeUndefined();
+  });
+
+  it('keeps a confirmed PATCH successful when optional diff presentation is unavailable', async () => {
+    const { handler, calls } = setup({ failPresentation: true });
+    const result = await handler('bpm_update_record')({
+      collection: 'Contact',
+      id: ID,
+      data: { Email: 'new@example.com' },
+    });
+    expect(calls.updated).toEqual([{ id: ID, data: { Email: 'new@example.com' } }]);
+    expect(result.isError).toBeFalsy();
+    expect(result.structuredContent?.changes_basis).toBe('observed_response');
+    expect(result.structuredContent?.presentation_warnings).toContain(
+      'Подписи и отображаемые значения полей недоступны; показаны технические имена и исходные значения.'
+    );
   });
 });
 

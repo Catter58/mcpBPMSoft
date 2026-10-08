@@ -9,11 +9,13 @@ import {
 import { operationFingerprint } from '../utils/confirm.js';
 import { literalizeFieldValue } from '../utils/field-values.js';
 import {
-  creationRecordId,
+  creationRecordIdWithScope,
   recordId,
   validateIdempotencyKey,
-  validateRequiredCreateFields,
+  type IdempotencyScope,
 } from '../utils/write-safety.js';
+import { assertPreparedCreate, prepareCreateIntent } from './create-preparation.js';
+import type { ResolutionContext } from '../lookup/resolution-context.js';
 
 export interface FindOrCreateResult {
   id: string;
@@ -34,7 +36,9 @@ export async function prepareFindOrCreate(
   collection: string,
   matchOn: { field: string; value: string },
   createWith: Record<string, unknown>,
-  idempotencyKey?: string
+  idempotencyKey?: string,
+  context?: ResolutionContext,
+  idempotencyScope: IdempotencyScope = 'session'
 ): Promise<FindOrCreatePlan> {
   validateIdempotencyKey(idempotencyKey);
   if (!matchOn.value.trim()) throw new BpmApiError('Значение поиска не может быть пустым.', 400, collection);
@@ -91,15 +95,26 @@ export async function prepareFindOrCreate(
         displayColumn: property.name,
       });
   }
-  const resolved = await services.lookupResolver.resolveDataLookups(resolvedCollection, createWith);
-  await validateRequiredCreateFields(services, resolvedCollection, resolved.data);
+  // Keep create preparation on the create branch; composite operations can
+  // supply their shared snapshot while standalone calls create one lazily.
+  const resolutionContext = context ?? services.lookupResolver.createResolutionContext();
+  const prepared = await prepareCreateIntent(services, resolvedCollection, createWith, resolutionContext);
+  assertPreparedCreate(prepared, resolvedCollection);
+  const data = prepared.data;
   const creationKey =
     idempotencyKey ??
-    (resolved.data.Id === undefined
+    (data.Id === undefined
       ? `find:${operationFingerprint({ collection: resolvedCollection, field: property.name, literal })}`
       : undefined);
-  const id = creationRecordId(services, resolved.data, creationKey, `${resolvedCollection}:find-or-create`);
-  return { collection: resolvedCollection, id, created: true, data: resolved.data };
+  const id = await creationRecordIdWithScope(
+    services,
+    data,
+    creationKey,
+    `${resolvedCollection}:find-or-create`,
+    idempotencyScope,
+    resolutionContext
+  );
+  return { collection: resolvedCollection, id, created: true, data };
 }
 
 export async function executeFindOrCreate(

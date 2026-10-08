@@ -126,10 +126,20 @@ export interface EntityMetadata {
   /** Collection endpoint name (e.g. "Contact" for OData 4, "ContactCollection" for OData 3) */
   collectionName: string;
   properties: EntityProperty[];
+  /** Navigation names advertised by EDMX, including collection cardinality and resolved target set. */
+  navigationProperties?: EntityNavigationProperty[];
   /** Lookup field names for quick access */
   lookupFields: string[];
   /** When metadata was cached */
   cachedAt: number;
+}
+
+export interface EntityNavigationProperty {
+  name: string;
+  targetCollection: string;
+  isCollection: boolean;
+  /** EDMX Partner on a collection navigation, identifying its exact single-valued inverse. */
+  partner?: string;
 }
 
 export interface LookupCandidate {

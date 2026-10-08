@@ -11,6 +11,19 @@ function setup() {
     '@odata.count': 1,
   }));
   const getCount = vi.fn(async () => 1);
+  const getEntityMetadata = vi.fn(async (collection: string) => ({
+    collectionName: collection,
+    properties: [
+      { name: 'Id', type: 'Edm.Guid', nullable: false, isLookup: false },
+      {
+        name: collection === 'Activity' ? 'Title' : 'Name',
+        caption: 'Название',
+        type: 'Edm.String',
+        nullable: false,
+        isLookup: false,
+      },
+    ],
+  }));
   const services = {
     initialized: true,
     config: { bpmsoft_url: 'https://crm.example.test', username: 'test-user', odata_version: 4 },
@@ -18,19 +31,15 @@ function setup() {
     odataClient: { getRecords, getCount },
     metadataManager: {
       resolveCollectionReference: vi.fn(async (name: string) => ({ name })),
-      getEntityMetadata: vi.fn(async (collection: string) => ({
-        collectionName: collection,
-        properties: [
-          { name: 'Id', type: 'Edm.Guid', nullable: false, isLookup: false },
-          {
-            name: collection === 'Activity' ? 'Title' : 'Name',
-            caption: 'Название',
-            type: 'Edm.String',
-            nullable: false,
-            isLookup: false,
-          },
-        ],
-      })),
+      getEntityMetadata,
+      resolveFieldReference: vi.fn(async (collection: string, input: string) => {
+        const properties = (await getEntityMetadata(collection)).properties;
+        const property = properties.find(
+          (candidate) => candidate.name === input || candidate.caption === input
+        );
+        return property ? { name: property.name } : { name: null };
+      }),
+      getLookupInfo: vi.fn(async () => null),
     },
   } as unknown as ServiceContainer;
   let handler: (args: Record<string, unknown>) => Promise<CallToolResult>;
@@ -42,14 +51,20 @@ function setup() {
     } as never,
     services
   );
-  return { getRecords, getCount, services, call: (args: Record<string, unknown>) => handler(args) };
+  return {
+    getRecords,
+    getCount,
+    getEntityMetadata,
+    services,
+    call: (args: Record<string, unknown>) => handler(args),
+  };
 }
 
 describe('registered unified search', () => {
   it('compiles normalized search and returns a captioned card', async () => {
     const env = setup();
     const result = await env.call({ query: 'Ланит', collections: ['Account'] });
-    expect(env.getRecords.mock.calls[0][1].$filter).toBe("contains(tolower(Name), 'ланит')");
+    expect(env.getRecords.mock.calls[0][1].$filter).toBe("(contains(tolower(Name), 'ланит'))");
     expect(result.structuredContent).toMatchObject({
       total_found: 1,
       count: 1,
@@ -62,8 +77,8 @@ describe('registered unified search', () => {
     env.getRecords.mockResolvedValueOnce({ value: [], '@odata.count': 0 });
     const result = await env.call({ query: 'АО ЛАНИТ', collections: ['Account'] });
     expect(env.getRecords.mock.calls.map((call) => call[1].$filter)).toEqual([
-      "contains(tolower(Name), 'ао ланит')",
-      "contains(tolower(Name), 'ланит')",
+      "(contains(tolower(Name), 'ао ланит'))",
+      "(contains(tolower(Name), 'ланит'))",
     ]);
     expect(result.structuredContent?.results).toEqual([expect.objectContaining({ match_type: 'core' })]);
   });
@@ -122,7 +137,83 @@ describe('registered unified search', () => {
       has_more: false,
       complete: true,
     });
-    expect(env.getRecords.mock.calls[2][1].$filter).toBe("contains(tolower(Title), 'title')");
+    expect(env.getRecords.mock.calls[2][1].$filter).toBe("(contains(tolower(Title), 'title'))");
+  });
+
+  it('searches explicit string fields with OR, reports matched fields, and deduplicates repeated IDs', async () => {
+    const env = setup();
+    env.getEntityMetadata.mockImplementation(
+      async () =>
+        ({
+          collectionName: 'Account',
+          properties: [
+            { name: 'Id', type: 'Edm.Guid', nullable: false, isLookup: false },
+            { name: 'Name', caption: 'Название', type: 'Edm.String', nullable: false, isLookup: false },
+            { name: 'TaxCode', caption: 'ИНН', type: 'Edm.String', nullable: true, isLookup: false },
+          ],
+        }) as never
+    );
+    env.getRecords.mockResolvedValue({
+      value: [
+        { Id: 'id-1', Name: 'ООО Ланит', TaxCode: '770123' },
+        { Id: 'id-1', Name: 'ООО Ланит', TaxCode: '770123' },
+      ],
+      '@odata.count': 2,
+    });
+    const result = await env.call({
+      query: '770',
+      fields_by_collection: { Account: ['ИНН', 'Name'] },
+    });
+    expect(env.getRecords.mock.calls[0][1].$filter).toContain(' or ');
+    expect(result.structuredContent).toMatchObject({
+      count: 1,
+      results: [{ id: 'id-1', matched_fields: ['TaxCode'] }],
+      count_semantics: expect.stringContaining('уникальные пары'),
+    });
+  });
+
+  it('supports exact field matching and does not broaden explicit searches to core fallback', async () => {
+    const env = setup();
+    env.getRecords.mockResolvedValueOnce({ value: [], '@odata.count': 0 });
+    const result = await env.call({
+      query: 'АО ЛАНИТ',
+      fields_by_collection: { Account: ['Name'] },
+      match_mode: 'exact',
+    });
+    expect(env.getRecords).toHaveBeenCalledTimes(1);
+    expect(env.getRecords.mock.calls[0][1].$filter).toContain(" eq 'ао ланит'");
+    expect(result.structuredContent).toMatchObject({ total_found: 0, complete: true, results: [] });
+  });
+
+  it('rejects unknown/non-string fields and incomplete or unused field mappings', async () => {
+    const env = setup();
+    const missing = await env.call({
+      query: 'x',
+      collections: ['Account', 'Contact'],
+      fields_by_collection: { Account: ['Name'] },
+    });
+    expect(missing.isError).toBe(true);
+    const extra = await env.call({
+      query: 'x',
+      collections: ['Account'],
+      fields_by_collection: { Contact: ['Name'] },
+    });
+    expect(extra.isError).toBe(true);
+    env.getEntityMetadata.mockImplementation(
+      async () =>
+        ({
+          collectionName: 'Account',
+          properties: [
+            { name: 'Id', type: 'Edm.Guid', nullable: false, isLookup: false },
+            { name: 'Name', type: 'Edm.String', nullable: false, isLookup: false },
+            { name: 'Code', type: 'Edm.Int32', nullable: false, isLookup: false },
+          ],
+        }) as never
+    );
+    const invalid = await env.call({ query: 'x', fields_by_collection: { Account: ['Missing'] } });
+    expect(invalid.isError).toBe(true);
+    const nonString = await env.call({ query: 'x', fields_by_collection: { Account: ['Code'] } });
+    expect(nonString.isError).toBe(true);
   });
 
   it('ошибка коллекции → isError true', async () => {

@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll } from 'vitest';
+import { describe, it, expect, beforeAll, vi } from 'vitest';
 import { MetadataManager, singularCaptionCandidates } from '../../src/metadata/metadata-manager.js';
 import { damerauLevenshtein, uniqueClosest } from '../../src/utils/suggest.js';
 import { compileCriteria } from '../../src/tools/_guards.js';
@@ -162,5 +162,42 @@ describe('read-tools: запись целиком и заметки об исп�
     const result = await handlers.get('bpm_get_records')!({ collection: 'Contact', select: 'Nmae' });
     expect(result.structuredContent?.warnings).toEqual(['Поле «Nmae» → Name (исправлена опечатка)']);
     expect(result.content[0].text).toContain(`Id=${ID}; Name=Иван`);
+  });
+
+  it('bpm_get_record verify делает ровно одно чтение и возвращает только наблюдение без повторной записи', async () => {
+    const getRecord = vi.fn(async () => ({ Id: ID, Name: 'Иван' }));
+    const handlers = readTools({ getRecord });
+    const result = await handlers.get('bpm_get_record')!({
+      collection: 'Contact',
+      id: ID,
+      verify: { operation: 'update', expected: { Name: 'Иван' } },
+    });
+
+    expect(getRecord).toHaveBeenCalledTimes(1);
+    expect(getRecord).toHaveBeenCalledWith('Contact', ID, { $select: 'Id,Name' });
+    expect(result.structuredContent).toMatchObject({
+      verification: { operation: 'update', observation: 'matches', safe_to_retry: false },
+    });
+    expect(result.structuredContent?.record).toBeUndefined();
+    expect(result.content[0].text).toContain('не доказывает');
+  });
+
+  it('verify rejects UUID-near names and extra projection arguments before a record read', async () => {
+    const getRecord = vi.fn(async () => ({ Id: ID, Name: 'Иван' }));
+    const handlers = readTools({ getRecord });
+    const invalidId = await handlers.get('bpm_get_record')!({
+      collection: 'Contact',
+      id: 'Иван',
+      verify: { operation: 'delete' },
+    });
+    const projection = await handlers.get('bpm_get_record')!({
+      collection: 'Contact',
+      id: ID,
+      select: 'Id,Name',
+      verify: { operation: 'delete' },
+    });
+    expect(invalidId.isError).toBe(true);
+    expect(projection.isError).toBe(true);
+    expect(getRecord).not.toHaveBeenCalled();
   });
 });

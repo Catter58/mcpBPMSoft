@@ -12,14 +12,428 @@ import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import type { ServiceContainer } from './init-tool.js';
 import type { LookupEdge, LookupGraph } from '../metadata/metadata-manager.js';
 import { formatToolError } from '../utils/errors.js';
+import { getAuthCacheScope } from '../auth/request-context.js';
+import { getRelationshipReadSupport, setRelationshipReadSupport } from '../utils/server-capabilities.js';
 import { getTool } from './registry.js';
-import { notInitialized, resolveCollectionName } from './_guards.js';
+import { compileCriteria, notInitialized, resolveCollectionName } from './_guards.js';
 
 const DEFAULT_LIMIT = 50;
 const MAX_DEPTH = 3;
 const MAX_PATHS = 5;
 /** Сколько путей одной длины собирать перед сортировкой — страховка от хабов вроде Contact. */
 const PATH_CANDIDATES_CAP = 200;
+const MAX_READ_PROBES = 8;
+const MAX_READ_ROUTES = 8;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const EMPTY_GUID = '00000000-0000-0000-0000-000000000000';
+
+type ReadProbeCapability = 'supported' | 'unsupported' | 'inconclusive' | 'not_probed';
+type ReadProbeObservation = 'related_record_found' | 'no_related_record' | 'root_absent' | 'inconclusive';
+type ReadProbeAttempt = {
+  strategy: 'lookup_id' | 'filter' | 'expand' | 'exists';
+  capability: ReadProbeCapability;
+  cached?: boolean;
+  http_status?: number;
+  observation?: ReadProbeObservation;
+  matched_count?: number;
+  has_more?: boolean;
+};
+
+function queryStatus(error: unknown): number | undefined {
+  const status =
+    (error as { httpStatus?: unknown; status?: unknown } | null)?.httpStatus ??
+    (error as { status?: unknown } | null)?.status;
+  return typeof status === 'number' ? status : undefined;
+}
+
+function isExplicitQueryRejection(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error ?? '');
+  return /unknown (?:property|field|navigation)|invalid (?:property|field|navigation)|could not find (?:a )?(?:property|field|navigation)|not a valid (?:property|field|navigation)/i.test(
+    message
+  );
+}
+
+function readCapabilityKey(
+  services: ServiceContainer,
+  collection: string,
+  edge: LookupEdge,
+  strategy: string
+): string {
+  let instance = services.config.bpmsoft_url;
+  try {
+    instance = new URL(instance).origin;
+    const configured = new URL(services.config.bpmsoft_url);
+    instance = `${configured.origin}${configured.pathname.replace(/\/+$/, '')}`;
+  } catch {
+    /* Configuration validation reports invalid URLs elsewhere. */
+  }
+  const identity = getAuthCacheScope() || services.config.username || 'anonymous';
+  return `${instance}:${identity}:v${services.config.odata_version}:${services.config.platform}:${collection}:${edge.from}:${edge.field}:${edge.nav}:${edge.to}:${strategy}`;
+}
+
+async function probeReadPath(
+  services: ServiceContainer,
+  collection: string,
+  recordId: string,
+  edge: LookupEdge,
+  strategy: ReadProbeAttempt['strategy'],
+  action: () => Promise<{
+    observation: ReadProbeObservation;
+    matched_count?: number;
+    has_more?: boolean;
+    next_read_args?: Record<string, unknown>;
+  }>
+): Promise<{ attempt: ReadProbeAttempt; next_read_args?: Record<string, unknown> }> {
+  const key = readCapabilityKey(services, collection, edge, strategy);
+  const known = getRelationshipReadSupport(key);
+  if (known === false) return { attempt: { strategy, capability: 'unsupported', cached: true } };
+  try {
+    const observed = await action();
+    const meaningful = observed.observation !== 'inconclusive';
+    if (meaningful) setRelationshipReadSupport(key, true);
+    return {
+      attempt: {
+        strategy,
+        capability: meaningful ? 'supported' : 'inconclusive',
+        ...(meaningful && known === true ? { cached: true } : {}),
+        observation: observed.observation,
+        ...(observed.matched_count === undefined ? {} : { matched_count: observed.matched_count }),
+        ...(observed.has_more === undefined ? {} : { has_more: observed.has_more }),
+      },
+      ...(meaningful && observed.next_read_args ? { next_read_args: observed.next_read_args } : {}),
+    };
+  } catch (error) {
+    const status = queryStatus(error);
+    // Only a concrete 400 from this exact metadata-derived request marks this route unsupported.
+    if (status === 400 && isExplicitQueryRejection(error)) {
+      setRelationshipReadSupport(key, false);
+      return { attempt: { strategy, capability: 'unsupported', http_status: status } };
+    }
+    return {
+      attempt: {
+        strategy,
+        capability: 'inconclusive',
+        ...(status === undefined ? {} : { http_status: status }),
+        observation: 'inconclusive',
+      },
+    };
+  }
+}
+
+async function probeReadPaths(
+  services: ServiceContainer,
+  graph: LookupGraph,
+  collection: string,
+  recordId: string,
+  direction: 'out' | 'in' | 'both',
+  target?: string,
+  requestedLimit = MAX_READ_ROUTES
+): Promise<Record<string, unknown>> {
+  const allRoutes = [
+    ...(direction !== 'in'
+      ? (graph.outgoing.get(collection) ?? []).map((edge) => ({ edge, direction: 'out' as const }))
+      : []),
+    ...(direction !== 'out'
+      ? (graph.incoming.get(collection) ?? []).map((edge) => ({ edge, direction: 'in' as const }))
+      : []),
+  ];
+  const matchingRoutes = allRoutes.filter(
+    ({ edge, direction: routeDirection }) =>
+      !target || (routeDirection === 'out' ? edge.to === target : edge.from === target)
+  );
+  const routes = matchingRoutes.slice(0, Math.min(MAX_READ_ROUTES, Math.max(0, requestedLimit)));
+  const result: Record<string, unknown> = {
+    record_id: recordId,
+    root_record: 'inconclusive',
+    probe_limit: MAX_READ_PROBES,
+    declared_direct_routes: matchingRoutes.length,
+    probed_routes: 0,
+    omitted_routes: Math.max(0, matchingRoutes.length - routes.length),
+    routes: [],
+    multi_hop: 'metadata_only_unverified',
+  };
+  let probesMade = 1;
+  result.probes_made = probesMade;
+  try {
+    const root = await services.odataClient.getRecord<Record<string, unknown>>(collection, recordId, {
+      $select: 'Id',
+    });
+    result.root_record =
+      root?.Id && String(root.Id).toLowerCase() === recordId.toLowerCase() ? 'found' : 'inconclusive';
+  } catch (error) {
+    result.probes_made = probesMade;
+    if (queryStatus(error) === 404) result.root_record = 'absent';
+    else if (queryStatus(error) !== undefined) result.root_http_status = queryStatus(error);
+    if (result.root_record !== 'found') return result;
+  }
+  if (result.root_record !== 'found') return result;
+
+  const inspected: Array<Record<string, unknown>> = [];
+  for (const { edge, direction } of routes.slice(0, MAX_READ_ROUTES)) {
+    const attempts: ReadProbeAttempt[] = [];
+    let nextRead: Record<string, unknown> | undefined;
+    let reportedCollectionNavigation: string | undefined;
+    let probesForRoute = 0;
+    const run = async (
+      strategy: ReadProbeAttempt['strategy'],
+      action: () => Promise<{
+        observation: ReadProbeObservation;
+        matched_count?: number;
+        has_more?: boolean;
+        next_read_args?: Record<string, unknown>;
+      }>,
+      capabilityEdge: LookupEdge = edge
+    ) => {
+      if (probesMade >= MAX_READ_PROBES) return;
+      const known = getRelationshipReadSupport(
+        readCapabilityKey(services, collection, capabilityEdge, strategy)
+      );
+      if (known === false) {
+        attempts.push({ strategy, capability: 'unsupported', cached: true });
+        return;
+      }
+      probesMade++;
+      probesForRoute++;
+      const outcome = await probeReadPath(services, collection, recordId, capabilityEdge, strategy, action);
+      attempts.push(outcome.attempt);
+      if (outcome.next_read_args) nextRead = outcome.next_read_args;
+    };
+
+    if (direction === 'out') {
+      await run('lookup_id', async () => {
+        const row = await services.odataClient.getRecord<Record<string, unknown>>(collection, recordId, {
+          $select: `Id,${edge.field}`,
+        });
+        const targetId = row?.[edge.field];
+        if (targetId === null || targetId === '' || targetId === EMPTY_GUID)
+          return { observation: 'no_related_record' };
+        if (typeof targetId !== 'string' || !UUID_RE.test(targetId)) return { observation: 'inconclusive' };
+        return {
+          observation: 'related_record_found',
+          matched_count: 1,
+          next_read_args: {
+            tool: 'bpm_get_record',
+            arguments: {
+              collection,
+              id: recordId,
+              select: `Id,${edge.field}`,
+              resolve_lookups: false,
+            },
+          },
+        };
+      });
+      if (
+        services.config.odata_version === 4 &&
+        !attempts.some((attempt) => attempt.capability === 'supported') &&
+        probesMade < MAX_READ_PROBES
+      ) {
+        await run('expand', async () => {
+          const row = await services.odataClient.getRecord<Record<string, unknown>>(collection, recordId, {
+            $select: 'Id',
+            $expand: `${edge.nav}($select=Id;$top=1)`,
+          });
+          const related = row?.[edge.nav];
+          if (related === undefined) return { observation: 'inconclusive' };
+          if (related === null) return { observation: 'no_related_record' };
+          if (typeof related !== 'object' || Array.isArray(related)) return { observation: 'inconclusive' };
+          const relatedId = (related as Record<string, unknown>).Id;
+          if (typeof relatedId !== 'string' || !UUID_RE.test(relatedId) || relatedId === EMPTY_GUID)
+            return { observation: 'inconclusive' };
+          return {
+            observation: 'related_record_found',
+            matched_count: 1,
+            next_read_args: {
+              tool: 'bpm_get_record',
+              arguments: {
+                collection,
+                id: recordId,
+                select: 'Id',
+                expand: `${edge.nav}($select=Id;$top=1)`,
+                resolve_lookups: false,
+              },
+            },
+          };
+        });
+      }
+    } else {
+      let collectionNavigation: string | undefined;
+      try {
+        const metadata = await services.metadataManager.getEntityMetadata(collection);
+        collectionNavigation = metadata.navigationProperties?.find(
+          (property) =>
+            property.isCollection && property.targetCollection === edge.from && property.partner === edge.nav
+        )?.name;
+        reportedCollectionNavigation = collectionNavigation;
+      } catch {
+        // The child FK filter still provides a direct probe without inverse-navigation metadata.
+      }
+      await run('filter', async () => {
+        const criteria = [{ field: edge.field, op: 'eq', value: recordId }];
+        const compiled = await compileCriteria(services, edge.from, criteria, 'and', { autoCorrect: true });
+        const response = await services.odataClient.getRecords<Record<string, unknown>>(
+          edge.from,
+          {
+            $filter: compiled.filter,
+            $select: `Id,${edge.field}`,
+            $top: 1,
+            $orderby: 'Id',
+          },
+          false,
+          1
+        );
+        const hasMore = Boolean(response['@odata.nextLink']);
+        const child = response.value[0];
+        const observation: ReadProbeObservation =
+          response.value.length === 0
+            ? 'no_related_record'
+            : child &&
+                typeof child.Id === 'string' &&
+                UUID_RE.test(child.Id) &&
+                String(child[edge.field]).toLowerCase() === recordId.toLowerCase()
+              ? 'related_record_found'
+              : 'inconclusive';
+        return {
+          observation,
+          ...(observation === 'inconclusive' ? {} : { matched_count: response.value.length }),
+          has_more: hasMore,
+          next_read_args: {
+            tool: 'bpm_search_records',
+            arguments: {
+              collection: edge.from,
+              criteria,
+              join: 'and',
+              select: `Id,${edge.field}`,
+              top: 1,
+              orderby: 'Id asc',
+              auto_paginate: false,
+              resolve_lookups: false,
+            },
+          },
+        };
+      });
+      if (
+        services.config.odata_version === 4 &&
+        collectionNavigation &&
+        !attempts.some((attempt) => attempt.capability === 'supported') &&
+        probesMade < MAX_READ_PROBES
+      ) {
+        const collectionEdge: LookupEdge = { ...edge, nav: collectionNavigation };
+        await run(
+          'expand',
+          async () => {
+            const row = await services.odataClient.getRecord<Record<string, unknown>>(collection, recordId, {
+              $select: 'Id',
+              $expand: `${collectionNavigation}($select=Id;$top=1)`,
+            });
+            const related = row?.[collectionNavigation];
+            if (related === undefined) return { observation: 'inconclusive' };
+            if (!Array.isArray(related)) return { observation: 'inconclusive' };
+            const first = related[0] as Record<string, unknown> | undefined;
+            if (
+              related.length > 0 &&
+              (!first || typeof first.Id !== 'string' || !UUID_RE.test(first.Id) || first.Id === EMPTY_GUID)
+            )
+              return { observation: 'inconclusive' };
+            return {
+              observation: related.length ? 'related_record_found' : 'no_related_record',
+              matched_count: related.length,
+              has_more: related.length === 1,
+              next_read_args: {
+                tool: 'bpm_get_record',
+                arguments: {
+                  collection,
+                  id: recordId,
+                  select: 'Id',
+                  expand: `${collectionNavigation}($select=Id;$top=1)`,
+                  resolve_lookups: false,
+                },
+              },
+            };
+          },
+          collectionEdge
+        );
+      }
+      if (
+        collectionNavigation &&
+        !attempts.some((attempt) => attempt.capability === 'supported') &&
+        probesMade < MAX_READ_PROBES
+      ) {
+        const collectionEdge: LookupEdge = { ...edge, nav: collectionNavigation };
+        await run(
+          'exists',
+          async () => {
+            const criteria = [
+              { field: 'Id', op: 'eq', value: recordId },
+              { field: collectionNavigation, op: 'exists' },
+            ];
+            const compiled = await compileCriteria(services, collection, criteria, 'and', {
+              autoCorrect: true,
+            });
+            const response = await services.odataClient.getRecords<Record<string, unknown>>(
+              collection,
+              {
+                $filter: compiled.filter,
+                $select: 'Id',
+                $top: 1,
+                $orderby: 'Id',
+              },
+              false,
+              1
+            );
+            const first = response.value[0];
+            const observation: ReadProbeObservation =
+              response.value.length === 0
+                ? 'no_related_record'
+                : first && typeof first.Id === 'string' && first.Id.toLowerCase() === recordId.toLowerCase()
+                  ? 'related_record_found'
+                  : 'inconclusive';
+            return {
+              observation,
+              ...(observation === 'inconclusive' ? {} : { matched_count: response.value.length }),
+              next_read_args: {
+                tool: 'bpm_search_records',
+                arguments: {
+                  collection,
+                  criteria,
+                  join: 'and',
+                  select: 'Id',
+                  top: 1,
+                  orderby: 'Id asc',
+                  auto_paginate: false,
+                  resolve_lookups: false,
+                },
+              },
+            };
+          },
+          collectionEdge
+        );
+      }
+    }
+    const supported = attempts.some((attempt) => attempt.capability === 'supported');
+    const allUnsupported =
+      attempts.length > 0 && attempts.every((attempt) => attempt.capability === 'unsupported');
+    inspected.push({
+      declared: true,
+      direction,
+      collection: direction === 'out' ? edge.to : edge.from,
+      field: edge.field,
+      navigation: edge.nav,
+      ...(reportedCollectionNavigation ? { collection_navigation: reportedCollectionNavigation } : {}),
+      capability: supported ? 'supported' : allUnsupported ? 'unsupported' : 'inconclusive',
+      observation:
+        attempts.find((attempt) => attempt.capability === 'supported' && attempt.observation)?.observation ??
+        attempts.find((attempt) => attempt.observation)?.observation ??
+        'inconclusive',
+      attempts,
+      ...(nextRead ? { next_read: nextRead } : {}),
+      ...(probesForRoute === 0 ? { note: 'probe_limit_reached_before_this_route' } : {}),
+    });
+  }
+  result.probes_made = probesMade;
+  result.probed_routes = inspected.filter((route) => !('note' in route)).length;
+  result.routes = inspected;
+  return result;
+}
 
 /** Бизнес-объекты, которые чаще всего нужны в запросах, — в порядке важности. */
 const BUSINESS_ORDER = [
@@ -268,6 +682,12 @@ export function registerRelationsTool(server: McpServer, services: ServiceContai
           .positive()
           .optional()
           .describe(`Сколько входящих связей вернуть (по умолчанию ${DEFAULT_LIMIT})`),
+        probe_record_id: z
+          .string()
+          .optional()
+          .describe(
+            'Точный UUID записи collection для безопасной проверки поддерживаемых read paths; проверяются только ограниченные прямые связи.'
+          ),
       },
       outputSchema: {
         collection: z.string(),
@@ -300,6 +720,7 @@ export function registerRelationsTool(server: McpServer, services: ServiceContai
           )
           .optional(),
         note: z.string().optional(),
+        read_probe: z.record(z.string(), z.unknown()).optional(),
       },
       annotations: meta.annotations,
     },
@@ -383,6 +804,24 @@ export function registerRelationsTool(server: McpServer, services: ServiceContai
             lines.push(`Пути ${collection} -> ${target}:`);
             paths.forEach((p, n) => lines.push(`  ${n + 1}. ${pathText(p)}: ${p.hint}`));
           }
+        }
+
+        if (params.probe_record_id !== undefined) {
+          if (!UUID_RE.test(params.probe_record_id))
+            throw new Error('probe_record_id должен быть точным UUID.');
+          structured.read_probe = await probeReadPaths(
+            services,
+            graph,
+            collection,
+            params.probe_record_id,
+            direction,
+            target,
+            limit
+          );
+          const multiHopCount = target
+            ? (structured.paths as RelationPath[]).filter((path) => path.length > 1).length
+            : 0;
+          (structured.read_probe as Record<string, unknown>).unverified_multi_hop_paths = multiHopCount;
         }
 
         return { content: [{ type: 'text', text: lines.join('\n') }], structuredContent: structured };

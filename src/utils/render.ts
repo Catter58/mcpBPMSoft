@@ -5,6 +5,7 @@
  *   'compact'  — summary + до 50 записей, по строке на запись: `key=value` без пустых и
  *                служебных полей (compactRecord), Id первым, колонка отображения вторым.
  *                По умолчанию для bpm_get_records и bpm_search_records.
+ *   'summary'  — только коллекция, количество и наличие продолжения, без значений записей.
  *   'full'     — полный JSON.stringify(records, null, 2).
  *   'markdown' — markdown-таблица для ≤ `markdown_threshold` записей; иначе fallback в compact.
  *
@@ -21,7 +22,8 @@ const COMPACT_MAX_VALUE = 200;
 const MARKDOWN_THRESHOLD = 20;
 const MARKDOWN_MAX_COL_WIDTH = 60;
 
-export type RenderFormat = 'compact' | 'full' | 'markdown';
+export const READ_FORMATS = ['compact', 'full', 'markdown', 'summary'] as const;
+export type RenderFormat = (typeof READ_FORMATS)[number];
 
 export interface RenderRecordsOptions {
   format?: RenderFormat;
@@ -40,6 +42,8 @@ export function renderRecordsText(
 ): string {
   const format: RenderFormat = options.format ?? 'compact';
   const summary = buildSummary(records, options);
+
+  if (format === 'summary') return summary;
 
   if (records.length === 0) {
     return `${summary}\n\nДанные: (пусто)`;

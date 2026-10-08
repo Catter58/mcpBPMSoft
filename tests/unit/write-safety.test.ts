@@ -6,6 +6,39 @@ import { registerWriteTools } from '../../src/tools/write-tools.js';
 import { registerBatchTools } from '../../src/tools/batch-tools.js';
 import { BpmApiError } from '../../src/utils/errors.js';
 import { runWithAuth } from '../../src/auth/request-context.js';
+import { buildValueOrigins } from '../../src/utils/write-safety.js';
+
+describe('value provenance', () => {
+  it('labels normalized, exact lookup, current-user, computed, and unobserved platform defaults', () => {
+    expect(
+      buildValueOrigins({
+        values: {
+          Amount: 4,
+          AccountId: 'account-guid',
+          OwnerId: 'current-user-guid',
+          Total: 8,
+          Id: 'new-guid',
+        },
+        callerValues: { Amount: '4,00', AccountId: 'Acme', OwnerId: 'я', Total: 999 },
+        coerced: [{ field: 'Amount', input: '4,00', output: 4, type: 'Edm.Decimal' }],
+        originSources: [
+          { field: 'Amount', source: 'normalized' },
+          { field: 'AccountId', source: 'lookup' },
+          { field: 'OwnerId', source: 'current_user' },
+        ],
+        computedFields: ['Total', 'Id'],
+        platformDefaults: [{ field: 'StatusId', observed: false }],
+      })
+    ).toEqual([
+      { field: 'Amount', source: 'normalized', observed: true, value: 4 },
+      { field: 'AccountId', source: 'lookup', observed: true, value: 'account-guid' },
+      { field: 'OwnerId', source: 'current_user', observed: true, value: 'current-user-guid' },
+      { field: 'Total', source: 'computed', observed: true, value: 8 },
+      { field: 'Id', source: 'computed', observed: true, value: 'new-guid' },
+      { field: 'StatusId', source: 'platform_default', observed: false },
+    ]);
+  });
+});
 
 const A = 'aaaaaaaa-1111-4111-8111-111111111111';
 const B = 'bbbbbbbb-2222-4222-8222-222222222222';
@@ -64,6 +97,9 @@ function setup() {
         properties: [
           { name: 'Name', caption: 'Имя', type: 'Edm.String' },
           { name: 'CreatedOn', type: 'Edm.DateTimeOffset' },
+          { name: 'Quantity', type: 'Edm.Decimal' },
+          { name: 'Price', type: 'Edm.Decimal' },
+          { name: 'OrderId', type: 'Edm.Guid', isLookup: true, lookupCollection: 'Order' },
         ],
       })),
     },
@@ -141,15 +177,16 @@ describe('snapshot confirmation', () => {
         { Id: B, Name: 'B' },
       ],
     });
-    expect(
-      (
-        await env.call('bpm_delete_by_filter', {
-          ...selection,
-          confirm: true,
-          confirmation_token: preview.structuredContent?.confirmation_token,
-        })
-      ).isError
-    ).toBe(true);
+    const refreshed = await env.call('bpm_delete_by_filter', {
+      ...selection,
+      confirm: true,
+      confirmation_token: preview.structuredContent?.confirmation_token,
+    });
+    expect(refreshed.structuredContent).toMatchObject({
+      requires_confirmation: true,
+      conflict: { changed: [{ id: A }] },
+    });
+    expect(refreshed.structuredContent?.confirmation_token).toBeTruthy();
     expect(env.odataClient.deleteRecord).not.toHaveBeenCalled();
   });
   it('rejects update payload changes and allows the original bound payload', async () => {
@@ -234,6 +271,25 @@ describe('snapshot confirmation', () => {
       confirmation_token: preview.structuredContent?.confirmation_token,
     });
     expect(env.odataClient.deleteRecord).toHaveBeenCalledWith('Contact', A, { expectedEtag: 'W/"1"' });
+  });
+  it('refreshes a changed single-record delete preview without deleting', async () => {
+    const env = setup();
+    const args = { collection: 'Contact', id: A };
+    const preview = await env.call('bpm_delete_record', args);
+    env.odataClient.getRecord.mockResolvedValue({ Id: A, Name: 'Changed', '@odata.etag': 'W/"2"' });
+    const refreshed = await env.call('bpm_delete_record', {
+      ...args,
+      confirm: true,
+      confirmation_token: preview.structuredContent?.confirmation_token,
+    });
+    expect(refreshed.structuredContent).toMatchObject({
+      requires_confirmation: true,
+      conflict: {
+        changed: [{ index: 0, id: A, fields: [{ field: 'Name', before: 'A', current: 'Changed' }] }],
+      },
+    });
+    expect(refreshed.structuredContent?.confirmation_token).toBeTruthy();
+    expect(env.odataClient.deleteRecord).not.toHaveBeenCalled();
   });
   it('returns committed, unknown and unexecuted IDs and stops after an uncertain write', async () => {
     const env = setup();
@@ -328,8 +384,8 @@ describe('batch result correlation', () => {
     const result = await confirmedCall(env, 'bpm_batch_update', {
       collection: 'Contact',
       updates: [
-        { id: A, data: { Name: 'A' } },
-        { id: B, data: { Name: 'B' } },
+        { id: A, data: { Name: 'Updated A' } },
+        { id: B, data: { Name: 'Updated B' } },
       ],
     });
     expect(result.isError).toBe(true);
@@ -350,8 +406,8 @@ describe('batch result correlation', () => {
     const result = await confirmedCall(env, 'bpm_batch_update', {
       collection: 'Contact',
       updates: [
-        { id: A, data: { Name: 'A' } },
-        { id: B, data: { Name: 'B' } },
+        { id: A, data: { Name: 'Updated A' } },
+        { id: B, data: { Name: 'Updated B' } },
       ],
     });
     expect(result.structuredContent?.outcomes).toEqual([
@@ -363,10 +419,15 @@ describe('batch result correlation', () => {
     const env = setup();
     await confirmedCall(env, 'bpm_batch_update', {
       collection: 'Contact',
-      updates: [{ id: A, data: { Name: 'A' }, expected_etag: 'W/"2"' }],
+      updates: [{ id: A, data: { Name: 'Updated A' }, expected_etag: 'W/"2"' }],
     });
     expect(env.odataClient.executeBatch.mock.calls[0][0]).toEqual([
-      { method: 'PATCH', url: `/odata/Contact(${A})`, body: { Name: 'A' }, headers: { 'If-Match': 'W/"2"' } },
+      {
+        method: 'PATCH',
+        url: `/odata/Contact(${A})`,
+        body: { Name: 'Updated A' },
+        headers: { 'If-Match': 'W/"2"' },
+      },
     ]);
   });
 });
@@ -501,7 +562,10 @@ describe('semantic bulk selection', () => {
       confirm: true,
       confirmation_token: preview.structuredContent?.confirmation_token,
     });
-    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      requires_confirmation: true,
+      conflict: { changed: [{ id: A }] },
+    });
     expect(env.odataClient.deleteRecord).not.toHaveBeenCalled();
   });
 });
@@ -554,16 +618,70 @@ describe('creation intent and readable previews', () => {
       concurrency_protection: 'etag',
     });
     env.odataClient.getRecord.mockResolvedValue({ Id: A, Name: 'Changed', '@odata.etag': 'W/"2"' });
-    expect(
-      (
-        await env.call('bpm_batch_update', {
-          ...args,
-          confirm: true,
-          confirmation_token: preview.structuredContent?.confirmation_token,
-        })
-      ).isError
-    ).toBe(true);
+    const refreshed = await env.call('bpm_batch_update', {
+      ...args,
+      confirm: true,
+      confirmation_token: preview.structuredContent?.confirmation_token,
+    });
+    expect(refreshed.structuredContent).toMatchObject({
+      requires_confirmation: true,
+      conflict: { changed: [{ id: A }] },
+    });
+    expect(refreshed.structuredContent?.confirmation_token).toBeTruthy();
     expect(env.odataClient.executeBatch).not.toHaveBeenCalled();
+  });
+
+  it('reports a row that became a no-op while preserving the full target snapshot set', async () => {
+    const env = setup();
+    env.odataClient.getRecord
+      .mockResolvedValueOnce({ Id: A, Quantity: '5', '@odata.etag': 'W/"1"' })
+      .mockResolvedValueOnce({ Id: B, Quantity: '7', '@odata.etag': 'W/"1"' })
+      .mockResolvedValueOnce({ Id: C, Quantity: '11', '@odata.etag': 'W/"1"' });
+    const args = {
+      collection: 'Contact',
+      updates: [
+        { id: A, operations: [{ field: 'Quantity', op: 'increment', amount: 1 }] },
+        { id: B, operations: [{ field: 'Quantity', op: 'increment', amount: 1 }] },
+        { id: C, operations: [{ field: 'Quantity', op: 'increment', amount: 1 }] },
+      ],
+    };
+    const preview = await env.call('bpm_batch_update', args);
+    env.odataClient.getRecord
+      .mockResolvedValueOnce({ Id: A, Quantity: '6', '@odata.etag': 'W/"2"' })
+      .mockResolvedValueOnce({ Id: B, Quantity: '7', '@odata.etag': 'W/"1"' })
+      .mockResolvedValueOnce({ Id: C, Quantity: '11', '@odata.etag': 'W/"1"' });
+    const normalized = preview.structuredContent?.normalized_args as Record<string, unknown>;
+    const refreshed = await env.call('bpm_batch_update', {
+      ...normalized,
+      confirm: true,
+      confirmation_token: preview.structuredContent?.confirmation_token,
+    });
+    expect(refreshed.structuredContent).toMatchObject({
+      requires_confirmation: true,
+      conflict: {
+        changed: [{ index: 0, id: A, fields: [{ field: 'Quantity', before: '5', current: '6' }] }],
+      },
+    });
+    expect(refreshed.structuredContent?.confirmation_token).toBeTruthy();
+    expect(env.odataClient.executeBatch).not.toHaveBeenCalled();
+    const replayArgs = refreshed.structuredContent?.normalized_args as Record<string, unknown>;
+    expect(replayArgs.updates).toMatchObject([
+      { id: A, data: { Quantity: '6' } },
+      { id: B, data: { Quantity: '8' } },
+      { id: C, data: { Quantity: '12' } },
+    ]);
+    env.odataClient.getRecord
+      .mockResolvedValueOnce({ Id: A, Quantity: '6', '@odata.etag': 'W/"2"' })
+      .mockResolvedValueOnce({ Id: B, Quantity: '7', '@odata.etag': 'W/"1"' })
+      .mockResolvedValueOnce({ Id: C, Quantity: '11', '@odata.etag': 'W/"1"' });
+    const replayed = await env.call('bpm_batch_update', {
+      ...replayArgs,
+      confirm: true,
+      confirmation_token: refreshed.structuredContent?.confirmation_token,
+    });
+    expect(replayed.structuredContent).toMatchObject({ no_changes: [0] });
+    expect(env.odataClient.executeBatch).toHaveBeenCalledTimes(1);
+    expect(env.odataClient.executeBatch.mock.calls[0]?.[0]).toHaveLength(2);
   });
 });
 

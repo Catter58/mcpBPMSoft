@@ -4,12 +4,13 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import type { ServiceContainer } from './init-tool.js';
 import { BpmApiError, UnknownCollectionError } from '../utils/errors.js';
+import { buildValueOrigins } from '../utils/write-safety.js';
 import { getTool } from './registry.js';
 import {
   notInitialized,
   lookupNotesStructured,
   lookupNotesText,
-  resolveRecordId,
+  resolveRecordTarget,
   compileCriteria,
   combineFilters,
 } from './_guards.js';
@@ -31,18 +32,35 @@ import {
   consumeConfirmationPlan,
   previewIdList,
 } from '../utils/confirm.js';
-import { criterionSchema, recordShape, resolvedLookupNoteShape, lineItemsNotesShape } from './_schemas.js';
+import {
+  criterionSchema,
+  recordShape,
+  resolvedLookupNoteShape,
+  lineItemsNotesShape,
+  matchBySchema,
+  matchedByShape,
+  valueOriginShape,
+} from './_schemas.js';
 import type { Criterion } from '../utils/filter-compiler.js';
 import { isGuid } from '../utils/odata.js';
+import { createCreateResolutionContext, prepareCreateIntent } from '../workflows/create-preparation.js';
+import {
+  prepareUpdateIntent,
+  updateOperationSchema,
+  type UpdateOperation,
+} from '../workflows/update-preparation.js';
+import { reservePreparedActivity, releasePreparedActivity } from '../workflows/activity-preparation.js';
 import {
   executeSequentialWrites,
-  creationRecordId,
+  creationRecordIdWithScope,
   validateIdempotencyKey,
-  validateRequiredCreateFields,
   writeToolError,
   previewRecordSummary,
   concurrencyProtection,
   previewWriteFields,
+  previewWriteChanges,
+  writeChangesText,
+  buildClarifications,
   recordId,
   recordEtag,
   selectExactRecords,
@@ -56,11 +74,32 @@ const planShape = {
   records: z.array(z.object({ id: z.string(), display_value: z.string() })).optional(),
   concurrency_protection: z.enum(['etag', 'snapshot_only']).optional(),
   data_fields: z.array(z.object({ field: z.string(), caption: z.string(), value: z.unknown() })).optional(),
+  conflict: z
+    .object({
+      changed: z.array(
+        z.object({
+          index: z.number().int(),
+          id: z.string(),
+          fields: z.array(
+            z.object({ field: z.string(), before: z.unknown().optional(), current: z.unknown().optional() })
+          ),
+        })
+      ),
+    })
+    .optional(),
 };
 const outcomeShape = z.object({
   id: z.string(),
   state: z.enum(['succeeded', 'failed', 'not_executed', 'outcome_unknown']),
   error: z.string().optional(),
+});
+const verificationArgsShape = z.object({
+  collection: z.string(),
+  id: z.string(),
+  verify: z.object({
+    operation: z.enum(['create', 'update', 'delete']),
+    expected: z.record(z.string(), z.unknown()).optional(),
+  }),
 });
 const keyParam = z
   .string()
@@ -79,6 +118,18 @@ async function collectionName(services: ServiceContainer, input: string): Promis
   const ref = await services.metadataManager.resolveCollectionReference(input);
   if (ref.name === null) throw new UnknownCollectionError(input, ref.suggestions);
   return ref.name;
+}
+async function safeRecordSummary(
+  services: ServiceContainer,
+  collection: string,
+  record: Record<string, unknown>,
+  heading: string
+): Promise<string[]> {
+  try {
+    return await recordSummary(services, collection, record, heading);
+  } catch {
+    return [`${heading} (${String(record.Id ?? record.id ?? '')})`, 'Подписи полей недоступны.'];
+  }
 }
 function snapshotLineParents(collection: string, records: Record<string, unknown>[]): string[] {
   const config = lineConfig(collection);
@@ -126,43 +177,214 @@ export function registerWriteTools(server: McpServer, services: ServiceContainer
               'Совместимый параметр. Известные обязательные поля Designer проверяются всегда; nullable OData не означает обязательность ввода.'
             ),
           idempotency_key: keyParam,
+          idempotency_scope: z
+            .enum(['session', 'user'])
+            .optional()
+            .describe(
+              'Область стабильного ключа: session по умолчанию или user для повторов между сессиями.'
+            ),
+          dry_run: z.boolean().optional().describe('Подготовить и проверить данные без создания записи.'),
         },
         outputSchema: {
           collection: z.string(),
-          record: recordShape,
+          record: recordShape.optional(),
           created: z.boolean().nullable().optional(),
+          dry_run: z.boolean().optional(),
+          ready: z.boolean().optional(),
+          normalized_args: z.record(z.string(), z.unknown()).optional(),
+          normalized_args_status: z.enum(['complete', 'incomplete']).optional(),
+          blockers: z.array(z.record(z.string(), z.unknown())).optional(),
+          clarifications: z.array(z.record(z.string(), z.unknown())).optional(),
+          changes: z.array(z.record(z.string(), z.unknown())).optional(),
+          changes_basis: z.enum(['observed_response', 'requested']).optional(),
+          presentation_warnings: z.array(z.string()).optional(),
+          verification_args: verificationArgsShape.optional(),
+          missing_fields: z
+            .array(z.object({ name: z.string(), caption: z.string(), type: z.string() }))
+            .optional(),
+          no_changes: z.boolean().optional(),
+          source_timezone: z
+            .object({ time_zone: z.string(), source: z.enum(['profile', 'environment']) })
+            .optional(),
+          activity_warnings: z.array(z.string()).optional(),
+          activity_used_fields: z.record(z.string(), z.string()).optional(),
           resolved_lookups: z.array(resolvedLookupNoteShape).optional(),
+          value_origins: z.array(valueOriginShape).optional(),
           line_items_notes: lineItemsNotesShape,
         },
       },
       async (params): Promise<CallToolResult> => {
         if (!services.initialized) return notInitialized();
         let plannedId: string | undefined;
+        let mutationCompleted = false;
+        let normalizedArgs: Record<string, unknown> | undefined;
+        let preparedForOutput: Awaited<ReturnType<typeof prepareCreateIntent>> | undefined;
+        let activityReservation:
+          | {
+              context: NonNullable<ReturnType<typeof services.lookupResolver.createResolutionContext>>;
+              prepared: NonNullable<Awaited<ReturnType<typeof prepareCreateIntent>>['activity']>;
+            }
+          | undefined;
         try {
           await services.authManager.ensureAuthenticated();
           validateIdempotencyKey(params.idempotency_key);
           const collection = await collectionName(services, params.collection);
-          const resolved = await services.lookupResolver.resolveDataLookups(collection, params.data);
-          const line = await enrichLineItem(services, collection, resolved.data);
-          resolved.data = line.data;
-          await validateRequiredCreateFields(services, collection, resolved.data);
-          plannedId = creationRecordId(
+          const resolutionContext = createCreateResolutionContext(services);
+          const prepared = await prepareCreateIntent(services, collection, params.data, resolutionContext);
+          preparedForOutput = prepared;
+          const { data, line } = prepared;
+          normalizedArgs = {
+            collection,
+            data,
+            ...(params.idempotency_key ? { idempotency_key: params.idempotency_key } : {}),
+            ...(params.idempotency_scope ? { idempotency_scope: params.idempotency_scope } : {}),
+          };
+          plannedId = await creationRecordIdWithScope(
             services,
-            resolved.data,
+            data,
             params.idempotency_key,
-            `${collection}:create`
+            `${collection}:create`,
+            params.idempotency_scope ?? 'session',
+            resolutionContext
           );
+          normalizedArgs.data = { ...data, Id: plannedId };
+          const activityWarnings = prepared.activity
+            ? [
+                ...prepared.activity.warnings,
+                ...(prepared.activity.availabilityChecked
+                  ? [
+                      'Занятость проверена по снимку; интервал не блокируется атомарно и может измениться до сохранения.',
+                    ]
+                  : []),
+              ]
+            : undefined;
+          const preparedChanges = await previewWriteChanges(services, collection, undefined, data);
+          if (params.dry_run) {
+            return {
+              content: [
+                {
+                  type: 'text',
+                  text: prepared.blockers.length
+                    ? `Подготовка не пройдена: ${prepared.blockers.map((blocker) => blocker.message).join(' ')}\nНормализованные аргументы возвращены для исправления.`
+                    : 'Подготовка пройдена. Запись не создана.',
+                },
+              ],
+              structuredContent: {
+                collection,
+                dry_run: true,
+                ready: prepared.blockers.length === 0,
+                normalized_args: normalizedArgs,
+                normalized_args_status: prepared.blockers.length ? 'incomplete' : 'complete',
+                blockers: prepared.blockers,
+                clarifications: buildClarifications(prepared.blockers),
+                changes: preparedChanges.changes,
+                changes_basis: 'requested',
+                ...(preparedChanges.warnings.length
+                  ? { presentation_warnings: preparedChanges.warnings }
+                  : {}),
+                ...(prepared.source_timezone ? { source_timezone: prepared.source_timezone } : {}),
+                ...(activityWarnings?.length ? { activity_warnings: activityWarnings } : {}),
+                ...(prepared.activity ? { activity_used_fields: prepared.activity.usedFields } : {}),
+                ...(prepared.notes.length ? { resolved_lookups: lookupNotesStructured(prepared.notes) } : {}),
+                value_origins: buildValueOrigins({
+                  values: { ...prepared.data, Id: plannedId },
+                  callerValues: params.data,
+                  lookups: prepared.notes,
+                  coerced: prepared.coerced,
+                  originSources: prepared.origins,
+                  platformDefaults: (await services.metadataManager.getEntityMetadata(collection)).properties
+                    .filter(
+                      (property) =>
+                        !Object.hasOwn(prepared.data, property.name) && property.defaultHint?.providedByServer
+                    )
+                    .map((property) => ({ field: property.name, observed: false })),
+                  computedFields: params.data.Id === undefined ? ['Id'] : [],
+                }),
+                line_items_notes: line.notes,
+              },
+            };
+          }
+          if (prepared.blockers.length) {
+            const missing = prepared.blockers.flatMap((blocker) => blocker.missing_fields ?? []);
+            return {
+              content: [
+                { type: 'text', text: prepared.blockers.map((blocker) => blocker.message).join('\n') },
+              ],
+              structuredContent: {
+                code: 'validation',
+                message: 'Подготовка записи выявила блокеры. Ничего не создано.',
+                next_steps: ['Исправьте обязательные поля и lookup-значения, затем повторите вызов.'],
+                normalized_args: normalizedArgs,
+                normalized_args_status: 'incomplete',
+                blockers: prepared.blockers,
+                clarifications: buildClarifications(prepared.blockers),
+                changes: preparedChanges.changes,
+                ...(preparedChanges.warnings.length
+                  ? { presentation_warnings: preparedChanges.warnings }
+                  : {}),
+                ...(prepared.source_timezone ? { source_timezone: prepared.source_timezone } : {}),
+                ...(activityWarnings?.length ? { activity_warnings: activityWarnings } : {}),
+                ...(missing.length ? { missing_fields: missing } : {}),
+              },
+              isError: true,
+            };
+          }
+          const resolved = { data, notes: prepared.notes, coerced: prepared.coerced };
+          if (prepared.activity) {
+            reservePreparedActivity(resolutionContext, prepared.activity);
+            activityReservation = { context: resolutionContext, prepared: prepared.activity };
+          }
           const creation = await services.odataClient.createRecordWithOutcome<Record<string, unknown>>(
             collection,
             resolved.data,
             { id: plannedId }
           );
           const created = creation.record;
+          mutationCompleted = true;
+          const changedFields = Object.keys(data);
+          const resultChanges = await previewWriteChanges(
+            services,
+            collection,
+            undefined,
+            Object.fromEntries(
+              changedFields.map((field) => [
+                field,
+                Object.prototype.hasOwnProperty.call(created, field) ? created[field] : data[field],
+              ])
+            )
+          );
+          const responseCoversChanges =
+            creation.created === true && changedFields.every((field) => Object.hasOwn(created, field));
           const output = {
             collection,
             record: created,
             created: creation.created,
+            normalized_args: normalizedArgs,
+            ...(prepared.source_timezone ? { source_timezone: prepared.source_timezone } : {}),
+            ...(activityWarnings?.length ? { activity_warnings: activityWarnings } : {}),
+            ...(prepared.activity ? { activity_used_fields: prepared.activity.usedFields } : {}),
+            changes: resultChanges.changes,
+            changes_basis: responseCoversChanges ? 'observed_response' : 'requested',
+            ...(resultChanges.warnings.length ? { presentation_warnings: resultChanges.warnings } : {}),
             ...(resolved.notes.length ? { resolved_lookups: lookupNotesStructured(resolved.notes) } : {}),
+            value_origins: buildValueOrigins({
+              values: { ...resolved.data, Id: plannedId, ...created },
+              callerValues: params.data,
+              lookups: resolved.notes,
+              coerced: resolved.coerced,
+              originSources: prepared.origins,
+              computedFields: params.data.Id === undefined ? ['Id'] : [],
+              platformDefaults: (await services.metadataManager.getEntityMetadata(collection)).properties
+                .filter(
+                  (property) =>
+                    !Object.hasOwn(resolved.data, property.name) && property.defaultHint?.providedByServer
+                )
+                .map((property) => ({
+                  field: property.name,
+                  observed: Object.hasOwn(created, property.name),
+                  value: created[property.name],
+                })),
+            }),
           };
           const lineNotes = [
             ...line.notes,
@@ -174,7 +396,7 @@ export function registerWriteTools(server: McpServer, services: ServiceContainer
                 : []
               : await recalcParentTotals(services, collection, line.parents)),
           ];
-          const summary = await recordSummary(
+          const summary = await safeRecordSummary(
             services,
             collection,
             created,
@@ -186,6 +408,7 @@ export function registerWriteTools(server: McpServer, services: ServiceContainer
                 type: 'text',
                 text: [
                   ...summary,
+                  writeChangesText(resultChanges.changes) ?? '',
                   lookupNotesText(resolved.notes) ?? '',
                   coercedText(resolved.coerced) ?? '',
                   lineNotesText(lineNotes),
@@ -197,11 +420,36 @@ export function registerWriteTools(server: McpServer, services: ServiceContainer
             structuredContent: { ...output, ...(lineNotes.length ? { line_items_notes: lineNotes } : {}) },
           };
         } catch (error) {
-          return errorResult(
-            error,
-            params.collection,
-            plannedId ? { id: plannedId, state: writeFailureState(error) } : {}
-          );
+          if (activityReservation)
+            releasePreparedActivity(activityReservation.context, activityReservation.prepared);
+          return errorResult(error, params.collection, {
+            ...(plannedId
+              ? { id: plannedId, state: mutationCompleted ? 'succeeded' : writeFailureState(error) }
+              : {}),
+            ...(plannedId && !mutationCompleted && writeFailureState(error) === 'outcome_unknown'
+              ? {
+                  verification_args: {
+                    collection: normalizedArgs?.collection ?? params.collection,
+                    id: plannedId,
+                    verify: {
+                      operation: 'create',
+                      expected: Object.fromEntries(
+                        Object.entries(
+                          (normalizedArgs?.data as Record<string, unknown> | undefined) ?? {}
+                        ).filter(([field]) => field !== 'Id')
+                      ),
+                    },
+                  },
+                }
+              : {}),
+            ...(normalizedArgs ? { normalized_args: normalizedArgs } : {}),
+            ...(preparedForOutput?.source_timezone
+              ? { source_timezone: preparedForOutput.source_timezone }
+              : {}),
+            ...(preparedForOutput?.activity?.warnings.length
+              ? { activity_warnings: preparedForOutput.activity.warnings }
+              : {}),
+          });
         }
       }
     );
@@ -216,43 +464,242 @@ export function registerWriteTools(server: McpServer, services: ServiceContainer
         annotations: meta.annotations,
         inputSchema: {
           collection: z.string(),
-          id: z.string(),
-          data: recordShape,
+          id: z.string().optional(),
+          match_by: matchBySchema.optional(),
+          data: recordShape.optional(),
+          operations: z.array(updateOperationSchema).max(100).optional(),
+          dry_run: z.boolean().optional(),
           expected_etag: etagParam,
         },
         outputSchema: {
           collection: z.string(),
           id: z.string(),
           matched: z.string().optional(),
+          matched_by: matchedByShape.optional(),
+          value_origins: z.array(valueOriginShape).optional(),
           record: recordShape.optional(),
           updated_fields: z.array(z.string()),
+          dry_run: z.boolean().optional(),
+          ready: z.boolean().optional(),
+          normalized_args: z.record(z.string(), z.unknown()).optional(),
+          normalized_args_status: z.enum(['complete', 'incomplete']).optional(),
+          blockers: z.array(z.record(z.string(), z.unknown())).optional(),
+          clarifications: z.array(z.record(z.string(), z.unknown())).optional(),
+          changes: z.array(z.record(z.string(), z.unknown())).optional(),
+          changes_basis: z.enum(['observed_response', 'requested']).optional(),
+          presentation_warnings: z.array(z.string()).optional(),
+          no_changes: z.boolean().optional(),
+          missing_fields: z
+            .array(z.object({ name: z.string(), caption: z.string(), type: z.string() }))
+            .optional(),
+          before: recordShape.optional(),
+          after: recordShape.optional(),
+          concurrency_protection: z.enum(['etag', 'snapshot_only']).optional(),
+          source_timezone: z
+            .object({ time_zone: z.string(), source: z.enum(['profile', 'environment']) })
+            .optional(),
           resolved_lookups: z.array(resolvedLookupNoteShape).optional(),
           line_items_notes: lineItemsNotesShape,
+          verification_args: verificationArgsShape.optional(),
         },
       },
       async (params): Promise<CallToolResult> => {
         if (!services.initialized) return notInitialized();
         let executionStarted = false;
+        let mutationCompleted = false;
+        let normalizedArgs: Record<string, unknown> | undefined;
         try {
           await services.authManager.ensureAuthenticated();
           const collection = await collectionName(services, params.collection);
-          const target = await resolveRecordId(services, collection, params.id);
-          const resolved = await services.lookupResolver.resolveDataLookups(collection, params.data);
+          const target = await resolveRecordTarget(services, collection, params);
+          const operations = (params.operations ?? []) as UpdateOperation[];
+          const context = createCreateResolutionContext(services);
+          const prepared =
+            operations.length || params.dry_run
+              ? await prepareUpdateIntent(
+                  services,
+                  collection,
+                  target.id,
+                  params.data ?? {},
+                  operations,
+                  undefined,
+                  context
+                )
+              : undefined;
+          const expectedEtag = params.expected_etag ?? (prepared ? recordEtag(prepared.snapshot) : undefined);
+          const snapshotEtag = prepared ? recordEtag(prepared.snapshot) : undefined;
+          if (prepared && params.expected_etag) {
+            if (!/^(?:W\/)?"[^"\r\n]+"$/.test(params.expected_etag)) {
+              prepared.blockers.push({
+                code: 'invalid_expected_etag',
+                message: 'expected_etag должен быть конкретной версией записи.',
+              });
+            } else if (!snapshotEtag) {
+              prepared.blockers.push({
+                code: 'concurrency_unsupported',
+                message: 'Снимок записи не содержит ETag; условное изменение не поддерживается.',
+              });
+            } else if (params.expected_etag !== snapshotEtag) {
+              prepared.blockers.push({
+                code: 'concurrency_conflict',
+                message: 'Ожидаемый ETag не совпадает со снимком записи; обновление не подготовлено.',
+              });
+            }
+          }
+          if (prepared?.blockers.length) {
+            const missingFields = prepared.blockers.flatMap((blocker) => blocker.missing_fields ?? []);
+            normalizedArgs = {
+              collection,
+              id: target.id,
+              data: prepared.data,
+              ...(expectedEtag ? { expected_etag: expectedEtag } : {}),
+            };
+            return {
+              content: [
+                { type: 'text', text: prepared.blockers.map((blocker) => blocker.message).join('\n') },
+              ],
+              structuredContent: {
+                collection,
+                id: target.id,
+                dry_run: Boolean(params.dry_run),
+                ready: false,
+                blockers: prepared.blockers,
+                clarifications: buildClarifications(prepared.blockers),
+                updated_fields: Object.keys(prepared.data),
+                normalized_args: normalizedArgs,
+                normalized_args_status: 'incomplete',
+                ...(missingFields.length ? { missing_fields: missingFields } : {}),
+              },
+              ...(!params.dry_run ? { isError: true } : {}),
+            };
+          }
+          if (prepared?.no_changes) {
+            normalizedArgs = {
+              collection,
+              id: target.id,
+              data: {},
+              ...(expectedEtag ? { expected_etag: expectedEtag } : {}),
+            };
+            return {
+              content: [{ type: 'text', text: 'Изменения не требуются: заполненные поля не изменены.' }],
+              structuredContent: {
+                collection,
+                id: target.id,
+                dry_run: Boolean(params.dry_run),
+                ready: true,
+                no_changes: true,
+                blockers: [],
+                changes: [],
+                normalized_args: normalizedArgs,
+                updated_fields: [],
+                concurrency_protection: expectedEtag ? 'etag' : prepared.concurrency_protection,
+                ...(prepared.source_timezone ? { source_timezone: prepared.source_timezone } : {}),
+              },
+            };
+          }
+          const resolved = prepared
+            ? { data: prepared.data, notes: prepared.notes, coerced: prepared.coerced }
+            : await services.lookupResolver.resolveDataLookups(collection, params.data ?? {}, context);
           if (!Object.keys(resolved.data).length)
             throw new BpmApiError('Не переданы поля для обновления.', 400, collection);
           if ('Id' in resolved.data)
             throw new BpmApiError('UUID записи нельзя менять. Передайте его через id.', 400, collection);
           const line = await enrichLineItem(services, collection, resolved.data, { id: target.id });
           resolved.data = line.data;
+          let beforeForDiff = prepared?.before;
+          let beforeReadUnavailable = false;
+          if (!beforeForDiff) {
+            try {
+              beforeForDiff = await services.odataClient.getRecord<Record<string, unknown>>(
+                collection,
+                target.id,
+                { $select: ['Id', ...Object.keys(line.data)].join(',') }
+              );
+            } catch {
+              beforeReadUnavailable = true;
+            }
+          }
+          const plannedDiff = await previewWriteChanges(
+            services,
+            collection,
+            beforeForDiff,
+            Object.fromEntries(Object.keys(line.data).map((field) => [field, line.data[field]]))
+          );
+          normalizedArgs = {
+            collection,
+            id: target.id,
+            data: line.data,
+            ...(expectedEtag ? { expected_etag: expectedEtag } : {}),
+          };
+          if (params.dry_run)
+            return {
+              content: [{ type: 'text', text: 'Подготовка пройдена. Запись не изменена.' }],
+              structuredContent: {
+                collection,
+                id: target.id,
+                ...(target.matched ? { matched: target.matched } : {}),
+                ...(target.matched_by ? { matched_by: target.matched_by } : {}),
+                dry_run: true,
+                ready: true,
+                blockers: [],
+                clarifications: [],
+                changes: plannedDiff.changes,
+                ...(beforeReadUnavailable || plannedDiff.warnings.length
+                  ? {
+                      presentation_warnings: [
+                        ...(beforeReadUnavailable
+                          ? ['Предыдущее состояние недоступно; показаны только запрошенные значения.']
+                          : []),
+                        ...plannedDiff.warnings,
+                      ],
+                    }
+                  : {}),
+                normalized_args: normalizedArgs,
+                ...(prepared
+                  ? {
+                      before: prepared.before,
+                      after: { ...prepared.after, ...line.data },
+                      concurrency_protection: expectedEtag ? 'etag' : prepared.concurrency_protection,
+                      ...(prepared.source_timezone ? { source_timezone: prepared.source_timezone } : {}),
+                    }
+                  : {}),
+                updated_fields: Object.keys(line.data),
+                ...(resolved.notes.length ? { resolved_lookups: lookupNotesStructured(resolved.notes) } : {}),
+                value_origins: buildValueOrigins({
+                  values: line.data,
+                  callerValues: params.data,
+                  lookups: resolved.notes,
+                  coerced: resolved.coerced,
+                  originSources: prepared?.origins ?? ('origins' in resolved ? resolved.origins : []),
+                  computedFields: (params.operations ?? []).map((operation) => operation.field),
+                }),
+              },
+            };
           executionStarted = true;
           const updated = await services.odataClient.updateRecord<Record<string, unknown>>(
             collection,
             target.id,
             resolved.data,
             {
-              expectedEtag: params.expected_etag,
+              expectedEtag,
               returnRepresentation: true,
             }
+          );
+          mutationCompleted = true;
+          const responseCoversChanges = Boolean(
+            updated &&
+            Object.keys(line.data).every((field) => Object.prototype.hasOwnProperty.call(updated, field))
+          );
+          const resultDiff = await previewWriteChanges(
+            services,
+            collection,
+            beforeForDiff,
+            Object.fromEntries(
+              Object.keys(line.data).map((field) => [
+                field,
+                responseCoversChanges ? updated![field] : line.data[field],
+              ])
+            )
           );
           const lineNotes = [
             ...line.notes,
@@ -262,10 +709,43 @@ export function registerWriteTools(server: McpServer, services: ServiceContainer
             collection,
             id: target.id,
             ...(target.matched ? { matched: target.matched } : {}),
+            ...(target.matched_by ? { matched_by: target.matched_by } : {}),
             ...(updated ? { record: updated } : {}),
+            normalized_args: normalizedArgs,
+            ...(prepared
+              ? {
+                  before: prepared.before,
+                  after: { ...prepared.after, ...line.data },
+                  concurrency_protection: expectedEtag ? 'etag' : prepared.concurrency_protection,
+                  ready: true,
+                  blockers: [],
+                  ...(prepared.source_timezone ? { source_timezone: prepared.source_timezone } : {}),
+                }
+              : {}),
             ...(lineNotes.length ? { line_items_notes: lineNotes } : {}),
             updated_fields: Object.keys(resolved.data),
+            changes: resultDiff.changes,
+            changes_basis:
+              responseCoversChanges && !beforeReadUnavailable ? 'observed_response' : 'requested',
+            ...(beforeReadUnavailable || resultDiff.warnings.length
+              ? {
+                  presentation_warnings: [
+                    ...(beforeReadUnavailable
+                      ? ['Предыдущее состояние недоступно; показаны только запрошенные значения.']
+                      : []),
+                    ...resultDiff.warnings,
+                  ],
+                }
+              : {}),
             ...(resolved.notes.length ? { resolved_lookups: lookupNotesStructured(resolved.notes) } : {}),
+            value_origins: buildValueOrigins({
+              values: line.data,
+              callerValues: params.data,
+              lookups: resolved.notes,
+              coerced: resolved.coerced,
+              originSources: prepared?.origins ?? ('origins' in resolved ? resolved.origins : []),
+              computedFields: (params.operations ?? []).map((operation) => operation.field),
+            }),
           };
           return {
             content: [
@@ -274,9 +754,15 @@ export function registerWriteTools(server: McpServer, services: ServiceContainer
                 text: [
                   ...(target.matched ? [`Найдена запись по имени: «${target.matched}» (${target.id})`] : []),
                   ...(updated
-                    ? await recordSummary(services, collection, updated, `Запись ${collection} обновлена:`)
+                    ? await safeRecordSummary(
+                        services,
+                        collection,
+                        updated,
+                        `Запись ${collection} обновлена:`
+                      )
                     : [`Запись ${collection}(${target.id}) обновлена.`]),
                   `Обновлённые поля: ${output.updated_fields.join(', ')}`,
+                  writeChangesText(resultDiff.changes) ?? '',
                   lookupNotesText(resolved.notes) ?? '',
                   coercedText(resolved.coerced) ?? '',
                   lineNotesText(lineNotes),
@@ -289,8 +775,34 @@ export function registerWriteTools(server: McpServer, services: ServiceContainer
           };
         } catch (error) {
           return errorResult(error, params.collection, {
-            id: params.id,
-            state: executionStarted ? writeFailureState(error) : 'not_executed',
+            id: normalizedArgs?.id ?? params.id ?? '',
+            state: executionStarted
+              ? mutationCompleted
+                ? 'succeeded'
+                : writeFailureState(error)
+              : 'not_executed',
+            ...(executionStarted &&
+            !mutationCompleted &&
+            writeFailureState(error) === 'outcome_unknown' &&
+            normalizedArgs
+              ? {
+                  verification_args: {
+                    collection: normalizedArgs.collection,
+                    id: normalizedArgs.id,
+                    verify: { operation: 'update', expected: normalizedArgs.data },
+                  },
+                }
+              : {}),
+            ready: false,
+            updated_fields: [],
+            blockers: [
+              {
+                code: error instanceof BpmApiError ? error.code : 'validation',
+                message: error instanceof Error ? error.message : String(error),
+              },
+            ],
+            clarifications: buildClarifications([writeToolError(error, params.collection)]),
+            ...(normalizedArgs ? { normalized_args: normalizedArgs } : {}),
           });
         }
       }
@@ -306,7 +818,8 @@ export function registerWriteTools(server: McpServer, services: ServiceContainer
         annotations: meta.annotations,
         inputSchema: {
           collection: z.string(),
-          id: z.string(),
+          id: z.string().optional(),
+          match_by: matchBySchema.optional(),
           confirm: confirmParam,
           confirmation_token: confirmationTokenParam,
           expected_etag: etagParam,
@@ -318,16 +831,20 @@ export function registerWriteTools(server: McpServer, services: ServiceContainer
           deleted: z.boolean().optional(),
           record: recordShape.optional(),
           matched: z.string().optional(),
+          matched_by: matchedByShape.optional(),
           line_items_notes: lineItemsNotesShape,
+          verification_args: verificationArgsShape.optional(),
         },
       },
       async (params): Promise<CallToolResult> => {
         if (!services.initialized) return notInitialized();
         let executionStarted = false;
+        let verificationTarget: { collection: string; id: string } | undefined;
         try {
           await services.authManager.ensureAuthenticated();
           const collection = await collectionName(services, params.collection);
-          const target = await resolveRecordId(services, collection, params.id, { fuzzy: false });
+          const target = await resolveRecordTarget(services, collection, params, { fuzzy: false });
+          verificationTarget = { collection, id: target.id };
           const record = await services.odataClient.getRecord<Record<string, unknown>>(collection, target.id);
           const operation = {
             tool: meta.name,
@@ -336,6 +853,24 @@ export function registerWriteTools(server: McpServer, services: ServiceContainer
             id: target.id,
             record,
             expected_etag: params.expected_etag,
+          };
+          const freshness = {
+            intent: {
+              tool: meta.name,
+              collection,
+              id: params.id,
+              match_by: params.match_by,
+              expected_etag: params.expected_etag,
+            },
+            snapshots: [
+              {
+                index: 0,
+                id: target.id,
+                values: Object.fromEntries(
+                  Object.entries(record).filter(([field]) => !field.startsWith('@odata.'))
+                ),
+              },
+            ],
           };
           if (params.confirm !== true) {
             return confirmationResponse(
@@ -348,14 +883,32 @@ export function registerWriteTools(server: McpServer, services: ServiceContainer
                 collection,
                 id: target.id,
                 ...(target.matched ? { matched: target.matched } : {}),
+                ...(target.matched_by ? { matched_by: target.matched_by } : {}),
                 record,
                 records: previewRecordSummary([record]),
                 concurrency_protection: concurrencyProtection([record]),
-                confirmation_token: createConfirmationPlan(services, operation),
+                confirmation_token: createConfirmationPlan(services, operation, freshness),
               }
             );
           }
-          consumeConfirmationPlan(services, params.confirmation_token, operation);
+          const stale = consumeConfirmationPlan(services, params.confirmation_token, operation, freshness);
+          if (stale)
+            return confirmationResponse(
+              meta.name,
+              [
+                'Запись изменилась после предварительного просмотра. Ничего не удалено; проверьте текущие значения и подтвердите новый план отдельно.',
+              ],
+              {
+                collection,
+                id: target.id,
+                ...(target.matched_by ? { matched_by: target.matched_by } : {}),
+                record,
+                conflict: { changed: stale.changed },
+                records: previewRecordSummary([record]),
+                concurrency_protection: concurrencyProtection([record]),
+                confirmation_token: createConfirmationPlan(services, operation, freshness),
+              }
+            );
           const parents = await lineParentIds(services, collection, [target.id]);
           executionStarted = true;
           await services.odataClient.deleteRecord(collection, target.id, {
@@ -376,13 +929,23 @@ export function registerWriteTools(server: McpServer, services: ServiceContainer
               id: target.id,
               deleted: true,
               ...(target.matched ? { matched: target.matched } : {}),
+              ...(target.matched_by ? { matched_by: target.matched_by } : {}),
               ...(lineNotes.length ? { line_items_notes: lineNotes } : {}),
             },
           };
         } catch (error) {
           return errorResult(error, params.collection, {
-            id: params.id,
+            id: verificationTarget?.id ?? params.id,
             state: executionStarted ? writeFailureState(error) : 'not_executed',
+            ...(executionStarted && writeFailureState(error) === 'outcome_unknown' && verificationTarget
+              ? {
+                  verification_args: {
+                    collection: verificationTarget.collection,
+                    id: verificationTarget.id,
+                    verify: { operation: 'delete' },
+                  },
+                }
+              : {}),
           });
         }
       }
@@ -581,6 +1144,25 @@ export function registerWriteTools(server: McpServer, services: ServiceContainer
             })),
             deletion_parents: [...deletionParents].sort(),
           };
+          const freshness = {
+            intent: {
+              tool: meta.name,
+              collection,
+              filter: params.filter,
+              criteria: params.criteria,
+              join: params.join ?? 'and',
+              expected_count: params.expected_count,
+              data: resolved.data,
+              ids,
+            },
+            snapshots: records.map((record, index) => ({
+              index,
+              id: recordId(record),
+              values: Object.fromEntries(
+                Object.entries(record).filter(([field]) => !field.startsWith('@odata.'))
+              ),
+            })),
+          };
           if (params.confirm !== true) {
             return confirmationResponse(
               meta.name,
@@ -611,11 +1193,32 @@ export function registerWriteTools(server: McpServer, services: ServiceContainer
                       ),
                     }
                   : {}),
-                confirmation_token: createConfirmationPlan(services, operation),
+                confirmation_token: createConfirmationPlan(services, operation, freshness),
               }
             );
           }
-          consumeConfirmationPlan(services, params.confirmation_token, operation);
+          const stale = consumeConfirmationPlan(services, params.confirmation_token, operation, freshness);
+          if (stale) {
+            return confirmationResponse(
+              meta.name,
+              [
+                'Снимок изменился после предварительного просмотра. Записи не изменены; проверьте обновлённый план.',
+              ],
+              {
+                collection,
+                ...filterOutput,
+                count: ids.length,
+                ids,
+                records: previewRecordSummary(records),
+                conflict: { changed: stale.changed },
+                concurrency_protection: concurrencyProtection(records),
+                ...(isUpdate
+                  ? { data: resolved.data, changes: lines.map((line) => ({ id: line.id, data: line.data })) }
+                  : {}),
+                confirmation_token: createConfirmationPlan(services, operation, freshness),
+              }
+            );
+          }
           const outcomes = await executeSequentialWrites(records, async (id, expectedEtag) => {
             if (isUpdate)
               await services.odataClient.updateRecord(

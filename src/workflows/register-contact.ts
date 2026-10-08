@@ -8,10 +8,10 @@ import { getTool } from '../tools/registry.js';
 import { notInitialized } from '../tools/_guards.js';
 import { executeFindOrCreate, prepareFindOrCreate, type FindOrCreatePlan } from './find-or-create.js';
 import { escapeODataString, guidLiteral } from '../utils/odata.js';
+import { assertPreparedCreate, prepareCreateIntent } from './create-preparation.js';
 import {
-  creationRecordId,
+  creationRecordIdWithScope,
   validateIdempotencyKey,
-  validateRequiredCreateFields,
   MissingRequiredFieldsError,
   writeToolError,
   recordId,
@@ -118,6 +118,12 @@ export function registerRegisterContactTool(server: McpServer, services: Service
           .describe(
             'Ключ одного намерения регистрации. Повтор использует те же UUID; при ошибке сначала проверьте outcomes.'
           ),
+        idempotency_scope: z
+          .enum(['session', 'user'])
+          .optional()
+          .describe(
+            'user сохраняет UUID по tenant, адресу инстанса и подтверждённому пользователю BPMSoft; требует idempotency_key.'
+          ),
       },
       outputSchema: {
         contact_id: z.string().nullable(),
@@ -152,6 +158,11 @@ export function registerRegisterContactTool(server: McpServer, services: Service
       try {
         await services.authManager.ensureAuthenticated();
         validateIdempotencyKey(params.idempotency_key);
+        if (params.idempotency_scope === 'user' && params.idempotency_key === undefined)
+          throw new BpmApiError('idempotency_scope=user требует idempotency_key.', 400, 'Contact');
+        // All lookup and date coercion in this composite write uses one user,
+        // timezone, and clock snapshot.
+        const context = services.lookupResolver.createResolutionContext();
         const contactMeta = await services.metadataManager.getEntityMetadata('Contact');
         const warnings: string[] = [];
         if (typeof params.name !== 'string' || !params.name.trim()) {
@@ -189,7 +200,9 @@ export function registerRegisterContactTool(server: McpServer, services: Service
               'Account',
               { field: 'Name', value: params.account_name! },
               { Name: params.account_name! },
-              params.idempotency_key ? `${params.idempotency_key}:account` : undefined
+              params.idempotency_key ? `${params.idempotency_key}:account` : undefined,
+              context,
+              params.idempotency_scope ?? 'session'
             );
             accountId = accountPlan.id;
           }
@@ -201,7 +214,7 @@ export function registerRegisterContactTool(server: McpServer, services: Service
         }
         // Resolve extras first so alias collisions cannot silently override explicit intent.
         const extras = params.extra
-          ? (await services.lookupResolver.resolveDataLookups('Contact', params.extra)).data
+          ? (await services.lookupResolver.resolveDataLookups('Contact', params.extra, context)).data
           : {};
         const explicit: Record<string, unknown> = { Name: params.name };
         if (params.email !== undefined) explicit.Email = params.email;
@@ -231,7 +244,7 @@ export function registerRegisterContactTool(server: McpServer, services: Service
             }
           }
         }
-        const base = await services.lookupResolver.resolveDataLookups('Contact', explicit);
+        const base = await services.lookupResolver.resolveDataLookups('Contact', explicit, context);
         for (const [field, value] of Object.entries(extras)) {
           if (field in base.data && base.data[field] !== value)
             throw new BpmApiError(
@@ -250,12 +263,16 @@ export function registerRegisterContactTool(server: McpServer, services: Service
             );
           contactData[accountField] = accountId;
         }
-        await validateRequiredCreateFields(services, 'Contact', contactData);
-        contactId = creationRecordId(
+        const contactPrepared = await prepareCreateIntent(services, 'Contact', contactData, context);
+        assertPreparedCreate(contactPrepared, 'Contact');
+        const normalizedContactData = contactPrepared.data;
+        contactId = await creationRecordIdWithScope(
           services,
-          contactData,
+          normalizedContactData,
           params.idempotency_key,
-          'register-contact:contact'
+          'register-contact:contact',
+          params.idempotency_scope ?? 'session',
+          context
         );
         if (accountPlan) {
           current = { step: 'account', collection: 'Account', id: accountPlan.id, state: 'not_executed' };
@@ -269,7 +286,7 @@ export function registerRegisterContactTool(server: McpServer, services: Service
         current = { step: 'contact', collection: 'Contact', id: contactId, state: 'not_executed' };
         const result = await services.odataClient.createRecordWithOutcome<Record<string, unknown>>(
           'Contact',
-          contactData,
+          normalizedContactData,
           { id: contactId }
         );
         contactId = recordId(result.record);

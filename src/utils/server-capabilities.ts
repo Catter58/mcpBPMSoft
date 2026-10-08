@@ -41,6 +41,28 @@ export function markTolowerUnsupported(): void {
 export function resetServerCapabilities(): void {
   tolowerUnsupported.clear();
   batchSupport.clear();
+  relationshipReadSupport.clear();
+}
+
+/** A result for one exact read strategy, scoped by the caller to instance, user and path. */
+const RELATIONSHIP_READ_TTL_MS = 5 * 60 * 1000;
+const MAX_RELATIONSHIP_READ_SCOPES = 2000;
+const relationshipReadSupport = new Map<string, { supported: boolean; expires: number }>();
+
+export function getRelationshipReadSupport(scope: string): boolean | undefined {
+  const known = relationshipReadSupport.get(scope);
+  if (known && known.expires > Date.now()) return known.supported;
+  relationshipReadSupport.delete(scope);
+  return undefined;
+}
+
+export function setRelationshipReadSupport(scope: string, supported: boolean): void {
+  const now = Date.now();
+  for (const [key, value] of relationshipReadSupport)
+    if (value.expires <= now) relationshipReadSupport.delete(key);
+  if (!relationshipReadSupport.has(scope) && relationshipReadSupport.size >= MAX_RELATIONSHIP_READ_SCOPES)
+    relationshipReadSupport.delete(relationshipReadSupport.keys().next().value!);
+  relationshipReadSupport.set(scope, { supported, expires: now + RELATIONSHIP_READ_TTL_MS });
 }
 
 /**

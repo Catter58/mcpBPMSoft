@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { compileFilter, resolveFieldPath, type Criterion } from '../../src/utils/filter-compiler.js';
+import { compileFilter, resolveFieldPath, type CriterionNode } from '../../src/utils/filter-compiler.js';
 import { UnknownFieldError } from '../../src/utils/errors.js';
 import type { MetadataManager } from '../../src/metadata/metadata-manager.js';
 import type { EntityMetadata, EntityProperty } from '../../src/types/index.js';
@@ -15,11 +15,14 @@ interface CollectionDef {
     {
       caption?: string;
       type?: string;
+      nullable?: boolean;
       isLookup?: boolean;
       lookupCollection?: string;
       displayColumn?: string;
     }
   >;
+  collectionNavigations?: Array<{ name: string; targetCollection: string }>;
+  keyFields?: string[];
 }
 
 function makeStubMetadata(collections: Record<string, CollectionDef>): MetadataManager {
@@ -31,7 +34,7 @@ function makeStubMetadata(collections: Record<string, CollectionDef>): MetadataM
     const props: EntityProperty[] = Object.entries(def.fields).map(([name, info]) => ({
       name,
       type: info.type ?? 'Edm.String',
-      nullable: true,
+      nullable: info.nullable ?? true,
       isLookup: !!info.isLookup,
       lookupCollection: info.lookupCollection,
       lookupDisplayColumn: info.displayColumn ?? 'Name',
@@ -40,8 +43,10 @@ function makeStubMetadata(collections: Record<string, CollectionDef>): MetadataM
     return {
       name: collection,
       collectionName: collection,
+      keyFields: def.keyFields,
       properties: props,
       lookupFields: props.filter((p) => p.isLookup).map((p) => p.name),
+      navigationProperties: (def.collectionNavigations ?? []).map((nav) => ({ ...nav, isCollection: true })),
       cachedAt: Date.now(),
     };
   };
@@ -59,6 +64,12 @@ function makeStubMetadata(collections: Record<string, CollectionDef>): MetadataM
         displayColumn: prop.lookupDisplayColumn || 'Name',
         navigationProperty: prop.name.replace(/Id$/, ''),
       };
+    },
+    async getCollectionNavigationInfo(collection: string, name: string) {
+      return (
+        buildMeta(collection).navigationProperties?.find((nav) => nav.name === name && nav.isCollection) ??
+        null
+      );
     },
     async resolveFieldReference(collection: string, query: string) {
       const meta = buildMeta(collection);
@@ -106,6 +117,7 @@ const META = makeStubMetadata({
         lookupCollection: 'Account',
       },
     },
+    collectionNavigations: [{ name: 'Activities', targetCollection: 'Activity' }],
   },
   City: {
     fields: {
@@ -126,9 +138,13 @@ const META = makeStubMetadata({
       },
     },
   },
+  Activity: {
+    keyFields: ['Id'],
+    fields: { Id: { type: 'Edm.Guid', nullable: false } },
+  },
 });
 
-function compile(criteria: Criterion[], opts: { join?: 'and' | 'or'; v?: 3 | 4 } = {}) {
+function compile(criteria: CriterionNode[], opts: { join?: 'and' | 'or'; v?: 3 | 4 } = {}) {
   return compileFilter(criteria, {
     collection: 'Contact',
     metadataManager: META,
@@ -136,6 +152,120 @@ function compile(criteria: Criterion[], opts: { join?: 'and' | 'or'; v?: 3 | 4 }
     join: opts.join,
   });
 }
+
+describe('compileFilter — boolean groups', () => {
+  it('keeps nested AND/OR/NOT precedence explicit', async () => {
+    const result = await compile([
+      {
+        or: [
+          { field: 'Age', op: 'ge', value: 18 },
+          {
+            and: [
+              { field: 'IsVip', op: 'eq', value: true },
+              { not: { field: 'Name', op: 'contains', value: 'test' } },
+            ],
+          },
+        ],
+      },
+    ]);
+    expect(result.filter).toBe(
+      "((Age ge 18) or (((IsVip eq true) and ((not (contains(tolower(Name), 'test')))))))"
+    );
+    expect(result.used_fields.map((field) => field.resolved)).toEqual(['Age', 'IsVip', 'Name']);
+  });
+
+  it('rejects empty groups and excessive nesting before returning an OData filter', async () => {
+    await expect(compile([{ and: [] }])).rejects.toThrow('непустой массив');
+    let node: CriterionNode = { field: 'Age', op: 'eq', value: 1 };
+    for (let i = 0; i < 9; i++) node = { not: node };
+    await expect(compile([node])).rejects.toThrow('Вложенность criteria');
+  });
+
+  it('compiles collection presence only for declared OData v4 collection navigation', async () => {
+    const result = await compile([
+      { field: 'Activities', op: 'exists' },
+      { field: 'Activities', op: 'not_exists' },
+    ]);
+    expect(result.filter).toBe(
+      '(Activities/any(related: related/Id ne null)) and (not (Activities/any(related: related/Id ne null)))'
+    );
+    await expect(compile([{ field: 'UnknownActivities', op: 'exists' }])).rejects.toThrow(
+      'не подтверждена метаданными'
+    );
+    await expect(compile([{ field: 'Activities', op: 'exists' }], { v: 3 })).rejects.toThrow(
+      'только в OData v4'
+    );
+  });
+
+  it('uses a safe non-nullable target key, including a non-Id composite key member', async () => {
+    const metadata = makeStubMetadata({
+      Account: {
+        fields: {},
+        collectionNavigations: [{ name: 'AccountsByContact', targetCollection: 'Link' }],
+      },
+      Link: {
+        keyFields: ['Unsafe/Key', 'LinkCode', 'TenantId'],
+        fields: {
+          'Unsafe/Key': { type: 'Edm.String', nullable: false },
+          LinkCode: { type: 'Edm.String', nullable: false },
+          TenantId: { type: 'Edm.Guid', nullable: false },
+        },
+      },
+    });
+    const result = await compileFilter([{ field: 'AccountsByContact', op: 'exists' }], {
+      collection: 'Account',
+      metadataManager: metadata,
+      odataVersion: 4,
+    });
+    expect(result.filter).toBe('AccountsByContact/any(related: related/LinkCode ne null)');
+  });
+
+  it('fails closed when the target has no safe, published, non-nullable key', async () => {
+    for (const target of [
+      { keyFields: undefined, fields: { Id: { type: 'Edm.Guid', nullable: false } } },
+      { keyFields: ['Missing'], fields: {} },
+      { keyFields: ['NullableKey'], fields: { NullableKey: { nullable: true } } },
+      { keyFields: ['Unsafe/Key'], fields: { 'Unsafe/Key': { nullable: false } } },
+    ]) {
+      const metadata = makeStubMetadata({
+        Account: {
+          fields: {},
+          collectionNavigations: [{ name: 'AccountsByContact', targetCollection: 'Link' }],
+        },
+        Link: target,
+      });
+      await expect(
+        compileFilter([{ field: 'AccountsByContact', op: 'exists' }], {
+          collection: 'Account',
+          metadataManager: metadata,
+          odataVersion: 4,
+        })
+      ).rejects.toThrow('нет подтверждённого безопасного обязательного ключевого поля');
+    }
+  });
+
+  it('preserves nested boolean groups around the lambda predicate', async () => {
+    const result = await compile([
+      {
+        or: [{ field: 'Activities', op: 'exists' }, { not: { field: 'Activities', op: 'not_exists' } }],
+      },
+    ]);
+    expect(result.filter).toBe(
+      '((Activities/any(related: related/Id ne null)) or ((not (not (Activities/any(related: related/Id ne null))))))'
+    );
+  });
+
+  it('does not load target metadata for OData v3 or an unknown navigation', async () => {
+    const getEntityMetadata = vi.spyOn(META, 'getEntityMetadata');
+    await expect(compile([{ field: 'Activities', op: 'exists' }], { v: 3 })).rejects.toThrow(
+      'только в OData v4'
+    );
+    await expect(compile([{ field: 'UnknownActivities', op: 'exists' }])).rejects.toThrow(
+      'не подтверждена метаданными'
+    );
+    expect(getEntityMetadata).not.toHaveBeenCalled();
+  });
+});
 
 // ============================================================
 // Tests

@@ -6,7 +6,7 @@ import { formatToolError, BpmApiError } from '../utils/errors.js';
 import { getTool } from './registry.js';
 import {
   notInitialized,
-  resolveRecordId,
+  resolveRecordTarget,
   resolveCollection,
   compileCriteria,
   combineFilters,
@@ -20,18 +20,26 @@ import {
   planLookupExpand,
 } from '../utils/display.js';
 import { type Criterion } from '../utils/filter-compiler.js';
-import { renderRecordsText, type RenderFormat } from '../utils/render.js';
+import { READ_FORMATS, renderRecordsText, type RenderFormat } from '../utils/render.js';
 import { decodeCursor, buildNextCursor, type CursorState } from '../utils/cursor.js';
+import { continuationForResult } from '../client/odata-client.js';
 import { getAuthCacheScope } from '../auth/request-context.js';
-import { paginationShape, recordShape, criterionSchema } from './_schemas.js';
+import { paginationShape, recordShape, criterionSchema, matchBySchema, matchedByShape } from './_schemas.js';
 import { canonicalCollection, readSelect, presentRecords } from '../read/record-presentation.js';
 import { registerAnalyticsTools } from './analytics-tools.js';
 import { compactRecord } from '../utils/compact.js';
+import { assertGuid } from '../utils/odata.js';
+import { verifyRecordState } from '../read/record-verification.js';
+import {
+  READ_RESULT_BYTE_LIMIT,
+  serializedResultBytes,
+  serializedResultBytesAfterTextLimit,
+} from '../server/response-budget.js';
 
 const DEFAULT_TOP = 20;
 const DEFAULT_MAX_RECORDS = 1000;
+const AUTO_PAGE_CHUNK_SIZE = 100;
 const RESPONSE_BUDGET = 512 * 1024;
-const formats = ['compact', 'full', 'markdown'] as const;
 
 const pageInputs = {
   collection: z
@@ -68,7 +76,12 @@ const pageInputs = {
     .max(1000)
     .optional()
     .describe('Потолок записей ответа, по умолчанию 1000'),
-  format: z.enum(formats).optional().describe('compact (по умолчанию), markdown или full'),
+  format: z
+    .enum(READ_FORMATS)
+    .optional()
+    .describe(
+      'compact (по умолчанию), markdown, full или summary; summary не повторяет значения строк в content, записи остаются в structuredContent.'
+    ),
   resolve_lookups: z
     .boolean()
     .optional()
@@ -90,6 +103,29 @@ const presentationShape = {
   field_labels: z.record(z.string(), z.string()),
   warnings: z.array(z.string()),
 };
+
+const verificationInput = z.discriminatedUnion('operation', [
+  z.object({ operation: z.enum(['create', 'update']), expected: recordShape }),
+  z.object({ operation: z.literal('delete') }),
+]);
+
+const verificationShape = z.object({
+  operation: z.enum(['create', 'update', 'delete']),
+  observation: z.enum(['matches', 'differs', 'absent', 'unavailable']),
+  safe_to_retry: z.literal(false),
+  observed_at: z.string(),
+  differences: z
+    .array(
+      z.object({
+        field: z.string(),
+        expected: z.unknown(),
+        actual: z.unknown(),
+        actual_present: z.boolean(),
+      })
+    )
+    .optional(),
+  reason: z.string().optional(),
+});
 
 type PageParams = {
   collection?: string;
@@ -145,7 +181,7 @@ async function listRecords(
       params.resolve_references !== params.resolve_lookups
     )
       throw new BpmApiError('resolve_references и resolve_lookups заданы противоречиво.', 400);
-    const resolveReferences = params.resolve_references ?? params.resolve_lookups ?? true;
+    const requestedResolveReferences = params.resolve_references ?? params.resolve_lookups;
     const scope = `${services.config.bpmsoft_url}:${getAuthCacheScope() || services.config.username || ''}:records`;
     let state: CursorState;
     let usedFields: Array<{ input: string; resolved: string; caption?: string }> = [];
@@ -176,10 +212,19 @@ async function listRecords(
         expand: params.expand,
         count: params.count,
         top: params.top ?? DEFAULT_TOP,
+        autoPaginate: params.auto_paginate ?? false,
+        format: params.format,
+        resolveReferences: requestedResolveReferences ?? true,
         skip: params.skip ?? 0,
       };
     }
-    const limit = params.auto_paginate
+    const autoPaginate = params.auto_paginate ?? state.autoPaginate ?? false;
+    const format = params.format ?? state.format ?? 'compact';
+    const resolveReferences = requestedResolveReferences ?? state.resolveReferences ?? true;
+    state.autoPaginate = autoPaginate;
+    state.format = format;
+    state.resolveReferences = resolveReferences;
+    const limit = autoPaginate
       ? (params.max_records ?? DEFAULT_MAX_RECORDS)
       : Math.min(state.top ?? DEFAULT_TOP, params.max_records ?? DEFAULT_MAX_RECORDS);
     const query = {
@@ -215,11 +260,227 @@ async function listRecords(
         },
       };
     }
+    const makeReadOutput = (
+      pageRecords: Array<Record<string, unknown>>,
+      pageDisplayRecords: Array<Record<string, unknown>>,
+      pageLabels: Record<string, string>,
+      pageWarnings: string[],
+      countValue: number | undefined,
+      next: string | undefined,
+      cursorRowCount = pageRecords.length,
+      stopReason?: 'continuation_available' | 'record_limit_reached' | 'response_byte_budget'
+    ): CallToolResult => {
+      const hasMore = Boolean(next);
+      const cursor = buildNextCursor(
+        { ...state, autoPaginate, format, resolveReferences, nextLink: next },
+        cursorRowCount,
+        hasMore,
+        scope
+      );
+      const fieldNames = new Set(pageRecords.flatMap((record) => Object.keys(record)));
+      const labels = Object.fromEntries(
+        Object.entries(pageLabels).filter(([field]) => fieldNames.has(field))
+      );
+      const text = renderRecordsText(format === 'markdown' ? pageDisplayRecords : pageRecords, {
+        collection: state.collection,
+        format,
+        totalCount: countValue,
+        nextLink: next,
+        cursor,
+      });
+      return {
+        content: [
+          { type: 'text', text: pageWarnings.length ? `${text}\n\n${pageWarnings.join('\n')}` : text },
+        ],
+        structuredContent: {
+          collection: state.collection,
+          count: pageRecords.length,
+          total_count: countValue,
+          has_more: hasMore,
+          cursor,
+          records: pageRecords,
+          display_records: pageDisplayRecords,
+          field_labels: labels,
+          warnings: pageWarnings,
+          ...((stopReason ?? (hasMore ? 'continuation_available' : undefined))
+            ? { stop_reason: stopReason ?? 'continuation_available' }
+            : {}),
+          ...(search ? { compiled_filter: state.filter ?? '', used_fields: usedFields } : {}),
+        },
+      };
+    };
     const deps = {
       metadataManager: services.metadataManager,
       odataClient: services.odataClient,
       odataVersion: services.config.odata_version,
     };
+    if (autoPaginate) {
+      const maxRecords = params.max_records ?? DEFAULT_MAX_RECORDS;
+      let records: Array<Record<string, unknown>> = [];
+      let displayRecords: Array<Record<string, unknown>> = [];
+      let fieldLabels: Record<string, string> = {};
+      const pageWarnings = [...warnings];
+      let totalCount: number | undefined;
+      let output: CallToolResult | undefined;
+      let continuation = state.nextLink;
+      let firstRequest = !state.nextLink;
+      let nextChunkSize = Math.min(AUTO_PAGE_CHUNK_SIZE, maxRecords);
+      const visited = new Set<string>();
+
+      const fitsBudget = (candidate: CallToolResult): boolean =>
+        serializedResultBytes(candidate) <= READ_RESULT_BYTE_LIMIT &&
+        serializedResultBytesAfterTextLimit(candidate) <= READ_RESULT_BYTE_LIMIT;
+
+      while (records.length < maxRecords) {
+        const chunkSize = Math.min(nextChunkSize, maxRecords - records.length);
+        let requestUrl: string;
+        let response;
+        let chunkRecords: Array<Record<string, unknown>>;
+        if (firstRequest) {
+          const chunkQuery = {
+            $filter: state.filter,
+            $select: state.select,
+            $top: chunkSize + 1,
+            $skip: state.skip,
+            $orderby: state.orderby,
+            $expand: state.expand,
+            $count: state.count,
+          };
+          requestUrl = services.odataClient.previewCollectionUrl(state.collection, chunkQuery);
+          if (visited.has(requestUrl))
+            throw new BpmApiError('Сервер вернул повторяющуюся ссылку пагинации.', 502, state.collection);
+          visited.add(requestUrl);
+          const fetched = await getRecordsWithLookupNames(deps, state.collection, chunkQuery, {
+            autoPaginate: false,
+            maxRecords: chunkSize,
+            resolveLookups: resolveReferences,
+          });
+          response = fetched.response;
+          chunkRecords = fetched.records;
+          firstRequest = false;
+        } else {
+          if (!continuation) break;
+          requestUrl = continuation;
+          if (visited.has(requestUrl))
+            throw new BpmApiError('Сервер вернул повторяющуюся ссылку пагинации.', 502, state.collection);
+          visited.add(requestUrl);
+          response = await services.odataClient.getNextPage<Record<string, unknown>>(
+            state.collection,
+            requestUrl,
+            chunkSize
+          );
+          chunkRecords = resolveReferences
+            ? await enrichLookups(response.value, state.collection, deps)
+            : response.value;
+        }
+
+        pageWarnings.push(...(response.warnings ?? []));
+        if (totalCount === undefined) totalCount = response['@odata.count'];
+        if (state.count && totalCount === undefined)
+          totalCount = await services.odataClient.getCount(state.collection, state.filter, pageWarnings);
+        if (chunkRecords.length === 0) {
+          if (response['@odata.nextLink']) {
+            continuation = response['@odata.nextLink'];
+            continue;
+          }
+          output = makeReadOutput(records, displayRecords, fieldLabels, pageWarnings, totalCount, undefined);
+          break;
+        }
+
+        const presentation = await presentRecords(
+          services,
+          state.collection,
+          chunkRecords,
+          resolveReferences
+        );
+        pageWarnings.push(...presentation.warnings);
+        const combinedLabels = { ...fieldLabels, ...presentation.fieldLabels };
+        const makeCandidate = (accepted: number): CallToolResult => {
+          const pageRecords = [...records, ...chunkRecords.slice(0, accepted)];
+          const pageDisplayRecords = [...displayRecords, ...presentation.displayRecords.slice(0, accepted)];
+          const next =
+            accepted < chunkRecords.length
+              ? continuationForResult(response, accepted, requestUrl)
+              : response['@odata.nextLink'];
+          return makeReadOutput(
+            pageRecords,
+            pageDisplayRecords,
+            combinedLabels,
+            pageWarnings,
+            totalCount,
+            next
+          );
+        };
+
+        let candidate = makeCandidate(chunkRecords.length);
+        if (fitsBudget(candidate)) {
+          records = [...records, ...chunkRecords];
+          displayRecords = [...displayRecords, ...presentation.displayRecords];
+          fieldLabels = combinedLabels;
+          continuation = response['@odata.nextLink'];
+          output = candidate;
+          if (!continuation) break;
+          if (records.length >= maxRecords) {
+            output = {
+              ...candidate,
+              structuredContent: { ...candidate.structuredContent, stop_reason: 'record_limit_reached' },
+            };
+            break;
+          }
+          const usedBytes = serializedResultBytes(output);
+          const estimatedBytesPerRow = Math.max(1, Math.ceil(usedBytes / records.length));
+          const projectedRows = Math.max(
+            1,
+            Math.floor((READ_RESULT_BYTE_LIMIT - usedBytes) / estimatedBytesPerRow)
+          );
+          nextChunkSize = Math.min(AUTO_PAGE_CHUNK_SIZE, maxRecords - records.length, projectedRows);
+          continue;
+        }
+
+        let accepted = chunkRecords.length;
+        while (accepted > 1 && !fitsBudget(candidate)) {
+          accepted = Math.floor(accepted / 2);
+          candidate = makeCandidate(accepted);
+        }
+        if (!fitsBudget(candidate)) {
+          if (records.length === 0)
+            throw new BpmApiError(
+              'Запись слишком велика для ответа. Укажите необходимые поля в select.',
+              400,
+              state.collection
+            );
+          candidate = makeCandidate(0);
+          if (!fitsBudget(candidate))
+            throw new BpmApiError('Ответ слишком велик для лимита страницы.', 400, state.collection);
+          output = {
+            ...candidate,
+            structuredContent: { ...candidate.structuredContent, stop_reason: 'response_byte_budget' },
+          };
+          break;
+        }
+        let lower = accepted;
+        let upper = chunkRecords.length;
+        while (lower + 1 < upper) {
+          const middle = Math.floor((lower + upper) / 2);
+          const middleCandidate = makeCandidate(middle);
+          if (fitsBudget(middleCandidate)) {
+            lower = middle;
+            candidate = middleCandidate;
+          } else {
+            upper = middle;
+          }
+        }
+        output = {
+          ...candidate,
+          structuredContent: { ...candidate.structuredContent, stop_reason: 'response_byte_budget' },
+        };
+        break;
+      }
+
+      return (
+        output ?? makeReadOutput(records, displayRecords, fieldLabels, pageWarnings, totalCount, continuation)
+      );
+    }
     let result;
     let records: Array<Record<string, unknown>>;
     if (state.nextLink) {
@@ -231,14 +492,14 @@ async function listRecords(
       records = resolveReferences ? await enrichLookups(result.value, state.collection, deps) : result.value;
     } else {
       const fetched = await getRecordsWithLookupNames(deps, state.collection, query, {
-        autoPaginate: params.auto_paginate ?? false,
+        autoPaginate,
         maxRecords: limit,
         resolveLookups: resolveReferences,
       });
       result = fetched.response;
       records = fetched.records;
     }
-    if (Buffer.byteLength(JSON.stringify(result.value)) > RESPONSE_BUDGET)
+    if (!autoPaginate && Buffer.byteLength(JSON.stringify(result.value)) > RESPONSE_BUDGET)
       throw new BpmApiError(
         'Ответ слишком велик. Выберите необходимые поля через select или уменьшите top.',
         400,
@@ -250,35 +511,20 @@ async function listRecords(
       );
     const nextLink = result['@odata.nextLink'];
     warnings.push(...(result.warnings ?? []));
-    const hasMore = Boolean(nextLink);
-    const cursor = buildNextCursor({ ...state, nextLink }, result.value.length, hasMore, scope);
     const presentation = await presentRecords(services, state.collection, records, resolveReferences);
     warnings.push(...presentation.warnings);
     let totalCount = result['@odata.count'];
     if (state.count && totalCount === undefined)
       totalCount = await services.odataClient.getCount(state.collection, state.filter, warnings);
-    const text = renderRecordsText(params.format === 'markdown' ? presentation.displayRecords : records, {
-      collection: state.collection,
-      format: params.format ?? 'compact',
+    return makeReadOutput(
+      records,
+      presentation.displayRecords,
+      presentation.fieldLabels,
+      warnings,
       totalCount,
       nextLink,
-      cursor,
-    });
-    return {
-      content: [{ type: 'text', text: warnings.length ? `${text}\n\n${warnings.join('\n')}` : text }],
-      structuredContent: {
-        collection: state.collection,
-        count: result.value.length,
-        total_count: totalCount,
-        has_more: hasMore,
-        cursor,
-        records,
-        display_records: presentation.displayRecords,
-        field_labels: presentation.fieldLabels,
-        warnings,
-        ...(search ? { compiled_filter: state.filter ?? '', used_fields: usedFields } : {}),
-      },
-    };
+      result.value.length
+    );
   } catch (error) {
     return errorResult(error, params.collection);
   }
@@ -306,6 +552,9 @@ export function registerReadTools(server: McpServer, services: ServiceContainer)
         outputSchema: {
           collection: z.string(),
           ...paginationShape,
+          stop_reason: z
+            .enum(['continuation_available', 'record_limit_reached', 'response_byte_budget'])
+            .optional(),
           records: z.array(recordShape),
           ...presentationShape,
           dry_run: z.boolean().optional(),
@@ -341,20 +590,28 @@ export function registerReadTools(server: McpServer, services: ServiceContainer)
         annotations: meta.annotations,
         inputSchema: {
           collection: z.string().min(1),
-          id: z.string().min(1).describe('UUID или однозначное название записи.'),
+          id: z.string().min(1).optional().describe('UUID или однозначное название записи.'),
+          match_by: matchBySchema.optional(),
           select: z.string().max(8192).optional(),
           expand: z.string().max(8192).optional(),
           resolve_references: z.boolean().optional(),
           resolve_lookups: z.boolean().optional(),
+          verify: verificationInput
+            .optional()
+            .describe(
+              'Только чтение по точным UUID и имени коллекции: сверить create/update expected либо проверить отсутствующий после delete. Не повторяет запись.'
+            ),
         },
         outputSchema: {
           collection: z.string(),
           id: z.string(),
-          record: recordShape,
-          display_record: recordShape,
-          field_labels: z.record(z.string(), z.string()),
-          warnings: z.array(z.string()),
+          record: recordShape.optional(),
+          display_record: recordShape.optional(),
+          field_labels: z.record(z.string(), z.string()).optional(),
+          warnings: z.array(z.string()).optional(),
           etag: z.string().optional(),
+          verification: verificationShape.optional(),
+          matched_by: matchedByShape.optional(),
         },
       },
       async (params): Promise<CallToolResult> => {
@@ -362,10 +619,78 @@ export function registerReadTools(server: McpServer, services: ServiceContainer)
         try {
           await services.authManager.ensureAuthenticated();
           const warnings: string[] = [];
-          const resolved = await resolveCollection(services, params.collection, { autoCorrect: true });
-          const collection = resolved.name;
-          if (resolved.note) warnings.push(resolved.note);
-          const { id } = await resolveRecordId(services, collection, params.id);
+          let collection: string;
+          let id: string;
+          let matchedBy: Awaited<ReturnType<typeof resolveRecordTarget>>['matched_by'];
+          let verification: Awaited<ReturnType<typeof verifyRecordState>> | undefined;
+          if (params.verify) {
+            if (params.match_by !== undefined)
+              throw new BpmApiError(
+                'verify требует точный UUID в id и не совмещается с match_by.',
+                400,
+                params.collection
+              );
+            if (!params.id)
+              throw new BpmApiError('Для verify передайте точный UUID в id.', 400, params.collection);
+            if (params.select !== undefined || params.expand !== undefined)
+              throw new BpmApiError(
+                'select и expand нельзя совмещать с verify: проверка читает только поля expected.',
+                400,
+                params.collection
+              );
+            assertGuid(params.id, 'id');
+            const resolved = await resolveCollection(services, params.collection);
+            if (resolved.name !== params.collection)
+              throw new BpmApiError(
+                'Для verify передайте точное имя коллекции без автоисправлений.',
+                400,
+                params.collection
+              );
+            collection = params.collection;
+            id = params.id;
+            verification = await verifyRecordState(services, collection, id, params.verify);
+            const observationText =
+              verification.observation === 'absent'
+                ? `Запись ${collection}(${id}) сейчас отсутствует.`
+                : verification.observation === 'unavailable'
+                  ? `Текущее состояние недоступно: ${verification.reason ?? 'причина неизвестна'}.`
+                  : verification.observation === 'matches'
+                    ? 'Указанные поля совпадают с expected на момент чтения.'
+                    : (verification.reason ?? 'Указанные поля отличаются от expected.');
+            const differenceLines = (verification.differences ?? []).map(
+              (difference) =>
+                `• ${difference.field}: expected=${JSON.stringify(difference.expected)}; actual=${difference.actual_present ? JSON.stringify(difference.actual) : '<отсутствует в ответе>'}`
+            );
+            return {
+              content: [
+                {
+                  type: 'text',
+                  text: [
+                    `Проверка ${verification.operation}: ${verification.observation}. ${observationText}`,
+                    ...differenceLines,
+                    'Проверка фиксирует только текущее наблюдение и не доказывает, что его вызвала предыдущая запись. Автоматически повторять запись нельзя.',
+                  ].join('\n'),
+                },
+              ],
+              structuredContent: { collection, id, verification },
+            };
+          } else {
+            if ((params.id === undefined) === (params.match_by === undefined))
+              throw new BpmApiError(
+                'Передайте ровно один параметр: id или match_by.',
+                400,
+                params.collection
+              );
+            const resolved = await resolveCollection(services, params.collection, { autoCorrect: true });
+            collection = resolved.name;
+            if (resolved.note) warnings.push(resolved.note);
+            const target = await resolveRecordTarget(services, collection, {
+              id: params.id,
+              match_by: params.match_by,
+            });
+            id = target.id;
+            matchedBy = target.matched_by;
+          }
           const record = await getRecordWithLookupNames(
             {
               metadataManager: services.metadataManager,
@@ -398,9 +723,16 @@ export function registerReadTools(server: McpServer, services: ServiceContainer)
                 type: 'text',
                 text: [
                   `Запись ${collection}(${id}):`,
-                  ...Object.entries(compactRecord(record)).map(([key, value]) => `${key}: ${String(value)}`),
+                  ...Object.entries(compactRecord(presentation.displayRecords[0])).map(
+                    ([key, value]) => `${key}: ${String(value)}`
+                  ),
                   ...warnings,
                   ...presentation.warnings,
+                  ...(verification
+                    ? [
+                        `Проверка ${verification.operation}: ${verification.observation}; автоматически повторять нельзя.`,
+                      ]
+                    : []),
                 ].join('\n'),
               },
             ],
@@ -411,6 +743,8 @@ export function registerReadTools(server: McpServer, services: ServiceContainer)
               display_record: presentation.displayRecords[0],
               field_labels: presentation.fieldLabels,
               warnings: warnings.concat(presentation.warnings),
+              ...(matchedBy ? { matched_by: matchedBy } : {}),
+              ...(verification ? { verification } : {}),
               ...(typeof record['@odata.etag'] === 'string' ? { etag: record['@odata.etag'] } : {}),
             },
           };

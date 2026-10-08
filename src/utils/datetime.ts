@@ -49,6 +49,20 @@ export function isValidTimeZone(timeZone: string): boolean {
   }
 }
 
+/** Parse OData date values, including the legacy /Date(ms)/ representation. */
+export function parseDateValue(raw: unknown): Date | null {
+  if (raw === null || raw === undefined || raw === '') return null;
+  if (typeof raw === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(raw)) {
+    const calendarDate = new Date(`${raw}T00:00:00Z`);
+    return !Number.isNaN(calendarDate.getTime()) && calendarDate.toISOString().slice(0, 10) === raw
+      ? calendarDate
+      : null;
+  }
+  const legacy = typeof raw === 'string' ? /^\/Date\((-?\d+)/.exec(raw) : null;
+  const date = legacy ? new Date(Number(legacy[1])) : new Date(raw as string);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
 /** Смещение пояса от UTC в минутах на конкретный момент (с учётом DST). */
 export function zoneOffsetMinutes(instant: Date, timeZone: string): number {
   // Приём без зависимостей: форматируем момент как «локальное» время зоны и

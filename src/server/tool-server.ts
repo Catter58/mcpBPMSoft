@@ -22,6 +22,10 @@ import { registerWhoamiTool } from '../tools/whoami-tool.js';
 import { registerOperationTool } from '../tools/operation-tool.js';
 
 type RegistrationKind = 'registerTool' | 'registerPrompt' | 'registerResource';
+
+export const SERVER_INSTRUCTIONS =
+  'Карточка: bpm_record_card; запись: bpm_get_record; поиск: bpm_search_records; счётчики: bpm_count_records; сводки: bpm_aggregate. Поля: bpm_get_schema. Create: bpm_create_record; массовое создание: bpm_batch_create; массовые изменения/удаления: bpm_batch_update/bpm_batch_delete. По фильтру: bpm_update_by_filter/bpm_delete_by_filter. Не пишите OData вручную. При неоднозначном выборе уточняйте. dry_run не меняет запись: устраните blockers и примените normalized_args; после update повторяйте абсолютный data, не operations. Массовые изменения сначала покажите как план и получите явное подтверждение. Связанные строки передавайте в steps, {$ref: alias} — только в lookup.';
+
 interface Registration {
   kind: RegistrationKind;
   args: unknown[];
@@ -33,7 +37,10 @@ export function createToolServer(
   services: ServiceContainer,
   options: { allowEnvCreds?: boolean; onInitialized?: (services: ServiceContainer) => void } = {}
 ): McpServer {
-  const server = new McpServer({ name: 'mcp-bpmsoft-odata', version: SERVER_VERSION });
+  const server = new McpServer(
+    { name: 'mcp-bpmsoft-odata', version: SERVER_VERSION },
+    { instructions: SERVER_INSTRUCTIONS }
+  );
   const key = `${!!options.allowEnvCreds}:${!!services.config?.journal_root}`;
   let cache = definitions.get(services);
   if (!cache) {

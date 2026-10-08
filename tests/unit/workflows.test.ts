@@ -1,5 +1,8 @@
 /** Exercise registered workflow handlers, including validation and partial writes. */
 import { describe, expect, it, vi } from 'vitest';
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import type { ServiceContainer } from '../../src/tools/init-tool.js';
 import type { EntityMetadata, EntityProperty } from '../../src/types/index.js';
@@ -11,6 +14,7 @@ import { registerSetStatusTool } from '../../src/workflows/set-status.js';
 import { ODataClient } from '../../src/client/odata-client.js';
 import { buildConfig } from '../../src/config.js';
 import { MockHttpClient } from '../setup/mock-http-client.js';
+import { prepareCreateIntent } from '../../src/workflows/create-preparation.js';
 
 const A = 'aaaaaaaa-1111-4111-8111-111111111111';
 const B = 'bbbbbbbb-2222-4222-8222-222222222222';
@@ -45,11 +49,15 @@ function setup() {
     Activity: metadata('Activity', [
       property('Title'),
       property('Notes'),
+      property('StartDate', 'Edm.DateTimeOffset'),
       property('DueDate', 'Edm.DateTimeOffset'),
       property('OwnerId', 'Edm.Guid', 'Contact'),
       property('TypeId', 'Edm.Guid', 'ActivityType'),
+      property('ActivityCategoryId', 'Edm.Guid', 'ActivityCategory'),
       property('AccountId', 'Edm.Guid', 'Account'),
     ]),
+    ActivityCategory: metadata('ActivityCategory', [property('ActivityTypeId', 'Edm.Guid', 'ActivityType')]),
+    ActivityType: metadata('ActivityType', [property('Name')]),
     Opportunity: metadata('Opportunity', [property('StatusId', 'Edm.Guid', 'OpportunityStatus')]),
   };
   const createRecord = vi.fn(
@@ -71,12 +79,25 @@ function setup() {
     updateRecord: vi.fn(async () => undefined),
   };
   const lookupResolver = {
+    createResolutionContext: vi.fn((now: Date = new Date('2026-10-07T11:42:00.000Z')) => ({
+      now,
+      getCurrentUser: vi.fn(async () => ({ userId: A, contactId: A, timeZoneId: 'Europe/Moscow' })),
+      getTimeZone: vi.fn(async () => ({ timeZone: 'Europe/Moscow', source: 'profile' as const })),
+    })),
     resolve: vi.fn(async () => ({ resolved: false, matchCount: 0, candidates: [] })),
     resolveDataLookups: vi.fn(async (collection: string, data: Record<string, unknown>) => {
       for (const key of Object.keys(data))
         if (!metas[collection].properties.some((p) => p.name === key))
           throw new BpmApiError(`Unknown field ${key}`, 400, collection);
-      return { data: { ...data }, notes: [] };
+      const normalized = { ...data };
+      if (
+        collection === 'Activity' &&
+        typeof normalized.OwnerId === 'string' &&
+        normalized.OwnerId !== A &&
+        normalized.OwnerId !== B
+      )
+        normalized.OwnerId = A;
+      return { data: normalized, notes: [], coerced: [] };
     }),
   };
   const services = {
@@ -345,6 +366,137 @@ describe('registered contact workflow', () => {
 });
 
 describe('registered activity workflow', () => {
+  it('preserves distinct Activity properties when the preferred adapter field also exists', async () => {
+    const env = setup();
+    env.metas.Activity.properties.push(property('Subject'));
+    const prepared = await prepareCreateIntent(
+      env.services,
+      'Activity',
+      { Subject: 'Secondary subject' },
+      env.lookupResolver.createResolutionContext()
+    );
+    expect(prepared.data).toMatchObject({ Subject: 'Secondary subject' });
+    expect(prepared.data.Title).toBeUndefined();
+  });
+
+  it('generic Activity preparation preserves null values and resolves captions before date scheduling', async () => {
+    const env = setup();
+    env.metas.Activity.properties.find((p) => p.name === 'Title')!.required = true;
+    vi.mocked(env.services.metadataManager.resolveFieldReference).mockImplementation(
+      async (_collection, key) => ({
+        name: key === 'Заголовок' || key === 'Subject' ? 'Title' : key === 'Срок' ? 'DueDate' : key,
+      })
+    );
+    const context = env.lookupResolver.createResolutionContext();
+    const nullTitle = await prepareCreateIntent(env.services, 'Activity', { Title: null }, context);
+    expect(nullTitle.data.Title).toBeNull();
+    expect(
+      nullTitle.blockers.some((blocker) => blocker.missing_fields?.some((field) => field.name === 'Title'))
+    ).toBe(true);
+
+    const collision = await prepareCreateIntent(
+      env.services,
+      'Activity',
+      { Title: 'A', Subject: 'B' },
+      context
+    );
+    expect(collision.blockers.some((blocker) => /передано несколько раз/.test(blocker.message))).toBe(true);
+
+    const dated = await prepareCreateIntent(env.services, 'Activity', { Срок: 'завтра' }, context);
+    expect(dated.data.DueDate).toBe('2026-10-08T06:30:00.000Z');
+    expect(dated.source_timezone).toEqual({ time_zone: 'Europe/Moscow', source: 'profile' });
+  });
+  it('returns normalized dry_run output without creating an Activity', async () => {
+    const env = setup();
+    const result = await env.call('bpm_log_activity', { dry_run: true, title: 'Call' });
+    expect(result.isError).toBe(false);
+    expect(result.structuredContent).toMatchObject({
+      collection: 'Activity',
+      dry_run: true,
+      ready: true,
+      blockers: [],
+      normalized_args: {
+        title: 'Call',
+        start_date: expect.any(String),
+        due_date: expect.any(String),
+        owner_name: A,
+        idempotency_key: expect.any(String),
+      },
+      planned_id: expect.any(String),
+      source_timezone: { time_zone: 'Europe/Moscow', source: 'profile' },
+    });
+    expect(env.odataClient.createRecord).not.toHaveBeenCalled();
+  });
+  it('returns a ready dry_run through MCP output-schema validation', async () => {
+    const env = setup();
+    const server = new McpServer({ name: 'activity-output-schema-test', version: '1.0.0' });
+    registerLogActivityTool(server, env.services);
+    const client = new Client({ name: 'activity-output-schema-client', version: '1.0.0' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([client.connect(clientTransport), server.connect(serverTransport)]);
+    try {
+      const result = await client.callTool({
+        name: 'bpm_log_activity',
+        arguments: { dry_run: true, title: 'Call' },
+      });
+      expect(result.isError).not.toBe(true);
+      expect(result.structuredContent).toMatchObject({
+        collection: 'Activity',
+        dry_run: true,
+        ready: true,
+        blockers: [],
+        normalized_args: {
+          title: 'Call',
+          idempotency_key: expect.any(String),
+        },
+      });
+      expect(env.odataClient.createRecord).not.toHaveBeenCalled();
+    } finally {
+      await client.close();
+    }
+  });
+
+  it('returns a missing-title dry_run blocker and does not create an Activity', async () => {
+    const env = setup();
+    const result = await env.call('bpm_log_activity', { dry_run: true });
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toMatchObject({ dry_run: true, ready: false });
+    expect(result.structuredContent?.blockers).toEqual([
+      expect.objectContaining({ code: 'missing_required_fields' }),
+    ]);
+    expect(env.odataClient.createRecord).not.toHaveBeenCalled();
+  });
+
+  it('preserves submitted values in normalized_args when date preparation blocks', async () => {
+    const env = setup();
+    const result = await env.call('bpm_log_activity', {
+      dry_run: true,
+      title: 'Call',
+      start_date: 'not-a-date',
+      owner_name: 'Ivan',
+      idempotency_key: 'activity-invalid-date',
+    });
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent?.normalized_args).toMatchObject({
+      title: 'Call',
+      start_date: 'not-a-date',
+      owner_name: 'Ivan',
+      idempotency_key: 'activity-invalid-date',
+    });
+    expect(result.structuredContent?.normalized_args).not.toHaveProperty('dry_run');
+    expect(env.odataClient.createRecord).not.toHaveBeenCalled();
+  });
+
+  it('returns a structured missing_fields blocker for an absent title and creates nothing', async () => {
+    const env = setup();
+    const result = await env.call('bpm_log_activity', {});
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent?.missing_fields).toEqual([
+      expect.objectContaining({ name: 'Title', type: 'Edm.String' }),
+    ]);
+    expect(env.odataClient.createRecord).not.toHaveBeenCalled();
+  });
+
   it('selects the primary Contact relation among owner, author and custom Contact fields', async () => {
     const env = setup();
     env.metas.Activity.properties.push(
@@ -360,7 +512,7 @@ describe('registered activity workflow', () => {
     });
     expect(result.isError).toBeUndefined();
     expect(result.structuredContent?.used_fields).toMatchObject({ owner: 'OwnerId', relation: 'ContactId' });
-    expect(env.odataClient.createRecord.mock.calls[0][1]).toMatchObject({ OwnerId: 'Ivan', ContactId: A });
+    expect(env.odataClient.createRecord.mock.calls[0][1]).toMatchObject({ OwnerId: A, ContactId: A });
   });
   it.each(['legacy', 'navigation'] as const)('selects the canonical %s Contact relation', async (mode) => {
     const env = setup();
@@ -415,15 +567,43 @@ describe('registered activity workflow', () => {
     expect(env.odataClient.createRecord).not.toHaveBeenCalled();
     expect(conflict.structuredContent?.error).toContain('разные значения');
   });
+  it('validates a related Activity type against the explicit category before writing', async () => {
+    const env = setup();
+    env.odataClient.getRecords.mockResolvedValue({
+      value: [{ Id: B, ActivityTypeId: B }],
+    } as never);
+    const result = await env.call('bpm_log_activity', {
+      title: 'Call',
+      activity_type: A,
+      category: B,
+      start_date: '2026-10-08T09:00:00+03:00',
+      end_date: '2026-10-08T09:30:00+03:00',
+      related_collection: 'ActivityType',
+      related_id: A,
+      related_field: 'TypeId',
+    });
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent?.error).toContain('Выбранная категория не относится');
+    expect(env.lookupResolver.resolveDataLookups).toHaveBeenCalledWith(
+      'Activity',
+      expect.objectContaining({ TypeId: A, ActivityCategoryId: B }),
+      expect.any(Object)
+    );
+    expect(env.odataClient.createRecord).not.toHaveBeenCalled();
+  });
   it('passes owner and type through the same write resolution policy', async () => {
     const env = setup();
     const result = await env.call('bpm_log_activity', { title: 'Call', owner_name: 'Ivan', type: 'Call' });
     expect(result.isError).toBeUndefined();
-    expect(env.lookupResolver.resolveDataLookups).toHaveBeenCalledWith('Activity', {
-      Title: 'Call',
-      OwnerId: 'Ivan',
-      TypeId: 'Call',
-    });
+    expect(env.lookupResolver.resolveDataLookups).toHaveBeenLastCalledWith(
+      'Activity',
+      expect.objectContaining({
+        Title: 'Call',
+        OwnerId: A,
+        ActivityCategoryId: 'Call',
+      }),
+      expect.any(Object)
+    );
   });
   it('does not create when owner resolution is ambiguous', async () => {
     const env = setup();

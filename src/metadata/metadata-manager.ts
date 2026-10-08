@@ -14,7 +14,13 @@ import { tmpdir } from 'node:os';
 
 import { XMLParser } from 'fast-xml-parser';
 
-import type { BpmConfig, EntityMetadata, EntityProperty, ODataVersion } from '../types/index.js';
+import type {
+  BpmConfig,
+  EntityMetadata,
+  EntityNavigationProperty,
+  EntityProperty,
+  ODataVersion,
+} from '../types/index.js';
 import type { ODataCollectionResponse } from '../types/index.js';
 import { ODataClient } from '../client/odata-client.js';
 import { HttpClient } from '../client/http-client.js';
@@ -37,6 +43,7 @@ interface EdmxNavigationProperty {
   '@_Type'?: string;
   '@_Relationship'?: string;
   '@_ToRole'?: string;
+  '@_Partner'?: string;
   ReferentialConstraint?: { '@_Property'?: string } | Array<{ '@_Property'?: string }>;
 }
 
@@ -209,6 +216,17 @@ export class MetadataManager {
       displayColumn: prop.lookupDisplayColumn || 'Name',
       navigationProperty: prop.navigationProperty,
     };
+  }
+
+  /** A collection navigation is usable only when EDMX resolves it to a published entity set. */
+  async getCollectionNavigationInfo(
+    collection: string,
+    navigationName: string
+  ): Promise<EntityNavigationProperty | null> {
+    const metadata = await this.getEntityMetadata(collection);
+    return (
+      metadata.navigationProperties?.find((item) => item.name === navigationName && item.isCollection) ?? null
+    );
   }
 
   getLookupFieldName(baseName: string): string {
@@ -581,6 +599,11 @@ export class MetadataManager {
 
     const properties: EntityProperty[] = [];
     const lookupFields: string[] = [];
+    const navigationProperties: EntityNavigationProperty[] = [];
+    const keyFields = toArray(entityType?.Key?.PropertyRef).flatMap((ref) =>
+      ref['@_Name'] ? [ref['@_Name']] : []
+    );
+    const keyFieldSet = new Set(keyFields);
 
     if (entityType) {
       // Pass 1: regular properties
@@ -588,7 +611,9 @@ export class MetadataManager {
         const name = p['@_Name'];
         const type = p['@_Type'];
         if (!name || !type) continue;
-        const nullable = p['@_Nullable'] !== 'false';
+        // CSDL key declarations are authoritative: key properties are non-nullable,
+        // even if a platform omits (or incorrectly emits) Nullable on the Property.
+        const nullable = keyFieldSet.has(name) ? false : p['@_Nullable'] !== 'false';
 
         let isLookup = false;
         let lookupCollection: string | undefined;
@@ -613,6 +638,33 @@ export class MetadataManager {
         const association = np['@_Relationship'] ? meta.associations.get(np['@_Relationship']) : undefined;
         const targetEnd = toArray(association?.End).find((end) => end['@_Role'] === np['@_ToRole']);
         const navType = np['@_Type'] || targetEnd?.['@_Type'];
+        const isCollection = this.odataVersion === 4 && !!navType?.startsWith('Collection(');
+        if (navName && navType && isCollection && isSafeIdentifier(navName)) {
+          const targetType = navType.startsWith('Collection(')
+            ? /^Collection\((.+)\)$/.exec(navType)?.[1]
+            : navType;
+          const binding = toArray(meta.entitySetDefinitions.get(collection)?.NavigationPropertyBinding).find(
+            (item) => item['@_Path'] === navName
+          );
+          const targetSets = targetType
+            ? Array.from(meta.entitySets).filter(([, type]) => type === targetType)
+            : [];
+          const boundTarget = binding?.['@_Target'];
+          const boundTargetType = boundTarget ? meta.entitySets.get(boundTarget) : undefined;
+          const targetCollection =
+            boundTarget && boundTargetType === targetType
+              ? boundTarget
+              : !boundTarget && targetSets.length === 1
+                ? targetSets[0][0]
+                : undefined;
+          if (targetCollection && meta.entitySets.has(targetCollection))
+            navigationProperties.push({
+              name: navName,
+              targetCollection,
+              isCollection: true,
+              ...(np['@_Partner'] ? { partner: np['@_Partner'] } : {}),
+            });
+        }
         if (
           !navName ||
           !navType ||
@@ -669,10 +721,9 @@ export class MetadataManager {
     return {
       name: shortTypeName,
       collectionName: collection,
-      keyFields: toArray(entityType.Key?.PropertyRef).flatMap((ref) =>
-        ref['@_Name'] ? [ref['@_Name']] : []
-      ),
+      keyFields,
       properties,
+      navigationProperties,
       lookupFields,
       cachedAt: Date.now(),
     };

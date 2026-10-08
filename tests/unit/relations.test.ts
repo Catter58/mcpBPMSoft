@@ -7,6 +7,7 @@ import { MetadataManager } from '../../src/metadata/metadata-manager.js';
 import { findPaths, registerRelationsTool } from '../../src/tools/relations-tool.js';
 import type { ServiceContainer } from '../../src/tools/init-tool.js';
 import type { BpmConfig } from '../../src/types/index.js';
+import { resetServerCapabilities } from '../../src/utils/server-capabilities.js';
 
 const NS = 'BPMSoft.Configuration.OData';
 
@@ -14,7 +15,7 @@ function entity(name: string, lookups: Array<[string, string]>, extra = ''): str
   const props = lookups.map(([nav]) => `<Property Name="${nav}Id" Type="Edm.Guid"/>`).join('');
   const navs = lookups.map(([nav, to]) => `<NavigationProperty Name="${nav}" Type="${NS}.${to}"/>`).join('');
   return (
-    `<EntityType Name="${name}"><Property Name="Id" Type="Edm.Guid"/><Property Name="Name" Type="Edm.String"/>` +
+    `<EntityType Name="${name}"><Key><PropertyRef Name="Id"/></Key><Property Name="Id" Type="Edm.Guid"/><Property Name="Name" Type="Edm.String"/>` +
     `<Property Name="CreatedById" Type="Edm.Guid"/><NavigationProperty Name="CreatedBy" Type="${NS}.Contact"/>` +
     `${props}${navs}${extra}</EntityType>`
   );
@@ -28,7 +29,7 @@ const TYPES: Array<[string, Array<[string, string]>, string?]> = [
       ['City', 'City'],
       ['Owner', 'Contact'],
     ],
-    `<NavigationProperty Name="ActivityCollectionByContact" Type="Collection(${NS}.Activity)"/>`,
+    `<NavigationProperty Name="ActivityCollectionByContact" Type="Collection(${NS}.Activity)" Partner="Contact"/>`,
   ],
   ['Account', [['Owner', 'Contact']]],
   ['City', []],
@@ -254,7 +255,11 @@ describe('OData v3: граф по Association и пути с FK-колонкой
 });
 
 describe('bpm_get_relations handler', () => {
-  async function call(args: Record<string, unknown>, v3 = false) {
+  async function call(
+    args: Record<string, unknown>,
+    v3 = false,
+    overrides: { getRecord?: ReturnType<typeof vi.fn>; getRecords?: ReturnType<typeof vi.fn> } = {}
+  ) {
     const { mgr } = makeManager(v3);
     const server = { registerTool: vi.fn() };
     const services = {
@@ -262,13 +267,40 @@ describe('bpm_get_relations handler', () => {
       authManager: { ensureAuthenticated: vi.fn(async () => undefined) },
       metadataManager: {
         getLookupGraph: () => mgr.getLookupGraph(),
-        getEntityMetadata: vi.fn(async () => ({
-          properties: [{ name: 'AccountId', caption: 'Контрагент' }],
-        })),
+        resolveFieldReference: (...args: Parameters<typeof mgr.resolveFieldReference>) =>
+          mgr.resolveFieldReference(...args),
+        getCollectionNavigationInfo: (...args: Parameters<typeof mgr.getCollectionNavigationInfo>) =>
+          mgr.getCollectionNavigationInfo(...args),
+        getLookupInfo: (...args: Parameters<typeof mgr.getLookupInfo>) => mgr.getLookupInfo(...args),
+        getEntityMetadata: vi.fn(async (collection: string) => {
+          const metadata = await mgr.getEntityMetadata(collection);
+          return {
+            ...metadata,
+            properties: metadata.properties.map((property) =>
+              property.name === 'AccountId' ? { ...property, caption: 'Контрагент' } : property
+            ),
+          };
+        }),
         resolveCollectionReference: vi.fn(async (q: string) => ({
           name: q === 'Контакт' ? 'Contact' : q === 'Сделка' ? 'Opportunity' : q,
         })),
       },
+      config: { bpmsoft_url: 'https://bpm.test', username: 'unit-test', odata_version: v3 ? 3 : 4 },
+      odataClient: {
+        getRecord:
+          overrides.getRecord ??
+          vi.fn(async (_collection: string, _id: string, options?: Record<string, unknown>) => {
+            if (options?.$expand)
+              return { Id: '11111111-1111-4111-8111-111111111111', ActivityCollectionByContact: [] };
+            return {
+              Id: '11111111-1111-4111-8111-111111111111',
+              AccountId: '22222222-2222-4222-8222-222222222222',
+            };
+          }),
+        getRecords: overrides.getRecords ?? vi.fn(async () => ({ value: [], '@odata.nextLink': undefined })),
+      },
+      lookupResolver: { resolve: vi.fn() },
+      currentUser: { get: vi.fn(async () => ({ timeZoneId: 'Europe/Moscow' })) },
     } as unknown as ServiceContainer;
     registerRelationsTool(server as never, services);
     const handler = server.registerTool.mock.calls[0][2] as (a: unknown) => Promise<{
@@ -332,5 +364,154 @@ describe('bpm_get_relations handler', () => {
       'OpportunityCollection',
     ]);
     expect(s.paths[0].hint).toBe('ищите в ContactCollection по полю AccountId = <Id AccountCollection>');
+  });
+
+  it('проверяет прямой исходящий lookup точным чтением и возвращает готовый read-вызов', async () => {
+    resetServerCapabilities();
+    const getRecord = vi.fn(async () => ({
+      Id: '11111111-1111-4111-8111-111111111111',
+      AccountId: '22222222-2222-4222-8222-222222222222',
+    }));
+    const res = await call(
+      {
+        collection: 'Contact',
+        target: 'Account',
+        direction: 'out',
+        probe_record_id: '11111111-1111-4111-8111-111111111111',
+      },
+      false,
+      { getRecord }
+    );
+    const probe = res.structuredContent.read_probe as {
+      root_record: string;
+      routes: Array<Record<string, unknown>>;
+    };
+    expect(probe.root_record).toBe('found');
+    expect(probe.routes[0].capability).toBe('supported');
+    expect(probe.routes[0].next_read).toEqual({
+      tool: 'bpm_get_record',
+      arguments: {
+        collection: 'Contact',
+        id: '11111111-1111-4111-8111-111111111111',
+        select: 'Id,AccountId',
+        resolve_lookups: false,
+      },
+    });
+    expect(getRecord).toHaveBeenCalledTimes(2); // корневая запись и единственный целевой lookup
+  });
+
+  it('оставляет сетевой сбой read path inconclusive и повторяет проверку при следующем вызове', async () => {
+    resetServerCapabilities();
+    const networkError = Object.assign(new Error('network reset'), { httpStatus: 0 });
+    const getRecord = vi.fn(async (_collection: string, _id: string, options?: Record<string, unknown>) => {
+      if (options?.$select === 'Id') return { Id: '11111111-1111-4111-8111-111111111111' };
+      throw networkError;
+    });
+    const args = {
+      collection: 'Contact',
+      target: 'Account',
+      direction: 'out',
+      probe_record_id: '11111111-1111-4111-8111-111111111111',
+    };
+    const first = await call(args, false, { getRecord });
+    const firstProbe = first.structuredContent.read_probe as { routes: Array<Record<string, unknown>> };
+    const lookupAttempt = (
+      firstProbe.routes[0].attempts as Array<{ strategy: string; capability: string }>
+    )[0];
+    expect(lookupAttempt).toEqual({
+      strategy: 'lookup_id',
+      capability: 'inconclusive',
+      http_status: 0,
+      observation: 'inconclusive',
+    });
+    const callsAfterFirst = getRecord.mock.calls.length;
+    await call(args, false, { getRecord });
+    expect(getRecord.mock.calls.length).toBeGreaterThan(callsAfterFirst);
+  });
+
+  it('различает пустой GUID и некорректное значение исходящего lookup', async () => {
+    resetServerCapabilities();
+    const recordId = '11111111-1111-4111-8111-111111111111';
+    const empty = await call(
+      { collection: 'Contact', target: 'Account', direction: 'out', probe_record_id: recordId },
+      false,
+      {
+        getRecord: vi.fn(async (_collection: string, _id: string, options?: Record<string, unknown>) =>
+          options?.$select === 'Id'
+            ? { Id: recordId }
+            : { Id: recordId, AccountId: '00000000-0000-0000-0000-000000000000' }
+        ),
+      }
+    );
+    const emptyProbe = empty.structuredContent.read_probe as {
+      routes: Array<{ capability: string; observation: string; next_read?: unknown }>;
+    };
+    expect(emptyProbe.routes[0]).toMatchObject({
+      capability: 'supported',
+      observation: 'no_related_record',
+    });
+    expect(emptyProbe.routes[0].next_read).toBeUndefined();
+
+    resetServerCapabilities();
+    const malformed = await call(
+      { collection: 'Contact', target: 'Account', direction: 'out', probe_record_id: recordId },
+      false,
+      {
+        getRecord: vi.fn(async (_collection: string, _id: string, options?: Record<string, unknown>) => {
+          if (options?.$select === 'Id' && !options.$expand) return { Id: recordId };
+          if (options?.$expand) return { Id: recordId, Account: 'not-an-expanded-record' };
+          return { Id: recordId, AccountId: 'not-a-guid' };
+        }),
+      }
+    );
+    const malformedProbe = malformed.structuredContent.read_probe as {
+      routes: Array<{ capability: string; attempts: Array<{ strategy: string; capability: string }> }>;
+    };
+    expect(malformedProbe.routes[0].capability).toBe('inconclusive');
+    expect(malformedProbe.routes[0].attempts.map((attempt) => attempt.capability)).toEqual([
+      'inconclusive',
+      'inconclusive',
+    ]);
+  });
+
+  it('использует incoming expand и exists только для точного EDMX Partner', async () => {
+    resetServerCapabilities();
+    const networkError = Object.assign(new Error('network reset'), { httpStatus: 0 });
+    const unsupportedExpand = Object.assign(new Error('Unknown navigation property'), { httpStatus: 400 });
+    const getRecords = vi
+      .fn()
+      .mockRejectedValueOnce(networkError)
+      .mockResolvedValueOnce({ value: [{ Id: '11111111-1111-4111-8111-111111111111' }] });
+    const res = await call(
+      {
+        collection: 'Contact',
+        target: 'Activity',
+        direction: 'in',
+        probe_record_id: '11111111-1111-4111-8111-111111111111',
+      },
+      false,
+      {
+        getRecords,
+        getRecord: vi.fn(async (_collection: string, _id: string, options?: Record<string, unknown>) => {
+          if (options?.$expand) throw unsupportedExpand;
+          return { Id: '11111111-1111-4111-8111-111111111111' };
+        }),
+      }
+    );
+    const probe = res.structuredContent.read_probe as {
+      routes: Array<{
+        collection_navigation?: string;
+        attempts: Array<{ strategy: string; capability: string }>;
+      }>;
+    };
+    const activityRoute = probe.routes.find(
+      (route) => route.collection_navigation === 'ActivityCollectionByContact'
+    );
+    expect(activityRoute?.attempts.map((attempt) => [attempt.strategy, attempt.capability])).toEqual([
+      ['filter', 'inconclusive'],
+      ['expand', 'unsupported'],
+      ['exists', 'supported'],
+    ]);
+    expect(getRecords).toHaveBeenCalledTimes(2);
   });
 });

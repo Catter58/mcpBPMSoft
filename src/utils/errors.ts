@@ -44,7 +44,12 @@ export class BpmApiError extends Error {
       collection: this.collection,
       details: this.details,
       suggestions: this.suggestions,
-      next_steps: this.nextSteps ?? defaultNextSteps(this.httpStatus, this.collection),
+      next_steps:
+        this.code === 'outcome_unknown'
+          ? [
+              `Проверьте текущее состояние через bpm_get_records${this.collection ? `(${this.collection})` : ''} перед любым дальнейшим действием. Не повторяйте операцию вслепую.`,
+            ]
+          : (this.nextSteps ?? defaultNextSteps(this.httpStatus, this.collection)),
       ...(this.code === 'outcome_unknown' ? { safe_to_retry: false } : {}),
     };
   }
